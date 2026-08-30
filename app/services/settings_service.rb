@@ -1,4 +1,6 @@
 class SettingsService
+  MIN_HEALTH_CHECK_INTERVAL = 60
+
   MANUAL_SAVE_SETTING_GROUPS = {
     indexer: %w[
       indexer_provider prowlarr_url prowlarr_api_key jackett_url jackett_api_key
@@ -24,6 +26,7 @@ class SettingsService
       oidc_default_role
     ],
     webhook: %w[webhook_enabled webhook_url webhook_token],
+    download: %w[allow_nonatomic_nfs_directory_publication],
     telegram: %w[
       telegram_enabled telegram_update_mode telegram_bot_token telegram_bot_username
       telegram_webhook_secret telegram_request_username
@@ -133,6 +136,13 @@ class SettingsService
     comicbook_filename_template: { type: "string", default: "{series - }{seriesNum:00 - }{title}", category: "paths", description: "Filename for Comics & Manga (extension added automatically). Variables include {author}, {authorSort}, {title}, {titleSort}, {year}, {publisher}, {language}, {series}, {seriesSort}, {seriesNum:00}, {narrator}. Optional suffix text is supported inside braces, e.g. {series - }." },
     download_remote_path: { type: "string", default: "", category: "paths", description: "Download client path (host path, e.g., /mnt/media/Torrents/Completed)" },
     download_local_path: { type: "string", default: "/downloads", category: "paths", description: "Container path for downloads (e.g., /downloads)" },
+    allow_nonatomic_nfs_directory_publication: {
+      type: "boolean",
+      default: false,
+      category: "paths",
+      env_overridable: true,
+      description: "Allow directory imports on NFS filesystems that reject atomic no-replace renames. Enable only when Shelfarr is the sole writer: a concurrently created empty destination directory could otherwise be replaced."
+    },
 
     # Queue Settings
     immediate_search_enabled: { type: "boolean", default: false, category: "queue", description: "Start searching immediately when a request is created (instead of waiting for queue cycle)" },
@@ -160,7 +170,7 @@ class SettingsService
     comic_vine_search_limit: { type: "integer", default: 10, category: "comic_vine", description: "Maximum number of Comic Vine search results to return" },
 
     # Health Monitoring
-    health_check_interval: { type: "integer", default: 300, category: "health", description: "Seconds between system health checks (default: 5 minutes)" },
+    health_check_interval: { type: "integer", default: 300, category: "health", description: "Seconds between system health checks (minimum: 60; default: 300)" },
 
     # Auto-Selection
     auto_select_enabled: { type: "boolean", default: false, category: "auto_select", description: "Automatically select the best search result without admin intervention" },
@@ -305,6 +315,7 @@ class SettingsService
     ebooks_com_enabled: "Show DRM-free eBooks.com Offers",
     ebooks_com_country_code: "Buyer Country Code",
     ebooks_com_search_limit: "Offer Limit",
+    allow_nonatomic_nfs_directory_publication: "Allow Non-Atomic NFS Directory Publication",
     audiobookshelf_audiobook_library_id: "Audiobook Library",
     audiobookshelf_ebook_library_id: "Ebook Library",
     audiobookshelf_comicbook_library_id: "Comics & Manga Library",
@@ -383,6 +394,8 @@ class SettingsService
       if key == :completed_download_import_mode
         return COMPLETED_DOWNLOAD_IMPORT_MODES.include?(value) ? value : "copy"
       end
+
+      return [ value.to_i, MIN_HEALTH_CHECK_INTERVAL ].max if key == :health_check_interval && !value.nil?
       return value unless value.nil?
 
       definition = DEFINITIONS[key]
@@ -400,6 +413,14 @@ class SettingsService
         value = value.to_s
         unless COMPLETED_DOWNLOAD_IMPORT_MODES.include?(value)
           raise ArgumentError, "#{label_for(key)} must be one of: #{COMPLETED_DOWNLOAD_IMPORT_MODES.join(', ')}"
+        end
+      end
+
+      if key == :health_check_interval
+        value = Integer(value, exception: false)
+        if value.nil? || value < MIN_HEALTH_CHECK_INTERVAL
+          raise ArgumentError,
+            "#{label_for(key)} must be at least #{MIN_HEALTH_CHECK_INTERVAL} seconds"
         end
       end
 

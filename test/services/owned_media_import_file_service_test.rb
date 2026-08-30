@@ -92,7 +92,7 @@ class OwnedMediaImportFileServiceTest < ActiveSupport::TestCase
           @media_import,
           StringIO.new("new bytes"),
           ".m4b",
-          root: Pathname(@output_root)
+          root: Pathname(@output_root).realpath
         )
       end
     end
@@ -129,6 +129,24 @@ class OwnedMediaImportFileServiceTest < ActiveSupport::TestCase
     assert_equal result, service.with_destination_lock { service.finalize! }
     assert_equal "durable audiobook bytes", File.binread(destination)
     assert_equal 0o640, File.stat(destination).mode & 0o777
+  end
+
+  test "a persisted reservation cannot be redirected into direct-download staging" do
+    service = persistent_service
+    internal_directory = File.join(
+      File.realpath(@output_root),
+      DirectDownloadFileService::STAGING_DIRECTORY,
+      "Injected"
+    )
+    @media_import.update!(
+      destination_path: File.join(internal_directory, "book.m4b"),
+      library_path: internal_directory
+    )
+
+    assert_raises(OwnedMediaImportFileService::Error) do
+      service.with_destination_lock { service.finalize! }
+    end
+    assert_not File.exist?(internal_directory)
   end
 
   test "filesystem capability probe verifies locking hard links and library permissions" do
@@ -583,6 +601,37 @@ class OwnedMediaImportFileServiceTest < ActiveSupport::TestCase
       assert_match(/required lock/, error.message)
       end
     end
+  end
+
+  test "publication filesystem errors are not reported as audiobook lock failures" do
+    error = assert_raises(Errno::EACCES) do
+      OwnedMediaImportFileService.with_lock(@output_root, "publication-error") do
+        raise Errno::EACCES, "Permission denied - publication mkdirat"
+      end
+    end
+
+    assert_match(/publication mkdirat/i, error.message)
+    assert_no_match(/lock/, error.message.downcase)
+  end
+
+  test "lock acquisition failure retains audiobook lock context" do
+    original_openat = OwnedMediaImportFileService.method(:class_native_openat)
+    failing_lock_open = lambda do |directory_fd, basename, flags:, mode: 0|
+      if basename.start_with?("lock-")
+        raise Errno::EACCES, "Permission denied - lock openat"
+      end
+
+      original_openat.call(directory_fd, basename, flags: flags, mode: mode)
+    end
+
+    error = OwnedMediaImportFileService.stub(:class_native_openat, failing_lock_open) do
+      assert_raises(OwnedMediaImportFileService::Error) do
+        OwnedMediaImportFileService.with_lock(@output_root, "failing-lock") { flunk }
+      end
+    end
+
+    assert_match(/could not lock the audiobook destination/i, error.message)
+    assert_match(/lock openat/i, error.message)
   end
 
   test "concurrent first use safely shares staging directory initialization" do

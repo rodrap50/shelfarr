@@ -232,30 +232,11 @@ class OwnedMediaImportFileService
     end
 
     def with_lock(root, key)
-      lock_directory = Pathname(root).join(STAGING_DIRECTORY, LOCKS_DIRECTORY)
-      shard = Digest::SHA256.hexdigest(key.to_s).to_i(16) % LOCK_SHARDS
-      secure_directory!(lock_directory) do |locks|
-        descriptor = class_native_openat(
-          locks.fileno,
-          format("lock-%04d", shard),
-          flags: File::RDWR | File::CREAT | File::NOFOLLOW | File::NONBLOCK,
-          mode: 0o600
-        )
-        lock = File.for_fd(descriptor, "r+", autoclose: true)
-        begin
-          raise Error, "Shelfarr's audiobook lock is not a regular file" unless lock.stat.file?
-
-          class_native_fchmod(lock.fileno, 0o600)
-          unless lock.flock(File::LOCK_EX)
-            raise Error, "The audiobook filesystem does not support Shelfarr's required lock"
-          end
-          yield
-        ensure
-          lock.close unless lock.closed?
-        end
-      end
-    rescue Errno::ELOOP, Errno::EACCES, Errno::ENOENT => e
-      raise Error, "Shelfarr could not lock the audiobook destination: #{e.message}"
+      lock = nil
+      lock = acquire_audiobook_lock(root, key)
+      yield
+    ensure
+      lock&.close unless lock&.closed?
     end
 
     # Audible backups rely on an advisory filesystem lock and a same-volume
@@ -300,6 +281,34 @@ class OwnedMediaImportFileService
     end
 
     private
+
+    def acquire_audiobook_lock(root, key)
+      lock = nil
+      lock_directory = Pathname(root).join(STAGING_DIRECTORY, LOCKS_DIRECTORY)
+      shard = Digest::SHA256.hexdigest(key.to_s).to_i(16) % LOCK_SHARDS
+      secure_directory!(lock_directory) do |locks|
+        descriptor = class_native_openat(
+          locks.fileno,
+          format("lock-%04d", shard),
+          flags: File::RDWR | File::CREAT | File::NOFOLLOW | File::NONBLOCK,
+          mode: 0o600
+        )
+        lock = File.for_fd(descriptor, "r+", autoclose: true)
+        raise Error, "Shelfarr's audiobook lock is not a regular file" unless lock.stat.file?
+
+        class_native_fchmod(lock.fileno, 0o600)
+        unless lock.flock(File::LOCK_EX)
+          raise Error, "The audiobook filesystem does not support Shelfarr's required lock"
+        end
+        return lock
+      end
+    rescue Errno::ELOOP, Errno::EACCES, Errno::ENOENT => e
+      lock&.close unless lock&.closed?
+      raise Error, "Shelfarr could not lock the audiobook destination: #{e.message}"
+    rescue
+      lock&.close unless lock&.closed?
+      raise
+    end
 
     def staging_components(raw_path)
       return if raw_path.blank?
@@ -555,10 +564,12 @@ class OwnedMediaImportFileService
     def safe_library_destination?(destination, root, staging_root)
       return false unless path_within?(destination, root)
       return false if path_within?(destination, staging_root)
+      return false if LibraryPathSafety.internal_path?(destination, root: root)
 
       resolved_parent = destination.parent.realpath
       path_within?(resolved_parent, root.realpath) &&
-        !path_within?(resolved_parent, staging_root.realpath)
+        !path_within?(resolved_parent, staging_root.realpath) &&
+        !LibraryPathSafety.internal_path?(resolved_parent, root: root.realpath)
     rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP
       false
     end
@@ -813,7 +824,7 @@ class OwnedMediaImportFileService
     library_path = Pathname(value.presence || book_library_path(canonical_destination_path)).expand_path
     unless path_within?(library_path, @output_root) &&
         library_path != @output_root &&
-        !path_within?(library_path, @output_root.join(STAGING_DIRECTORY))
+        !LibraryPathSafety.internal_path?(library_path, root: @output_root)
       raise Error, "The planned audiobook library path is outside the configured library"
     end
 
@@ -885,7 +896,8 @@ class OwnedMediaImportFileService
   def validate_destination_path!(destination)
     root = @output_root.realpath
     expanded = destination.expand_path
-    unless path_within?(expanded, root) && !path_within?(expanded, root.join(STAGING_DIRECTORY))
+    unless path_within?(expanded, root) &&
+        !LibraryPathSafety.internal_path?(expanded, root: root)
       raise Error, "The planned audiobook destination is outside the configured library"
     end
   end
@@ -972,7 +984,7 @@ class OwnedMediaImportFileService
     resolved_root = @output_root.realpath
     current_stat = File.lstat(destination.dirname)
     unless path_within?(resolved_parent, resolved_root) &&
-        !path_within?(resolved_parent, resolved_root.join(STAGING_DIRECTORY)) &&
+        !LibraryPathSafety.internal_path?(resolved_parent, root: resolved_root) &&
         current_stat.directory? &&
         same_file_identity?(current_stat, directory.stat)
       raise Error, "The planned audiobook destination changed during finalization"
@@ -989,7 +1001,8 @@ class OwnedMediaImportFileService
   def with_pinned_destination_parent(destination, create:)
     destination = Pathname(destination).expand_path
     relative = destination.dirname.relative_path_from(@output_root)
-    if relative.to_s.start_with?("..") || path_within?(destination, @output_root.join(STAGING_DIRECTORY))
+    if relative.to_s.start_with?("..") ||
+        LibraryPathSafety.internal_path?(destination, root: @output_root)
       raise Error, "The planned audiobook destination is outside the configured library"
     end
 

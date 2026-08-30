@@ -5,27 +5,81 @@ require "test_helper"
 class HealthCheckJobTest < ActiveJob::TestCase
   setup do
     SystemHealth.destroy_all
+    MetadataProviderStatus.destroy_all
     DownloadClient.destroy_all
+    Setting.where(key: "health_check_interval").delete_all
     Thread.current[:qbittorrent_sessions] = {}
   end
 
-  test "schedules next run after checking" do
-    assert_enqueued_with(job: HealthCheckJob) do
+  test "does not schedule next run after checking (recurring job handles scheduling)" do
+    assert_no_enqueued_jobs(only: HealthCheckJob) do
       HealthCheckJob.perform_now
     end
   end
 
-  test "uses configurable interval for next run" do
-    Setting.find_or_create_by(key: "health_check_interval").update!(
-      value: "600",
-      value_type: "integer",
-      category: "health"
+  test "cleanup discards only identifiable legacy delayed full-check jobs" do
+    SolidQueue::Record.establish_connection(:queue)
+    legacy = create_queue_health_job(scheduled_at: 5.minutes.from_now)
+    manual = create_queue_health_job(scheduled_at: Time.current)
+    targeted = create_queue_health_job(
+      scheduled_at: 5.minutes.from_now,
+      arguments: { service: "hardcover" }
     )
+    recurring = create_queue_health_job(
+      scheduled_at: 5.minutes.from_now,
+      arguments: { scheduled: true }
+    )
+    SolidQueue::RecurringExecution.create!(
+      job: recurring,
+      task_key: "health_check",
+      run_at: 5.minutes.from_now
+    )
+    claimed = create_queue_health_job(scheduled_at: 5.minutes.from_now)
+    claimed.scheduled_execution.destroy!
+    process = SolidQueue::Process.register(
+      kind: "Worker",
+      name: "health-check-cleanup-test-#{SecureRandom.hex(4)}",
+      pid: Process.pid,
+      hostname: "test",
+      metadata: {}
+    )
+    SolidQueue::ClaimedExecution.create!(job: claimed, process: process)
 
-    HealthCheckJob.perform_now
+    assert_equal 1, HealthCheckJob.discard_legacy_scheduled_chains!
 
-    enqueued = enqueued_jobs.find { |j| j[:job] == HealthCheckJob }
-    assert enqueued
+    assert_not SolidQueue::Job.exists?(legacy.id)
+    [ manual, targeted, recurring, claimed ].each do |preserved|
+      assert SolidQueue::Job.exists?(preserved.id), "expected job #{preserved.id} to be preserved"
+    end
+  end
+
+  test "scheduled checks honor the configured interval on minute boundaries" do
+    SettingsService.set(:health_check_interval, 600)
+
+    travel_to Time.zone.parse("2026-08-26 12:00:00") do
+      SystemHealth::SERVICES.each do |service|
+        SystemHealth.create!(
+          service: service,
+          status: :not_configured,
+          last_check_at: 9.minutes.ago
+        )
+      end
+
+      job = HealthCheckJob.new
+      assert_not job.send(:scheduled_health_check_due?)
+
+      SystemHealth.update_all(last_check_at: 10.minutes.ago)
+      assert job.send(:scheduled_health_check_due?)
+    end
+  end
+
+  test "scheduled checks run when a service has never been checked" do
+    SystemHealth::SERVICES.each do |service|
+      SystemHealth.create!(service: service, status: :not_configured, last_check_at: 1.minute.ago)
+    end
+    SystemHealth.find_by!(service: "hardcover").update_column(:last_check_at, nil)
+
+    assert HealthCheckJob.new.send(:scheduled_health_check_due?)
   end
 
   # Single service check
@@ -346,6 +400,47 @@ class HealthCheckJobTest < ActiveJob::TestCase
     end
   end
 
+  test "reports retained broad legacy direct staging without exposing its output root" do
+    Dir.mktmpdir("legacy-audiobooks") do |audiobook_dir|
+      Dir.mktmpdir("legacy-ebooks-private-root") do |ebook_dir|
+        setup_output_paths(audiobook_dir, ebook_dir)
+        legacy = File.join(ebook_dir, DirectDownloadFileService::LEGACY_STAGING_DIRECTORY)
+        FileUtils.mkdir_p(legacy)
+        File.chmod(0o777, legacy)
+
+        HealthCheckJob.perform_now(service: "output_paths")
+
+        health = SystemHealth.for_service("output_paths")
+        assert health.degraded?
+        assert_includes health.message, "Ebook legacy direct-download staging"
+        assert_includes health.message, "0777"
+        assert_includes health.message, "retained"
+        assert_includes health.message, DirectDownloadFileService::STAGING_DIRECTORY
+        refute_includes health.message, ebook_dir
+      end
+    end
+  end
+
+  test "reports nonempty private legacy direct staging without exposing its output root" do
+    Dir.mktmpdir("legacy-audiobooks") do |audiobook_dir|
+      Dir.mktmpdir("legacy-ebooks-private-root") do |ebook_dir|
+        setup_output_paths(audiobook_dir, ebook_dir)
+        legacy = File.join(ebook_dir, DirectDownloadFileService::LEGACY_STAGING_DIRECTORY)
+        FileUtils.mkdir_p(File.join(legacy, DirectDownloadFileService::DIRECT_DOWNLOADS_DIRECTORY))
+        File.chmod(0o700, legacy)
+
+        HealthCheckJob.perform_now(service: "output_paths")
+
+        health = SystemHealth.for_service("output_paths")
+        assert health.degraded?
+        assert_includes health.message, "Ebook legacy direct-download staging"
+        assert_includes health.message, "contains retained entries"
+        assert_includes health.message, DirectDownloadFileService::STAGING_DIRECTORY
+        refute_includes health.message, ebook_dir
+      end
+    end
+  end
+
   test "marks output_paths as degraded when one path has issues" do
     Dir.mktmpdir do |valid_dir|
       setup_output_paths(valid_dir, "/nonexistent/path")
@@ -406,7 +501,7 @@ class HealthCheckJobTest < ActiveJob::TestCase
         .to_return(
           status: 200,
           headers: { "Content-Type" => "application/json" },
-          body: { "libraries" => [{ "id" => "lib-1", "name" => "Audiobooks" }] }.to_json
+          body: { "libraries" => [ { "id" => "lib-1", "name" => "Audiobooks" } ] }.to_json
         )
 
       HealthCheckJob.perform_now
@@ -431,7 +526,52 @@ class HealthCheckJobTest < ActiveJob::TestCase
     end
   end
 
+  test "records a successful Hardcover health check for provider availability" do
+    HardcoverClient.stub(:configured?, true) do
+      HardcoverClient.stub(:test_connection, true) do
+        HealthCheckJob.perform_now(service: "hardcover")
+      end
+    end
+
+    health = SystemHealth.for_service("hardcover")
+    provider = MetadataProviderStatus.for_provider("hardcover")
+    assert health.healthy?
+    assert health.last_check_at.present?
+    assert_equal "healthy", provider.status
+    assert provider.last_success_at.present?
+  end
+
+  test "reports Hardcover rate limiting without treating the token as invalid" do
+    error = HardcoverClient::RateLimitError.new("limited for 2 minutes", retry_after: 120)
+
+    HardcoverClient.stub(:configured?, true) do
+      HardcoverClient.stub(:test_connection, -> { raise error }) do
+        HealthCheckJob.perform_now(service: "hardcover")
+      end
+    end
+
+    health = SystemHealth.for_service("hardcover")
+    provider = MetadataProviderStatus.for_provider("hardcover")
+    assert health.degraded?
+    assert health.last_check_at.present?
+    assert_includes health.message, "limited"
+    assert_equal "rate_limited", provider.status
+    assert_in_delta error.retry_at, provider.rate_limited_until, 1.second
+    assert_nil provider.last_success_at
+  end
+
   private
+
+  def create_queue_health_job(scheduled_at:, arguments: {})
+    active_job = arguments.empty? ? HealthCheckJob.new : HealthCheckJob.new(**arguments)
+    SolidQueue::Job.create!(
+      active_job_id: active_job.job_id,
+      class_name: "HealthCheckJob",
+      queue_name: "default",
+      arguments: active_job.serialize,
+      scheduled_at: scheduled_at
+    )
+  end
 
   def create_download_client(name: "Test Client", url: "http://localhost:8080")
     DownloadClient.create!(

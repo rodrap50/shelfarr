@@ -44,6 +44,7 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_select "#settings-tabs noscript", text: /Use Save All/
     assert_select "#settings-tabs noscript style", count: 0
     assert_select "#settings-tabs [data-settings-tabs-target='tablist'].hidden [role='tablist']", count: 1
+    assert_select "input[name='settings[health_check_interval]'][min='#{SettingsService::MIN_HEALTH_CHECK_INTERVAL}']"
   end
 
   test "index shows telegram group authorization only in integrations tab" do
@@ -256,6 +257,16 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_select "p", text: /Move: Removes the source and can stop torrent seeding/
     assert_select "p", text: /Hardlink: Retains the source without duplicate data; unsupported or cross-filesystem links fall back to copy/
     assert_select "p", text: /Hardlinked names share content, ownership, and permissions; edits through either name affect both/
+  end
+
+  test "index shows the non-atomic NFS publication safety override with a manual-save warning" do
+    get admin_settings_url
+
+    assert_response :success
+    assert_select "label[for='settings_allow_nonatomic_nfs_directory_publication']",
+      text: "Allow Non-Atomic NFS Directory Publication"
+    assert_select "input[name='settings[allow_nonatomic_nfs_directory_publication]'][data-settings-form-manual-save='true']"
+    assert_select "p.text-red-400", text: /Safety override: use only on an NFS export with no other writer/
   end
 
   test "index shows OIDC auto redirect setting" do
@@ -2188,6 +2199,25 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
 
     assert_redirected_to admin_settings_path
     assert_match /hard boom/, flash[:alert]
+  end
+
+  test "test_hardcover reports rate limiting as degraded and preserves the retry deadline" do
+    SettingsService.set(:hardcover_enabled, true)
+    SettingsService.set(:hardcover_api_token, "token")
+    MetadataProviderStatus.where(provider: "hardcover").delete_all
+    SystemHealth.where(service: "hardcover").delete_all
+    error = HardcoverClient::RateLimitError.new("retry later", retry_after: 120)
+
+    HardcoverClient.stub(:test_connection, -> { raise error }) do
+      post test_hardcover_admin_settings_url
+    end
+
+    assert_redirected_to admin_settings_path
+    assert_match(/rate limited/i, flash[:alert])
+    assert SystemHealth.for_service("hardcover").degraded?
+    provider = MetadataProviderStatus.for_provider("hardcover")
+    assert_equal "rate_limited", provider.status
+    assert_in_delta error.retry_at, provider.rate_limited_until, 1.second
   end
 
   test "test_google_books fails when disabled" do

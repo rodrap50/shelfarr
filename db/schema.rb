@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_07_23_120000) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_28_230000) do
   create_table "acquisition_providers", force: :cascade do |t|
     t.boolean "allow_private_network", default: false, null: false
     t.string "api_key"
@@ -80,14 +80,17 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_23_120000) do
     t.string "isbn"
     t.string "issue_number"
     t.string "language", default: "en"
+    t.datetime "metadata_backfill_checked_at"
     t.string "metadata_source", default: "openlibrary"
     t.string "narrator"
     t.string "open_library_edition_id"
     t.string "open_library_work_id"
     t.string "publisher"
+    t.text "reference_target_roots"
     t.date "release_date"
     t.string "series"
     t.string "series_position"
+    t.integer "series_start_year"
     t.string "title", null: false
     t.datetime "updated_at", null: false
     t.integer "year"
@@ -98,6 +101,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_23_120000) do
     t.index ["google_books_id"], name: "index_books_on_google_books_id"
     t.index ["hardcover_id"], name: "index_books_on_hardcover_id"
     t.index ["isbn"], name: "index_books_on_isbn"
+    t.index ["metadata_backfill_checked_at"], name: "index_books_on_metadata_backfill_checked_at"
     t.index ["open_library_edition_id"], name: "index_books_on_open_library_edition_id"
     t.index ["open_library_work_id"], name: "index_books_on_open_library_work_id"
     t.index ["series_position"], name: "index_books_on_series_position"

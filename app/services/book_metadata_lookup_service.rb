@@ -15,6 +15,7 @@ class BookMetadataLookupService
     content_kind: :content_kind,
     issue_number: :issue_number,
     release_date: :release_date,
+    series_start_year: :series_start_year,
     series: :series_name,
     series_position: :series_position,
     collection_id: :collection_id,
@@ -22,15 +23,21 @@ class BookMetadataLookupService
   }.freeze
 
   class << self
-    def call(work_ids, fallback: {})
+    def call(work_ids, fallback: {}, raise_lookup_errors: false)
       work_ids = normalize_work_ids(work_ids)
       return {} if work_ids.empty?
 
       metadata = {}
-      merge_details!(metadata, fetch_details(work_ids.first), work_ids.first)
+      merge_details!(
+        metadata,
+        fetch_details(work_ids.first, raise_lookup_errors: raise_lookup_errors),
+        work_ids.first
+      )
       return metadata if work_ids.one? || essential_metadata_complete?(metadata, fallback)
 
-      work_ids.drop(1).zip(fetch_concurrently(work_ids.drop(1))).each do |work_id, details|
+      alternate_ids = work_ids.drop(1)
+      alternate_details = fetch_concurrently(alternate_ids, raise_lookup_errors: raise_lookup_errors)
+      alternate_ids.zip(alternate_details).each do |work_id, details|
         merge_details!(metadata, details, work_id)
       end
       metadata
@@ -54,19 +61,23 @@ class BookMetadataLookupService
 
     private
 
-    def fetch_concurrently(work_ids)
+    def fetch_concurrently(work_ids, raise_lookup_errors:)
       work_ids.map do |work_id|
         Thread.new do
           Rails.application.executor.wrap do
-            ActiveRecord::Base.connection_pool.with_connection { fetch_details(work_id) }
+            ActiveRecord::Base.connection_pool.with_connection do
+              fetch_details(work_id, raise_lookup_errors: raise_lookup_errors)
+            end
           end
         end
       end.map(&:value)
     end
 
-    def fetch_details(work_id)
+    def fetch_details(work_id, raise_lookup_errors:)
       MetadataService.book_details(work_id)
     rescue *metadata_lookup_errors => e
+      raise if raise_lookup_errors
+
       Rails.logger.warn("[BookMetadataLookupService] Metadata lookup failed for #{work_id}: #{e.message}")
       nil
     end
@@ -111,6 +122,9 @@ class BookMetadataLookupService
       errors = [ HardcoverClient::Error, GoogleBooksClient::Error, OpenLibraryClient::Error, ComicVineClient::Error, MetadataService::Error, ArgumentError ]
       errors << VCR::Errors::UnhandledHTTPRequestError if defined?(VCR::Errors::UnhandledHTTPRequestError)
       errors << WebMock::NetConnectNotAllowedError if defined?(WebMock::NetConnectNotAllowedError)
+      if defined?(Faraday)
+        errors << Faraday::ConnectionFailed << Faraday::TimeoutError << Faraday::SSLError
+      end
       errors
     end
   end

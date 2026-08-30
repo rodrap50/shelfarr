@@ -301,6 +301,9 @@ class SearchJob < ApplicationJob
     book = request.book
     query = indexer_language_hint(request)
     categories = primary_indexer_categories(request)
+    issue_queries = comic_issue_search_queries(book)
+    structured_title = issue_queries.second || book.title
+    structured_author = issue_queries.any? ? nil : book.author
 
     Rails.logger.debug "[SearchJob] Searching #{IndexerClient.display_name} for request ##{request.id} (type: #{book.book_type})"
 
@@ -309,8 +312,8 @@ class SearchJob < ApplicationJob
         query,
         book_type: book.book_type,
         categories: categories,
-        title: book.title,
-        author: book.author
+        title: structured_title,
+        author: structured_author
       ),
       attempt: SearchAttempt.new(name: :structured_book, query: query, score_penalty: 0)
     )
@@ -742,16 +745,17 @@ class SearchJob < ApplicationJob
     language = request.effective_language
     return false if language.blank? || language == "en"
 
-    # Only add if we have a known language name
+    # Only add if we have a known language flag
     info = ReleaseParserService.language_info(language)
     info.present?
   end
 
-  # Get the language name for search query
+  # Prefer the short tokens commonly used in release names (for example DE,
+  # FR, and ES) over English display names such as "German" or "French".
   def language_search_term(request)
     language = request.effective_language
     info = ReleaseParserService.language_info(language)
-    info[:name]
+    info[:flag]
   end
 
   def merge_indexer_results(*result_groups)
@@ -915,6 +919,17 @@ class SearchJob < ApplicationJob
   def generic_indexer_attempts(request)
     book = request.book
     language_hint = indexer_language_hint(request)
+    issue_queries = comic_issue_search_queries(book)
+    if issue_queries.any?
+      attempts = issue_queries.map do |query|
+        build_search_attempt(:comic_issue, [ query, language_hint ])
+      end
+      if language_hint.present?
+        attempts.concat(issue_queries.map { |query| build_search_attempt(:comic_issue, [ query ]) })
+      end
+      return deduplicate_search_attempts(attempts)
+    end
+
     attempts = [
       build_search_attempt(:exact_title, [ book.title, language_hint ]),
       build_search_attempt(:title_author, [ book.title, book.author, language_hint ])
@@ -928,10 +943,37 @@ class SearchJob < ApplicationJob
 
     numeric_title_variants(book.title).each do |title_variant|
       attempts << build_search_attempt(:number_variant, [ title_variant, language_hint ])
-      attempts << build_search_attempt(:number_variant, [ title_variant, book.author, language_hint ])
+      attempts << build_search_attempt(:number_variant, [ title_variant, book.author, language_hint ]) if book.author.present?
+    end
+
+    # For non-English requests, add hint-free fallback attempts after all language-tagged attempts.
+    # Scene releases may be untagged or use different language markers than the hint,
+    # and matches_language already accepts untagged results ([lang, nil]).
+    if language_hint.present?
+      attempts << build_search_attempt(:exact_title, [ book.title ])
+      attempts << build_search_attempt(:title_author, [ book.title, book.author ])
     end
 
     deduplicate_search_attempts(attempts)
+  end
+
+  def comic_issue_search_queries(book)
+    issue_number = book.issue_number_for_matching.to_s.delete_prefix("#").squish
+    series = book.series.to_s.squish
+    return [] if issue_number.blank? || series.blank?
+
+    numeric_match = issue_number.match(/\A0*(\d+)((?:\.\d+)?[a-z]?)\z/i)
+    display_number = if numeric_match
+      "#{numeric_match[1].to_i}#{numeric_match[2]}"
+    else
+      issue_number
+    end
+    queries = [ "#{series} #{display_number}", "#{series} ##{display_number}" ]
+    if numeric_match
+      padded_number = "#{numeric_match[1].to_i.to_s.rjust(3, '0')}#{numeric_match[2]}"
+      queries << "#{series} #{padded_number}"
+    end
+    queries.uniq
   end
 
   def suppress_database_debug_logging(&block)

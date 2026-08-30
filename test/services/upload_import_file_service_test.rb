@@ -179,6 +179,23 @@ class UploadImportFileServiceTest < ActiveSupport::TestCase
     assert_not reserved_destination.start_with?(File.realpath(@other_library_root))
   end
 
+  test "a persisted reservation cannot be redirected into internal staging" do
+    service = UploadImportFileService.new(upload: @upload, book: @book)
+    service.reserve!
+    internal_directory = File.join(
+      File.realpath(@library_root),
+      DirectDownloadFileService::STAGING_DIRECTORY,
+      "Injected"
+    )
+    @upload.update_columns(
+      destination_path: File.join(internal_directory, "book.epub"),
+      library_path: internal_directory
+    )
+
+    assert_raises(UploadImportFileService::Error) { service.publish! }
+    assert_not File.exist?(internal_directory)
+  end
+
   test "destination-only recovery requires the persisted content digest" do
     service = UploadImportFileService.new(upload: @upload, book: @book)
     service.reserve!
@@ -556,6 +573,50 @@ class UploadImportFileServiceTest < ActiveSupport::TestCase
       "lock-*"
     ))
     assert_operator locks.length, :<=, UploadImportFileService::LOCK_SHARDS
+  end
+
+  test "mkdirat failure during publication reports accurate error not lock failure" do
+    service = UploadImportFileService.new(upload: @upload, book: @book)
+    service.reserve!
+
+    # Stub mkdirat to fail with EACCES when creating the destination parent directory.
+    # This happens during publication (inside the yielded block of with_lock),
+    # not during lock acquisition itself.
+    original_mkdirat = UploadImportFileService.method(:native_mkdirat)
+    destination_parent_name = File.basename(File.dirname(@upload.reload.destination_path))
+    interposed_mkdirat = lambda do |directory_fd, basename, mode|
+      if basename == destination_parent_name
+        raise Errno::EACCES, "Permission denied - mkdirat"
+      end
+      original_mkdirat.call(directory_fd, basename, mode)
+    end
+
+    error = UploadImportFileService.stub(:native_mkdirat, interposed_mkdirat) do
+      assert_raises(Errno::EACCES) { service.publish! }
+    end
+
+    assert_match(/Permission denied/, error.message)
+    assert_no_match(/lock/, error.message.downcase)
+  end
+
+  test "lock acquisition failure retains upload lock context" do
+    original_openat = UploadImportFileService.method(:native_openat)
+    failing_lock_open = lambda do |directory_fd, basename, flags:, mode: 0|
+      if basename.start_with?("lock-")
+        raise Errno::EACCES, "Permission denied - lock openat"
+      end
+
+      original_openat.call(directory_fd, basename, flags: flags, mode: mode)
+    end
+
+    error = UploadImportFileService.stub(:native_openat, failing_lock_open) do
+      assert_raises(UploadImportFileService::Error) do
+        UploadImportFileService.with_lock(@library_root, "failing-lock") { flunk }
+      end
+    end
+
+    assert_match(/could not lock the upload destination/i, error.message)
+    assert_match(/lock openat/i, error.message)
   end
 
   private
