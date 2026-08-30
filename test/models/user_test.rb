@@ -9,6 +9,45 @@ class UserTest < ActiveSupport::TestCase
     assert_equal("myuser", user.username)
   end
 
+  test "routing_configured? is false when preferred_output_path is blank" do
+    user = User.new(preferred_output_path: nil, library_routing_mode: "copy")
+    assert_not user.routing_configured?
+  end
+
+  test "routing_configured? is false when library_routing_mode is invalid" do
+    user = User.new(preferred_output_path: "/data/user", library_routing_mode: "invalid")
+    assert_not user.routing_configured?
+  end
+
+  test "routing_configured? is true for copy and hardlink modes" do
+    user = User.new(preferred_output_path: "/data/user", library_routing_mode: "copy")
+    assert user.routing_configured?
+
+    user.library_routing_mode = "hardlink"
+    assert user.routing_configured?
+  end
+
+  test "routing_configured? does not require preferred_output_path under nested layout" do
+    user = User.new(preferred_output_path: nil, library_routing_mode: "copy", routing_layout: "nested")
+    assert user.routing_configured?
+  end
+
+  test "routing_configured? still requires a routing mode under nested layout" do
+    user = User.new(preferred_output_path: nil, library_routing_mode: nil, routing_layout: "nested")
+    assert_not user.routing_configured?
+  end
+
+  test "nested_routing_layout? reflects the routing_layout column" do
+    user = User.new(routing_layout: "nested")
+    assert user.nested_routing_layout?
+
+    user.routing_layout = "single_path"
+    assert_not user.nested_routing_layout?
+
+    user.routing_layout = nil
+    assert_not user.nested_routing_layout?
+  end
+
   test "validates username format" do
     user = User.new(name: "Test", username: "invalid user!", password: VALID_PASSWORD)
     assert_not user.valid?

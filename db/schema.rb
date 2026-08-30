@@ -548,6 +548,17 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_28_230000) do
     t.index ["user_id"], name: "index_uploads_on_user_id"
   end
 
+  create_table "user_book_paths", force: :cascade do |t|
+    t.integer "book_id", null: false
+    t.datetime "created_at", null: false
+    t.string "file_path", null: false
+    t.datetime "updated_at", null: false
+    t.integer "user_id", null: false
+    t.index ["book_id"], name: "index_user_book_paths_on_book_id"
+    t.index ["user_id", "book_id"], name: "index_user_book_paths_on_user_id_and_book_id", unique: true
+    t.index ["user_id"], name: "index_user_book_paths_on_user_id"
+  end
+
   create_table "users", force: :cascade do |t|
     t.text "backup_codes"
     t.datetime "created_at", null: false
@@ -555,6 +566,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_28_230000) do
     t.integer "failed_login_count", default: 0, null: false
     t.datetime "last_failed_login_at"
     t.string "last_failed_login_ip"
+    t.string "library_routing_mode"
     t.datetime "locked_until"
     t.string "name", default: "", null: false
     t.string "oidc_provider"
@@ -562,7 +574,9 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_28_230000) do
     t.boolean "otp_required", default: false, null: false
     t.string "otp_secret"
     t.string "password_digest", null: false
+    t.string "preferred_output_path"
     t.integer "role", default: 0, null: false
+    t.string "routing_layout", default: "single_path", null: false
     t.datetime "telegram_link_token_created_at"
     t.string "telegram_link_token_digest"
     t.string "telegram_user_id"
@@ -603,4 +617,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_28_230000) do
   add_foreign_key "uploads", "books"
   add_foreign_key "uploads", "requests"
   add_foreign_key "uploads", "users"
+  add_foreign_key "user_book_paths", "books"
+  add_foreign_key "user_book_paths", "users"
 end
