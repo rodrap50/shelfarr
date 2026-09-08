@@ -59,6 +59,19 @@ class UserTest < ActiveSupport::TestCase
     assert user.valid?
   end
 
+  test "allows dots between username segments" do
+    user = User.new(name: "Test", username: "first.last", password: VALID_PASSWORD)
+    assert user.valid?
+  end
+
+  test "rejects leading, trailing, or doubled dots in username" do
+    [ ".leading", "trailing.", "double..dot", ".", ".." ].each do |username|
+      user = User.new(name: "Test", username: username, password: VALID_PASSWORD)
+      assert_not user.valid?, "expected #{username.inspect} to be invalid"
+      assert user.errors[:username].any?
+    end
+  end
+
   test "validates password minimum length" do
     user = User.new(name: "Test", username: "testuser", password: "Short1")
     assert_not user.valid?

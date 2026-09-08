@@ -21,8 +21,11 @@ class User < ApplicationRecord
 
   normalizes :username, with: ->(u) { u.strip.downcase }
 
+  # Dots are allowed between segments (e.g. "first.last") but not leading,
+  # trailing, or doubled — that also keeps "." and ".." out, which matters
+  # because the username is used as a directory name in UserLibraryRoutingService.
   validates :username, presence: true, uniqueness: { conditions: -> { where(deleted_at: nil) } },
-    format: { with: /\A[a-z0-9_]+\z/, message: "only allows lowercase letters, numbers, and underscores" }
+    format: { with: /\A[a-z0-9_]+(?:\.[a-z0-9_]+)*\z/, message: "only allows lowercase letters, numbers, underscores, and single dots between characters" }
   validates :name, presence: true
   validates :oidc_provider, presence: true, if: -> { oidc_uid.present? }
   validates :oidc_uid, presence: true, if: -> { oidc_provider.present? }
