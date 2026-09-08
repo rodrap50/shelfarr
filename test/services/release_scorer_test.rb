@@ -40,6 +40,22 @@ class ReleaseScorerTest < ActiveSupport::TestCase
     assert_equal :audiobook, result.detected_format
   end
 
+  test "parses each release once while preserving its complete score" do
+    search_result = @request.search_results.new(
+      title: "The Name of the Wind - Patrick Rothfuss - English Audiobook M4B 128kbps",
+      seeders: 50
+    )
+    expected = ReleaseScorer.score(search_result, @request)
+    original_parse = ReleaseParserService.method(:parse)
+    parsed_titles = []
+
+    ReleaseParserService.stub(:parse, ->(title) { parsed_titles << title; original_parse.call(title) }) do
+      assert_equal expected, ReleaseScorer.score(search_result, @request)
+    end
+
+    assert_equal [ search_result.title ], parsed_titles
+  end
+
   test "scores low for wrong language" do
     search_result = @request.search_results.create!(
       guid: "test-2",
@@ -151,6 +167,63 @@ class ReleaseScorerTest < ActiveSupport::TestCase
     result = ReleaseScorer.score(search_result, @request)
 
     assert result.breakdown[:author] == 100
+  end
+
+  test "scores localized and original components of a combined title as aliases" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(
+      title: "La Nena / The Girl",
+      author: "Carmen Mola",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "es")
+
+    localized = ReleaseScorer.score(
+      SearchResult.new(title: "La Nena - Carmen Mola - Spanish EPUB", seeders: 50),
+      request
+    )
+    original = ReleaseScorer.score(
+      SearchResult.new(title: "The Girl - Carmen Mola - Spanish EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, localized.breakdown[:title]
+    assert_equal 100, original.breakdown[:title]
+    assert_operator localized.total, :>=, 90
+    assert_operator original.total, :>=, 90
+    refute localized.breakdown[:auto_select_allowed]
+    refute original.breakdown[:auto_select_allowed]
+
+    combined = ReleaseScorer.score(
+      SearchResult.new(title: "La Nena The Girl - Carmen Mola - Spanish EPUB", seeders: 50),
+      request
+    )
+    assert combined.breakdown[:auto_select_allowed]
+  end
+
+  test "does not match a short combined-title alias inside another title" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(title: "Eso / It", author: "Stephen King", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+
+    unrelated = ReleaseScorer.score(
+      SearchResult.new(title: "The Institute - Stephen King - English EPUB", seeders: 50),
+      request
+    )
+    exact = ReleaseScorer.score(
+      SearchResult.new(title: "It - Stephen King - English EPUB", seeders: 50),
+      request
+    )
+
+    assert_operator unrelated.breakdown[:title], :<, 100
+    assert_equal 100, exact.breakdown[:title]
+    assert_operator unrelated.total, :<, SettingsService.get(:auto_select_confidence_threshold, default: 90)
+    refute unrelated.breakdown[:auto_select_allowed]
+    refute exact.breakdown[:auto_select_allowed]
   end
 
   test "scores partial author match for last name only" do

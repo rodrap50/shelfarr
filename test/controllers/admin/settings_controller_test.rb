@@ -241,6 +241,16 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_select "p", text: /MP3, FLAC, and other chapter-based releases stay together/
   end
 
+  test "index shows precreate download archives setting as disabled by default" do
+    get admin_settings_url
+
+    assert_response :success
+    assert_select "label", text: "Pre-create Download Archives"
+    assert_select "input[name='settings[precreate_download_archives]']"
+    assert_select "p", text: /Cached archives use tmp\/downloads/
+    assert_select "p", text: /reference-mode directory downloads use the container's OS temp directory/
+  end
+
   test "index shows completed download import mode options and hardlink guidance" do
     SettingsService.set(:completed_download_import_mode, "hardlink")
 
@@ -329,6 +339,17 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
 
     assert_redirected_to admin_settings_path
     assert_equal true, SettingsService.get(:split_audiobook_bundle_imports)
+  end
+
+  test "bulk_update stores precreate download archives setting" do
+    patch bulk_update_admin_settings_url, params: {
+      settings: {
+        precreate_download_archives: "true"
+      }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal true, SettingsService.get(:precreate_download_archives)
   end
 
   test "bulk_update stores a valid completed download import mode" do
@@ -1508,7 +1529,7 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     SettingsService.set(:zlibrary_email, "reader@example.com")
     SettingsService.set(:zlibrary_password, "secret")
 
-    ZLibraryClient.stub :test_connection, true do
+    ZLibraryClient.stub :test_connection!, true do
       post test_zlibrary_admin_settings_url
     end
 
@@ -1522,12 +1543,36 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     SettingsService.set(:zlibrary_email, "reader@example.com")
     SettingsService.set(:zlibrary_password, "secret")
 
-    ZLibraryClient.stub :test_connection, false do
+    ZLibraryClient.stub :test_connection!, false do
       post test_zlibrary_admin_settings_url
     end
 
     assert_redirected_to admin_settings_path
     assert_match /failed/i, flash[:alert]
+  end
+
+  test "test_zlibrary shows the login failure returned by Z-Library" do
+    SettingsService.set(:zlibrary_enabled, true)
+    SettingsService.set(:zlibrary_url, "https://z-library.sk")
+    SettingsService.set(:zlibrary_email, "reader@example.com")
+    SettingsService.set(:zlibrary_password, "secret")
+
+    VCR.turned_off do
+      stub_request(:post, "https://z-library.sk/eapi/user/login")
+        .with(body: "email=reader%40example.com&password=secret")
+        .to_return(
+          status: 200,
+          body: { success: 0, error: "Invalid email or password" }.to_json,
+          headers: { "Content-Type" => "application/json" }
+        )
+
+      post test_zlibrary_admin_settings_url,
+        headers: { "Accept" => "text/vnd.turbo-stream.html" }
+    end
+
+    assert_response :success
+    assert_select "turbo-stream[target='flash']", count: 1
+    assert_includes response.body, "Invalid email or password"
   end
 
   test "test_librivox fails when disabled" do
