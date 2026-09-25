@@ -1172,6 +1172,78 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
     end
   end
 
+  test "add_torrent raises ConnectionError for transient API HTTP statuses" do
+    VCR.turned_off do
+      stub_request(:post, "http://localhost:8080/api/v2/auth/login")
+        .to_return(
+          status: 200,
+          headers: { "Set-Cookie" => "SID=test_session_id; path=/" },
+          body: "Ok."
+        )
+
+      [ 408, 425, 429, 500, 503 ].each do |status|
+        stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+          .to_return(
+            status: status,
+            headers: { "Content-Type" => "application/json" },
+            body: { "error" => "unavailable" }.to_json
+          )
+
+        error = assert_raises(DownloadClients::Base::ConnectionError) do
+          @client.add_torrent("magnet:?xt=urn:btih:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
+        end
+        assert_instance_of DownloadClients::Base::ConnectionError, error
+        assert_equal "qBittorrent API error: #{status}", error.message
+      end
+    end
+  end
+
+  test "add_torrent returns nil for a 400 client rejection" do
+    VCR.turned_off do
+      stub_request(:post, "http://localhost:8080/api/v2/auth/login")
+        .to_return(
+          status: 200,
+          headers: { "Set-Cookie" => "SID=test_session_id; path=/" },
+          body: "Ok."
+        )
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .to_return(status: 400, headers: { "Content-Type" => "text/plain" }, body: "Fails to add torrent")
+
+      assert_nil @client.add_torrent("magnet:?xt=urn:btih:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
+    end
+  end
+
+  test "add_torrent returns nil for a 404 client rejection" do
+    VCR.turned_off do
+      stub_request(:post, "http://localhost:8080/api/v2/auth/login")
+        .to_return(
+          status: 200,
+          headers: { "Set-Cookie" => "SID=test_session_id; path=/" },
+          body: "Ok."
+        )
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .to_return(status: 404, headers: { "Content-Type" => "text/plain" }, body: "Not Found")
+
+      assert_nil @client.add_torrent("magnet:?xt=urn:btih:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
+    end
+  end
+
+  test "handle_response maps transient HTTP statuses to ConnectionError" do
+    error = assert_raises(DownloadClients::Base::ConnectionError) do
+      @client.send(:handle_response, qbittorrent_response(status: 503, body: {})) { |data| data }
+    end
+    assert_instance_of DownloadClients::Base::ConnectionError, error
+    assert_equal "qBittorrent API error: 503", error.message
+  end
+
+  test "handle_response keeps a 400 API status as Error" do
+    error = assert_raises(DownloadClients::Base::Error) do
+      @client.send(:handle_response, qbittorrent_response(status: 400, body: {})) { |data| data }
+    end
+    assert_instance_of DownloadClients::Base::Error, error
+    assert_equal "qBittorrent API error: 400", error.message
+  end
+
   # === Category Auto-Creation Tests ===
 
   test "test_connection creates category after successful connection" do
@@ -1475,5 +1547,138 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       # Should succeed on second verification attempt
       assert_equal "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", result
     end
+  end
+
+  test "add_torrent sends ratioLimit and seedingTimeLimit when seed criteria are supplied" do
+    VCR.turned_off do
+      captured = capture_add_torrent_request(
+        "magnet:?xt=urn:btih:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        seed_ratio: 1.5,
+        seed_time: 72
+      )
+
+      assert_in_delta 1.5, captured["ratioLimit"].to_f, 0.0001
+      assert_equal 72, captured["seedingTimeLimit"].to_i
+    end
+  end
+
+  test "add_torrent omits seed limits when criteria are absent" do
+    VCR.turned_off do
+      captured = capture_add_torrent_request(
+        "magnet:?xt=urn:btih:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+      )
+
+      assert_not captured.key?("ratioLimit")
+      assert_not captured.key?("seedingTimeLimit")
+    end
+  end
+
+  test "add_torrent omits invalid seed limits so the client keeps global limits" do
+    VCR.turned_off do
+      captured = capture_add_torrent_request(
+        "magnet:?xt=urn:btih:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        seed_ratio: -5,
+        seed_time: -5
+      )
+
+      assert_not captured.key?("ratioLimit")
+      assert_not captured.key?("seedingTimeLimit")
+    end
+  end
+
+  test "add_torrent includes seed limits on the torrent file upload path" do
+    VCR.turned_off do
+      info_dict = {
+        "name" => "Seed Criteria Book.epub",
+        "piece length" => 16384,
+        "pieces" => "s" * 20,
+        "length" => 512
+      }
+      torrent_data = { "info" => info_dict }.bencode
+      expected_hash = Digest::SHA1.hexdigest(info_dict.bencode).downcase
+
+      stub_request(:post, "http://localhost:8080/api/v2/auth/login")
+        .to_return(
+          status: 200,
+          headers: { "Set-Cookie" => "SID=test_session_id; path=/" },
+          body: "Ok."
+        )
+
+      stub_request(:get, "http://prowlarr:9696/api/v1/indexer/download/seed-criteria")
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/x-bittorrent" },
+          body: torrent_data
+        )
+
+      add_stub = stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .with { |request|
+          request.headers["Content-Type"]&.include?("multipart/form-data") &&
+            request.body.include?("name=\"ratioLimit\"") &&
+            request.body.include?("1.5") &&
+            request.body.include?("name=\"seedingTimeLimit\"") &&
+            request.body.include?("72")
+        }
+        .to_return(status: 200, body: "Ok.")
+
+      stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=#{expected_hash}")
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: [ { "hash" => expected_hash, "name" => "Seed Criteria Book.epub", "progress" => 0, "state" => "downloading", "size" => 512, "content_path" => "/downloads" } ].to_json
+        )
+
+      result = @client.add_torrent(
+        "http://prowlarr:9696/api/v1/indexer/download/seed-criteria",
+        seed_ratio: 1.5,
+        seed_time: 72
+      )
+
+      assert_equal expected_hash, result
+      assert_requested(add_stub)
+    end
+  end
+
+  private
+
+  def capture_add_torrent_request(url, **options)
+    hash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+    captured = nil
+
+    stub_request(:post, "http://localhost:8080/api/v2/auth/login")
+      .to_return(
+        status: 200,
+        headers: { "Set-Cookie" => "SID=test_session_id; path=/" },
+        body: "Ok."
+      )
+
+    stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+      .with { |request|
+        captured = add_torrent_params(request)
+        true
+      }
+      .to_return(status: 200, body: "Ok.")
+
+    stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=#{hash}")
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: [ { "hash" => hash, "name" => "Test", "progress" => 0, "state" => "downloading", "size" => 100, "content_path" => "/downloads" } ].to_json
+      )
+
+    result = @client.add_torrent(url, options)
+    assert_equal hash, result
+    captured
+  end
+
+  def add_torrent_params(request)
+    body = request.body
+    return body if body.is_a?(Hash)
+
+    URI.decode_www_form(body.to_s).to_h
+  end
+
+  def qbittorrent_response(status:, body:, headers: {})
+    Struct.new(:status, :body, :headers).new(status, body, headers)
   end
 end

@@ -144,7 +144,7 @@ module DownloadClients
           else
             Rails.logger.error "[Sabnzbd] Unexpected response format: #{body.inspect.truncate(200)}"
           end
-          raise Base::Error, "SABnzbd returned unexpected response format"
+          raise Base::ConnectionError, "SABnzbd returned unexpected response format"
         end
 
         # SABnzbd returns error in JSON body sometimes
@@ -167,7 +167,7 @@ module DownloadClients
         else
           Rails.logger.error "[Sabnzbd] API error (status #{response.status}): #{response.body.inspect.truncate(200)}"
         end
-        raise Base::Error, "SABnzbd API error: #{response.status}"
+        raise_for_http_status!(response.status, "SABnzbd API error: #{response.status}")
       end
     rescue Faraday::ConnectionFailed, Faraday::TimeoutError, Faraday::SSLError => e
       if sensitive_url
@@ -215,13 +215,14 @@ module DownloadClients
     end
 
     def parse_history_item(data)
+      download_path = data["storage"].presence || ""
       Base::TorrentInfo.new(
         hash: data["nzo_id"],
         name: data["name"],
         progress: 100,
-        state: normalize_history_state(data["status"]),
+        state: normalize_history_state(data["status"], download_path: download_path),
         size_bytes: data["bytes"].to_i,
-        download_path: data["storage"].presence || ""
+        download_path: download_path
       )
     end
 
@@ -238,14 +239,19 @@ module DownloadClients
       end
     end
 
-    def normalize_history_state(status)
+    # SABnzbd moves a job into history as soon as the download finishes, then
+    # continues repair/unpack/move there. Those statuses (Queued, QuickCheck,
+    # Verifying, Repairing, Fetching, Extracting, Moving, Running, Checking)
+    # must not be treated as import-ready. Completed with a blank storage path
+    # is the same race: the file is not visible yet.
+    def normalize_history_state(status, download_path: "")
       case status&.downcase
       when "completed"
-        :completed
+        download_path.present? ? :completed : :downloading
       when "failed"
         :failed
       else
-        :completed
+        :downloading
       end
     end
   end
