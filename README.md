@@ -42,7 +42,7 @@ Think Jellyseerr, but for books. Your users request ebooks and audiobooks; Shelf
 - **Auto-Selection & Format Preferences** — Pick the best release automatically, scored by your preferred formats, bitrate and language
 - **Auto-Processing** — Rename and organize files with path/filename templates, then deliver to Audiobookshelf, BookOrbit or Grimmory watched folders
 - **Library Sync** — Automatic Audiobookshelf, BookOrbit or Grimmory scans after downloads complete
-- **Manual Uploads** — Upload your own files to fulfill a request
+- **Manual Uploads** — Upload your own files to fulfill a request, or add them directly to the library. For a failed standalone upload, administrators can open **Admin → Uploads → Upload Details** to select a local book of the same format or create one with corrected title/author, then retry. That choice is preserved across retries and bypasses automatic metadata matching. Uploads attached to requests or Audible imports cannot be reassigned here; uploads with reserved library files must use **Retry** to reconcile their existing destination first.
 - **Multi-User** — Role-based access with user requests and admin controls
 - **Authentication** — TOTP-based 2FA with backup codes, plus OIDC/SSO (Authentik, Authelia, Keycloak, etc.)
 - **Notifications** — In-app, Discord, Telegram and webhook notifications for request events
@@ -51,6 +51,10 @@ Think Jellyseerr, but for books. Your users request ebooks and audiobooks; Shelf
 - **Custom Acquisition Providers** — Trusted HTTP providers can contribute search results and resolve selected items into direct, torrent or usenet artifacts
 - **Third-Party Store Offers (Beta)** — Surface legitimate DRM-free editions from supported sellers without handling checkout or payment data
 - **Audible Backup (Beta)** — Sync purchased Audible titles, explicitly queue a one-time backup of eligible existing purchases, optionally back up future purchases automatically, and import them through the separately packaged Libation companion
+
+Books created solely for a failed upload are kept for retries. Replacing the match or deleting the unfinished upload removes that creation only if it is still unused and unacquired; existing or adopted books are preserved.
+
+Manual upload recovery screenshots: [Desktop](docs/screenshot-upload-recovery.jpg) · [Mobile](docs/screenshot-upload-recovery-mobile.jpg).
 
 ### Beta integrations
 
@@ -163,6 +167,12 @@ After logging in, go to **Admin → Settings**:
 | Output Paths | Where to place completed audiobooks/ebooks |
 | Library Platform | Audiobookshelf URL + API key, or BookOrbit/Grimmory URL + username/password for library integration (optional) |
 
+The save bar stays visible as you scroll. Preferences save automatically and show **Saved** when complete; connection details and fields marked **Requires Save All** need **Save All**. Unused direct sources start collapsed—open their heading to configure them. Downloads lists output paths first, with polling and retry options under **Advanced download settings**.
+
+Only the selected indexer and library platform's credentials are shown. Switching providers preserves stored credentials and any unfinished draft for the other provider. **Save All** saves the active provider's draft; switch back to save a draft for another provider. Custom indexer categories appear when Search Scope is **Custom**. Without JavaScript, provider fields and settings sections remain available and all changes require **Save All**.
+
+See the [settings overview](docs/screenshot-settings.jpg) and [mobile save feedback](docs/screenshot-settings-mobile.jpg).
+
 📖 **[Read the docs](https://shelfarr.org/getting-started.html)** for a full install and setup walkthrough, plus a **[settings reference](https://shelfarr.org/configuration.html)** describing every option, its type and default.
 
 ### OIDC/SSO Setup
@@ -171,6 +181,7 @@ Shelfarr supports OpenID Connect for single sign-on with identity providers like
 
 1. Create an OIDC client in your identity provider:
    - **Redirect URI**: `http://your-shelfarr-url/auth/oidc/callback`
+     (include the application prefix when set, for example `https://your-shelfarr-url/books/auth/oidc/callback` with `RAILS_RELATIVE_URL_ROOT=/books`)
    - **Scopes**: `openid profile email`
 
 2. In **Admin → Settings → OIDC/SSO Authentication**:

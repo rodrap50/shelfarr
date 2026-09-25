@@ -12,12 +12,12 @@ The Shelfarr UI and documentation must describe the feature as **Audible Backup
 ## Packaging model
 
 The image is built from the unmodified multi-architecture
-`rmcrackan/libation:13.5.1` image at the manifest digest recorded in the
+`rmcrackan/libation:14.2.0` image at the manifest digest recorded in the
 [third-party notice](THIRD_PARTY_NOTICES.md). Do not replace the digest with a
 floating `latest` tag. The bridge is published as a self-contained .NET 10
 minimal API and the upstream Libation CLI remains a separate process.
 The build also places a machine-readable snapshot of the exact upstream source
-at `/companion/SOURCES/Libation-13.5.1-source.tar.gz`, beside the license and
+at `/companion/SOURCES/Libation-14.2.0-source.tar.gz`, beside the license and
 third-party notice in the distributed image. The independently licensed
 Shelfarr bridge has its own named license copy at
 `/companion/LICENSES/Shelfarr-GPL-3.0.txt`; OCI source and revision labels map
@@ -93,9 +93,15 @@ no-symlink-follow ownership migration of nested config, cached job, partial,
 completed-book, and token state. Per-volume owner markers avoid repeating that
 recursive scan on normal restarts. With `CHOWN_ON_START=never`, an ID change
 fails until the complete mounted trees have been pre-permissioned for the new
-identity. The image and supplied Compose service both probe the internal
-`/health` endpoint; the companion API should be healthy before Shelfarr is
-enabled against it.
+identity. The image and supplied Compose service both invoke the companion with
+`--healthcheck`, which GETs the already-running process's `/health` on the
+configured listen port (from `ASPNETCORE_URLS`, otherwise `8080`) and never
+starts a second listener. Remap that port with `ASPNETCORE_URLS`, not a
+container `command` `--urls` override: the image healthcheck is a separate
+process and only sees environment. HTTP `200` with `status: ok` means the
+companion process is live even when `libraryReady` is `false` because Libation
+is idle or unconfigured. The companion API should be healthy before Shelfarr
+is enabled against it.
 
 ## Authentication
 
@@ -114,7 +120,10 @@ environment variable.
 Audible authentication is a two-request operation:
 
 1. `POST /v1/auth/start` starts one Libation `login-external` process and
-   returns the upstream browser login URL.
+   returns the upstream browser login URL. Pass `"reregister": true` to reset
+   that email and marketplace's stored registration first; a still-valid registration
+   otherwise exits as already authenticated and never issues a new device
+   serial.
 2. The user signs in directly on Amazon/Audible, then copies the final URL from
    the browser address bar.
 3. `POST /v1/auth/complete` writes that URL into the **same** held Libation
@@ -124,7 +133,7 @@ Audible authentication is a two-request operation:
 The session expires after ten minutes by default. It holds the global Libation
 operation lock because Libation state must not be mutated concurrently.
 
-Supported marketplace values for Libation 13.5.1 are:
+Supported marketplace values for Libation 14.2.0 are:
 
 `us`, `uk`, `australia`, `canada`, `france`, `germany`, `india`, `italy`,
 `japan`, and `spain`.
@@ -138,7 +147,7 @@ All JSON field names use camel case.
 | `GET /health` | Liveness, pinned versions, busy state, and whether a cached library exists |
 | `GET /version` | Bridge/API/Libation versions and upstream attribution |
 | `GET /v1/accounts` | Configured account, marketplace, scan-enabled and authentication status |
-| `POST /v1/auth/start` | Begin external-browser authentication |
+| `POST /v1/auth/start` | Begin external-browser authentication; optional `reregister` resets the selected email and marketplace registration first |
 | `POST /v1/auth/complete` | Complete the held authentication session |
 | `POST /v1/sync` | Queue a serialized Libation scan followed by a normalized JSON export |
 | `GET /v1/library` | Read the complete last successful, local normalized library snapshot; never contacts Audible (legacy compatibility) |
@@ -152,9 +161,17 @@ Start authentication:
 POST /v1/auth/start
 {
   "account": "reader@example.com",
-  "locale": "us"
+  "locale": "us",
+  "reregister": false
 }
 ```
+
+Set `reregister` to `true` after a companion upgrade that changes Libation
+device registration. The companion resets only the identity tokens for that
+email and marketplace in `AccountsSettings.json` and starts a new external
+login so Libation can register again. Other registrations, account names, and
+scan preferences are preserved. Ordinary first-time sign-in leaves
+`reregister` false or omitted.
 
 ```json
 {
@@ -264,6 +281,9 @@ their image defaults.
   Libation and can require maintenance when Audible changes its service.
 - The pinned Libation release must be upgraded deliberately and tested against
   an existing state-volume copy. Never use an automatic `latest` updater.
+  Libation 14.2.0 also requires a fresh Audible sign-in after upgrade so the
+  corrected Android device serial can be registered; updating the image alone
+  does not replace an already stored registration.
 
 ## Development
 

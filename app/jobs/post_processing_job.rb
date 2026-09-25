@@ -10,6 +10,11 @@ class PostProcessingJob < ApplicationJob
   EBOOK_FILE_EXTENSIONS = %w[epub pdf mobi azw azw3 cbz cbr djvu].freeze
   EBOOK_SIDECAR_EXTENSIONS = %w[jpg jpeg png webp opf nfo txt].freeze
   EBOOK_ALLOWED_EXTENSIONS = (EBOOK_FILE_EXTENSIONS + EBOOK_SIDECAR_EXTENSIONS).freeze
+  # SABnzbd (and some torrent clients) report a completed file path instead of
+  # the job folder. Remap through the parent while preserving the reported file.
+  COMPLETED_DOWNLOAD_FILE_EXTENSIONS = (
+    EBOOK_FILE_EXTENSIONS + AudiobookBundleImportPlanner::KNOWN_AUDIO_EXTENSIONS + %w[zip rar 7z tar gz tgz]
+  ).freeze
   ERROR_DETAIL_CHARACTER_LIMIT = 500
   ERROR_DETAIL_INPUT_BYTE_LIMIT = ERROR_DETAIL_CHARACTER_LIMIT * 4
   MAX_FILENAME_BYTES = 255
@@ -1447,6 +1452,10 @@ class PostProcessingJob < ApplicationJob
   # per-client download_path) without requiring a single "correct" configuration.
   def remap_download_path(path, download)
     if path.blank?
+      path = refresh_download_path_from_client(download).to_s
+    end
+
+    if path.blank?
       Rails.logger.warn "[PostProcessingJob] Download path is blank - download client didn't report a path"
       return { path: path, authorized_roots: [] }
     end
@@ -1454,6 +1463,13 @@ class PostProcessingJob < ApplicationJob
     Rails.logger.info "[PostProcessingJob] Resolving the download client path"
 
     candidates = build_path_candidates(path, download)
+    parent_path = parent_directory_for_file_source(path, download)
+    if parent_path.present?
+      filename = File.basename(normalize_path_separators(path))
+      candidates.concat(build_path_candidates(parent_path, download).map do |candidate|
+        candidate.merge(path: File.join(candidate[:path], filename))
+      end)
+    end
     candidates = deduplicate_path_candidates(candidates)
 
     # Return the first candidate that actually exists on disk.
@@ -1474,6 +1490,27 @@ class PostProcessingJob < ApplicationJob
     # Return the first non-nil candidate so import_files produces a clear "not found" error
     best_guess = candidates.find { |c| c[:path].present? }
     best_guess || { path: path, authorized_roots: [] }
+  end
+
+  def refresh_download_path_from_client(download)
+    return if download.external_id.blank?
+
+    client = download.download_client
+    return unless client&.enabled?
+
+    info = client.adapter.torrent_info(download.external_id)
+    return unless info&.completed?
+
+    path = info&.download_path.to_s
+    return if path.blank?
+
+    download.update!(download_path: path)
+    path
+  rescue DownloadClients::Base::Error => e
+    Rails.logger.warn(
+      "[PostProcessingJob] Could not refresh blank download path from client for download ##{download.id}: #{e.class}"
+    )
+    nil
   end
 
   def build_path_candidates(path, download)
@@ -1553,6 +1590,40 @@ class PostProcessingJob < ApplicationJob
 
   def normalize_path_separators(path)
     path.to_s.tr("\\", "/") if path.present?
+  end
+
+  # Clients such as SABnzbd report a single-file release as the file itself.
+  # Remap through the parent job folder so category/basename strategies still
+  # find the reported file. Skip parents that are shared download roots
+  # (category or configured mount) so we never import an entire queue folder.
+  def parent_directory_for_file_source(path, download)
+    normalized_path = normalize_path_separators(path)
+    return unless completed_download_file_leaf?(File.basename(normalized_path))
+
+    parent = File.dirname(normalized_path)
+    return if generic_path_leaf?(parent)
+
+    parent_name = File.basename(parent)
+    return if generic_path_leaf?(parent_name)
+    return if shared_download_leaf?(parent_name, download)
+
+    parent
+  end
+
+  def completed_download_file_leaf?(name)
+    extension = File.extname(name.to_s).delete_prefix(".").downcase
+    COMPLETED_DOWNLOAD_FILE_EXTENSIONS.include?(extension)
+  end
+
+  def generic_path_leaf?(value)
+    value.blank? || value == "." || value == "/" || value == File::SEPARATOR
+  end
+
+  def shared_download_leaf?(name, download)
+    category_path_variants(download.download_client&.category).any? { |category| category.casecmp?(name) } ||
+      shared_download_roots(download).any? do |root|
+        File.basename(normalize_path_separators(root)).casecmp?(name)
+      end
   end
 
   def path_prefix_match?(path, prefix)

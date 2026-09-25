@@ -66,6 +66,10 @@ module DownloadClients
         raise Base::AuthenticationError, "qBittorrent authentication failed"
       else
         Rails.logger.error "[Qbittorrent] Failed to add torrent: #{response.status} - #{response.body}"
+        if transient_http_status?(response.status)
+          raise Base::ConnectionError, "qBittorrent API error: #{response.status}"
+        end
+
         nil
       end
     rescue Faraday::Error => e
@@ -576,7 +580,7 @@ module DownloadClients
         raise Base::AuthenticationError, "qBittorrent authentication failed (HTTP #{response.status}) at #{base_url}"
       else
         Rails.logger.error "[Qbittorrent] API error: HTTP #{response.status} from #{base_url} — #{response.body.to_s.truncate(200)}"
-        raise Base::Error, "qBittorrent API error: #{response.status}"
+        raise_for_http_status!(response.status, "qBittorrent API error: #{response.status}")
       end
     rescue Faraday::ConnectionFailed, Faraday::TimeoutError, Faraday::SSLError => e
       raise Base::ConnectionError, "Failed to connect to qBittorrent at #{base_url}: #{e.message}"
@@ -624,8 +628,17 @@ module DownloadClients
       params[:category] = config.category if config.category.present?
       params[:savepath] = options[:save_path] if options[:save_path].present?
       params[:paused] = options[:paused] ? "true" : "false" if options.key?(:paused)
+      apply_seed_limits!(params, options)
       params.merge!(adapter_specific_add_torrent_params)
       params
+    end
+
+    def apply_seed_limits!(params, options)
+      ratio = Float(options[:seed_ratio], exception: false)
+      params[:ratioLimit] = ratio if ratio&.finite? && (ratio >= 0 || [ -1, -2 ].include?(ratio))
+
+      time = Integer(options[:seed_time], exception: false)
+      params[:seedingTimeLimit] = time if time && time >= -2
     end
 
     def adapter_specific_add_torrent_params
