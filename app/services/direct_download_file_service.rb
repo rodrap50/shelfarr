@@ -57,7 +57,7 @@ class DirectDownloadFileService
       download.reload
       return cleanup_completed_state!(download) if completed_publication?(download)
 
-      if publication_complete?(download) && reservation_owned?(download)
+      if publication_complete?(download) == true && reservation_owned?(download)
         service_for(download).send(:finalize_database!, allow_failed: true)
         return cleanup_completed_state!(download.reload)
       end
@@ -73,12 +73,12 @@ class DirectDownloadFileService
       # or reservation until a full timeout has elapsed. A complete atomic
       # publication is still safe to finalize above during the grace period.
       return false if recovery_lease_fresh?(download)
-      return false unless valid_output_root_identity?(download)
+      return false unless valid_output_root_identity?(download) == true
 
       cleanup_staging_and_state!(download, release_reservation: true)
       false
-    rescue ActiveRecord::RecordNotFound
-      false
+    rescue ActiveRecord::RecordNotFound => error
+      RemoteResult::Failed.new(error)
     end
 
     def reconcile_reservation!(book)
@@ -92,8 +92,8 @@ class DirectDownloadFileService
 
       reconcile!(owner)
       !book.reload.acquisition_reserved?
-    rescue ActiveRecord::RecordNotFound
-      false
+    rescue ActiveRecord::RecordNotFound => error
+      RemoteResult::Failed.new(error)
     end
 
     def reconcile_orphaned_reservations!
@@ -151,28 +151,32 @@ class DirectDownloadFileService
       legacy = root.join(LEGACY_STAGING_DIRECTORY)
       stat = File.lstat(legacy)
       mode = stat.mode & 0o7777
-      if stat.directory? && mode == 0o700
-        return if Dir.empty?(legacy)
-
-        # Check if the directory only contains current owned-media structure.
-        # OwnedMediaImportFileService still uses .shelfarr-staging with uploads/
-        # and locks/ subdirectories. Only warn if there are other entries that
-        # could be leftover direct-download data.
+      if stat.directory?
         children = Dir.children(legacy)
-        owned_media_structure = children.all? do |name|
-          name.in?([ "uploads", "locks" ]) && File.lstat(legacy.join(name)).directory?
-        end
-        return if owned_media_structure
+        return if children.empty? && mode == 0o700
 
-        return "legacy direct-download staging contains retained entries; new downloads use " \
-          "#{STAGING_DIRECTORY}, and the legacy entry requires manual review"
+        # OwnedMediaImportFileService still uses .shelfarr-staging with uploads/
+        # and locks/ subdirectories. Network mounts (CIFS/SMB) may force a
+        # non-0700 directory mode, so recognize that live layout before treating
+        # the mode itself as leftover direct-download staging.
+        if children.any?
+          owned_media_structure = children.all? do |name|
+            name.in?([ "uploads", "locks" ]) && File.lstat(legacy.join(name)).directory?
+          end
+          return if owned_media_structure
+        end
+
+        if mode == 0o700
+          return "legacy direct-download staging contains retained entries; new downloads use " \
+            "#{STAGING_DIRECTORY}, and the legacy entry requires manual review"
+        end
       end
 
       type = stat.directory? ? "directory" : "non-directory entry"
       "legacy direct-download staging is a retained #{type} with mode #{format('%04o', mode)}; " \
         "new downloads use #{STAGING_DIRECTORY}, and the legacy entry requires manual review"
-    rescue Errno::ENOENT
-      nil
+    rescue Errno::ENOENT => error
+      RemoteResult::Failed.new(error)
     rescue SystemCallError
       "legacy direct-download staging could not be safely inspected; new downloads use " \
         "#{STAGING_DIRECTORY}, and the legacy entry requires manual review"
@@ -266,7 +270,7 @@ class DirectDownloadFileService
     def publication_complete?(download)
       return false if download.direct_content_manifest.blank?
       return false if download.direct_destination_path.blank? || download.direct_output_root.blank?
-      return false unless valid_output_root_identity?(download)
+      return false unless valid_output_root_identity?(download) == true
 
       expected = JSON.parse(download.direct_content_manifest)
       actual = if download.direct_publication_kind == "directory"
@@ -281,8 +285,8 @@ class DirectDownloadFileService
         )
       end
       actual == expected
-    rescue JSON::ParserError, SystemCallError, FileCopyService::UnsafePathError
-      false
+    rescue JSON::ParserError, SystemCallError, FileCopyService::UnsafePathError => error
+      RemoteResult::Failed.new(error)
     end
 
     def release_reservation!(download)
@@ -330,7 +334,7 @@ class DirectDownloadFileService
     end
 
     def cleanup_staging_and_state!(download, release_reservation: false)
-      return false unless remove_staging!(download)
+      return false unless remove_staging!(download) == true
 
       release_reservation!(download) if release_reservation
       Download.where(id: download.id).update_all(recovery_state_attributes)
@@ -341,7 +345,7 @@ class DirectDownloadFileService
       path = download.direct_staging_path
       return true if path.blank?
       return false if download.direct_output_root.blank?
-      return false unless valid_output_root_identity?(download)
+      return false unless valid_output_root_identity?(download) == true
 
       if legacy_staging_path?(download)
         Rails.logger.warn(
@@ -376,11 +380,14 @@ class DirectDownloadFileService
       snapshot = FileCopyService.snapshot_source_root(expanded)
       return false unless [ snapshot.device, snapshot.inode ] == expected_identity
 
-      FileCopyService.remove_source_tree(snapshot)
+      FileCopyService.remove_source_tree(
+        snapshot,
+        allow_nonatomic: SettingsService.get(:allow_nonatomic_nfs_directory_publication)
+      )
     rescue Errno::ENOENT
-      valid_output_root_identity?(download) && valid_staging_parent_identity?(download)
-    rescue Error, SystemCallError, FileCopyService::UnsafePathError
-      false
+      valid_output_root_identity?(download) == true && valid_staging_parent_identity?(download) == true
+    rescue Error, SystemCallError, FileCopyService::UnsafePathError => error
+      RemoteResult::Failed.new(error)
     end
 
     def legacy_staging_path?(download)
@@ -393,8 +400,8 @@ class DirectDownloadFileService
         parts[1] == DIRECT_DOWNLOADS_DIRECTORY &&
         parts[2].match?(/\A[0-9a-f]{12}\z/) &&
         parts[3].match?(/\Adownload-#{download.id}-[0-9a-f]{32}\z/)
-    rescue ArgumentError
-      false
+    rescue ArgumentError => error
+      RemoteResult::Failed.new(error)
     end
 
     def valid_output_root_identity?(download)
@@ -402,8 +409,8 @@ class DirectDownloadFileService
 
       stat = File.lstat(Pathname(download.direct_output_root).realpath)
       [ stat.dev, stat.ino ] == [ download.direct_output_root_device, download.direct_output_root_inode ]
-    rescue SystemCallError
-      false
+    rescue SystemCallError => error
+      RemoteResult::Failed.new(error)
     end
 
     def valid_staging_parent_identity?(download)
@@ -415,8 +422,8 @@ class DirectDownloadFileService
       parent = Pathname(download.direct_staging_path).expand_path.parent
       FileCopyService.directory_identity(parent.to_s, root: download.direct_output_root) ==
         [ download.direct_staging_parent_device, download.direct_staging_parent_inode ]
-    rescue SystemCallError, FileCopyService::UnsafePathError
-      false
+    rescue SystemCallError, FileCopyService::UnsafePathError => error
+      RemoteResult::Failed.new(error)
     end
 
     def recovery_state_attributes
@@ -522,7 +529,7 @@ class DirectDownloadFileService
     ensure_publication_verified!
     finalize_database!
   rescue => error
-    return true if recover_after_publication_error!(error)
+    return true if recover_after_publication_error!(error) == true
 
     raise
   end
@@ -564,7 +571,7 @@ class DirectDownloadFileService
     ensure_publication_verified!
     finalize_database!
   rescue => error
-    return true if recover_after_publication_error!(error)
+    return true if recover_after_publication_error!(error) == true
 
     raise
   end
@@ -656,7 +663,7 @@ class DirectDownloadFileService
           current_book.acquisition_reservation_owner_id == current_download.id
         raise ConflictError, "Another acquisition owns this title"
       end
-      unless self.class.send(:valid_output_root_identity?, current_download)
+      unless self.class.send(:valid_output_root_identity?, current_download) == true
         raise Error, "Direct-download output root changed before database completion"
       end
 
@@ -669,7 +676,7 @@ class DirectDownloadFileService
       )
       current_download.update!(status: :completed, download_path: destination_path)
       current_request.complete!
-      unless self.class.send(:valid_output_root_identity?, current_download)
+      unless self.class.send(:valid_output_root_identity?, current_download) == true
         raise Error, "Direct-download output root changed during database completion"
       end
     end
@@ -679,19 +686,19 @@ class DirectDownloadFileService
 
   def recover_after_publication_error!(error)
     download.reload
-    if self.class.send(:publication_complete?, download) &&
+    if self.class.send(:publication_complete?, download) == true &&
         self.class.send(:reservation_owned?, download)
       return finalize_database!(allow_failed: true)
     end
 
-    return false unless self.class.send(:valid_output_root_identity?, download)
+    return false unless self.class.send(:valid_output_root_identity?, download) == true
     return false if @publication_started && !error.is_a?(ConflictError)
 
     self.class.send(:release_reservation!, download)
     download.reload
     false
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def ensure_destination_parent!
@@ -703,14 +710,14 @@ class DirectDownloadFileService
 
   def ensure_output_root_identity!
     download.reload
-    return true if self.class.send(:valid_output_root_identity?, download)
+    return true if self.class.send(:valid_output_root_identity?, download) == true
 
     raise Error, "Direct-download output root changed during publication"
   end
 
   def ensure_publication_verified!
     download.reload
-    return true if self.class.send(:publication_complete?, download)
+    return true if self.class.send(:publication_complete?, download) == true
 
     raise Error, "Direct-download publication could not be verified"
   end
@@ -772,7 +779,7 @@ class DirectDownloadFileService
       device: @staging_device,
       inode: @staging_inode
     )
-  rescue Error, SystemCallError, FileCopyService::UnsafePathError
-    nil
+  rescue Error, SystemCallError, FileCopyService::UnsafePathError => error
+    RemoteResult::Failed.new(error)
   end
 end

@@ -137,12 +137,12 @@ class UploadImportFileService
               upload_directory.fileno,
               quarantine
             )
-            unless renamed
+            unless renamed == true
               raise Error, "The upload filesystem cannot quarantine ingress cleanup atomically"
             end
 
             upload_directory.fsync
-            unless pinned_child_matches?(upload_directory, quarantine, identity)
+            unless pinned_child_matches?(upload_directory, quarantine, identity) == true
               restore_ingress_quarantine(
                 upload_directory,
                 quarantine,
@@ -164,7 +164,7 @@ class UploadImportFileService
       Rails.logger.warn(
         "[UploadImportFileService] Refused unsafe ingress cleanup: #{error.class}"
       )
-      false
+      RemoteResult::Failed.new(error)
     end
 
     def recoverable_file?(upload)
@@ -178,12 +178,12 @@ class UploadImportFileService
     def recovery_source_path(upload)
       source = Pathname(upload.cleanup_source_path.presence || upload.file_path.to_s).expand_path
       digest = upload.content_sha256.to_s
-      return source.to_s if valid_regular_file?(source, upload.file_size, digest: digest.presence)
+      return source.to_s if valid_regular_file?(source, upload.file_size, digest: digest.presence) == true
 
       return unless complete_reservation?(upload)
 
       destination = validated_reserved_destination(upload, require_parent: true)
-      return destination.to_s if valid_regular_file?(destination, upload.file_size, digest: digest)
+      return destination.to_s if valid_regular_file?(destination, upload.file_size, digest: digest) == true
 
       raise Error, "Both the uploaded file and its reserved library copy are missing or changed"
     end
@@ -202,27 +202,24 @@ class UploadImportFileService
           source = Pathname(upload.cleanup_source_path.presence || upload.file_path.to_s).expand_path
           destination = validated_reserved_destination(upload, require_parent: false)
           digest = upload.content_sha256.to_s
-          source_valid = valid_regular_file?(source, upload.file_size, digest: digest)
+          source_valid = valid_regular_file?(source, upload.file_size, digest: digest) == true
           destination_exists = path_occupied?(destination)
           validate_existing_parent_chain!(destination.parent, root) if destination_exists
           destination_valid = valid_regular_file?(
             destination,
             upload.file_size,
             digest: digest
-          )
+          ) == true
 
           if destination_valid && source_valid
             configured_root = validated_configured_root(upload)
             display_path = configured_root.join(destination.relative_path_from(root)).to_s
             display_library_path = configured_root.join(library_path.relative_path_from(root)).to_s
-            adopted = Book.acquired.where(
-              file_path: [
-                destination.to_s,
-                display_path,
-                library_path.to_s,
-                display_library_path
-              ].uniq
-            ).exists?
+            adopted = Book.acquired.where(file_path: [ destination.to_s, display_path ].uniq)
+              .or(Book.acquired.where(
+                book_type: upload.book_type,
+                file_path: [ library_path.to_s, display_library_path ].uniq
+              )).exists?
             return false if adopted
 
             remove_verified_destination!(
@@ -253,7 +250,7 @@ class UploadImportFileService
         "[UploadImportFileService] Could not restore upload ##{upload.id}: " \
           "#{error.class}: #{error.message}"
       )
-      false
+      RemoteResult::Failed.new(error)
     end
 
     def cleanup_completed_source!(upload)
@@ -263,7 +260,7 @@ class UploadImportFileService
 
       destination = validated_reserved_destination(upload, require_parent: true)
       digest = upload.content_sha256.to_s
-      return false unless valid_regular_file?(destination, upload.file_size, digest: digest)
+      return false unless valid_regular_file?(destination, upload.file_size, digest: digest) == true
 
       source = Pathname(upload.cleanup_source_path).expand_path
       if source == destination
@@ -466,7 +463,7 @@ class UploadImportFileService
           parent.fileno,
           quarantine
         )
-        unless renamed
+        unless renamed == true
           raise Error, "The library filesystem cannot quarantine a rolled-back upload atomically"
         end
         parent.fsync
@@ -516,8 +513,8 @@ class UploadImportFileService
         validate_open_file!(file, expected_size, digest)
         true
       end
-    rescue Error, Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR
-      false
+    rescue Error, Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR => error
+      RemoteResult::Failed.new(error)
     end
 
     def validate_open_file!(file, expected_size, digest)
@@ -660,8 +657,8 @@ class UploadImportFileService
       with_pinned_child(parent, basename) do |child|
         return same_file_identity?(child.stat, expected_stat)
       end
-    rescue Error, SystemCallError
-      false
+    rescue Error, SystemCallError => error
+      RemoteResult::Failed.new(error)
     end
 
     def native_linkat(source_directory_fd, source_basename, destination_directory_fd, destination_basename)
@@ -679,8 +676,8 @@ class UploadImportFileService
       with_upload_filesystem_syscall do
         FilesystemSyscalls.mkdirat(directory_fd, basename, mode)
       end
-    rescue Errno::EEXIST
-      nil
+    rescue Errno::EEXIST => error
+      RemoteResult::Failed.new(error)
     end
 
     def native_openat(directory_fd, basename, flags: File::RDONLY | File::NOFOLLOW, mode: 0)
@@ -695,14 +692,14 @@ class UploadImportFileService
       with_upload_filesystem_syscall do
         FilesystemSyscalls.unlinkat(directory_fd, basename)
       end
-    rescue Errno::ENOENT
-      nil
+    rescue Errno::ENOENT => error
+      RemoteResult::Failed.new(error)
     end
 
     def native_rename_noreplace(source_fd, source_basename, destination_fd, destination_basename)
       FilesystemSyscalls.rename_noreplace(source_fd, source_basename, destination_fd, destination_basename)
-    rescue Errno::EINVAL
-      false
+    rescue Errno::EINVAL => error
+      RemoteResult::Failed.new(error)
     end
 
     def restore_ingress_quarantine(directory, quarantine, original)
@@ -712,12 +709,12 @@ class UploadImportFileService
         directory.fileno,
         original
       )
-      directory.fsync if restored
+      directory.fsync if restored == true
       restored
-    rescue SystemCallError
+    rescue SystemCallError => error
       # Never replace a concurrently restored ingress path. A retained private
       # quarantine is swept as an orphan after the normal grace period.
-      false
+      RemoteResult::Failed.new(error)
     end
 
     def native_fchmod(descriptor, mode)
@@ -880,7 +877,8 @@ class UploadImportFileService
                 validate_published_parent!(destination.parent, destination_parent)
                 return book_library_path
               end
-            rescue Errno::ENOENT
+            rescue Errno::ENOENT => error
+              RemoteResult::Failed.new(error)
               # Publish the verified private copy below.
             end
 
@@ -1022,7 +1020,7 @@ class UploadImportFileService
       temporary_basename,
       destination_parent.fileno,
       destination_basename
-    )
+    ) == true
     source_consumed = published_by_rename
     destination_published = published_by_rename
     unless published_by_rename
@@ -1136,16 +1134,16 @@ class UploadImportFileService
   end
 
   def occupied?(destination, library_path)
-    self.class.send(:path_occupied?, library_path) ||
-      Book.acquired.where(file_path: library_path.to_s).exists? ||
-      Upload.blocking_reservations.where(library_path: library_path.to_s)
-        .where.not(id: upload.id)
-        .exists? ||
+    self.class.send(:path_occupied?, destination) ||
       Upload.blocking_reservations.where(destination_path: destination.to_s)
         .where.not(id: upload.id)
         .exists? ||
-      OwnedMediaImport.blocking.where(library_path: library_path.to_s).exists? ||
-      OwnedMediaImport.blocking.where(destination_path: destination.to_s).exists?
+      OwnedMediaImport.blocking.where(destination_path: destination.to_s).exists? ||
+      LibraryDestinationOccupancy.occupied?(
+        library_path: library_path,
+        book: @book,
+        except_upload_id: upload.id
+      )
   end
 
   def validate_reservation!

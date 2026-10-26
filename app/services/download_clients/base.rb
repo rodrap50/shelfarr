@@ -5,8 +5,6 @@ require "uri"
 require "bencode"
 
 module DownloadClients
-  # Base class for download client implementations
-  # Subclasses should implement: add_torrent, torrent_info, list_torrents, test_connection
   class Base
     MAX_GUARDED_TORRENT_BYTES = 10.megabytes
     MAX_GUARDED_TORRENT_CONTENT_BYTES = 2.gigabytes
@@ -26,7 +24,6 @@ module DownloadClients
     class AuthenticationError < Error; end
     class NotConfiguredError < Error; end
 
-    # Data structure for torrent information
     TorrentInfo = Data.define(:hash, :name, :progress, :state, :size_bytes, :download_path) do
       def completed?
         state == :completed
@@ -47,33 +44,22 @@ module DownloadClients
       @config = download_client
     end
 
-    # Add a torrent by URL or magnet link
-    # Returns true on success, or hash with response data
     def add_torrent(url, options = {})
       raise NotImplementedError, "Subclass must implement add_torrent"
     end
 
-    # Get info for a specific torrent by hash
-    # Returns TorrentInfo or nil if not found
     def torrent_info(hash)
       raise NotImplementedError, "Subclass must implement torrent_info"
     end
 
-    # List all torrents, optionally filtered
-    # Returns array of TorrentInfo
     def list_torrents(filter = {})
       raise NotImplementedError, "Subclass must implement list_torrents"
     end
 
-    # Test the connection to the client
-    # Returns true if successful, false otherwise
     def test_connection
       raise NotImplementedError, "Subclass must implement test_connection"
     end
 
-    # Remove a torrent by hash
-    # delete_files: if true, also delete downloaded files
-    # Returns true on success, false otherwise
     def remove_torrent(hash, delete_files: false)
       raise NotImplementedError, "Subclass must implement remove_torrent"
     end
@@ -352,6 +338,106 @@ module DownloadClients
       end
 
       raise Error, "Torrent source metadata is malformed" unless depth.zero?
+    end
+
+    private
+
+    def download_state(unit:, progress:, state:, path: nil)
+      if state.key?(:deluge)
+        deluge_download_state(state[:deluge], progress_percent(unit, progress))
+      elsif state.key?(:transmission)
+        transmission_download_state(
+          state[:transmission],
+          state[:error],
+          progress_percent(unit, progress),
+          state[:left_until_done]
+        )
+      elsif state.key?(:sabnzbd_queue)
+        sabnzbd_queue_download_state(state[:sabnzbd_queue])
+      elsif state.key?(:sabnzbd_history)
+        sabnzbd_history_download_state(state[:sabnzbd_history], path)
+      else
+        :queued
+      end
+    end
+
+    def progress_percent(unit, progress)
+      value = progress.to_f
+      unit == :fraction ? value * 100 : value
+    end
+
+    def deluge_download_state(state, percent)
+      case state.to_s
+      when "Downloading", "Checking", "CheckingResumeData", "Queued", "Moving", "Allocating", "Creating"
+        :downloading
+      when "Seeding"
+        :completed
+      when "Error", "ErrorPause"
+        :failed
+      when "Paused", "PausedDownload", "PausedUpload", "Stopped"
+        percent >= 100 ? :completed : :paused
+      else
+        :queued
+      end
+    end
+
+    def transmission_download_state(status, error, percent, left_until_done = nil)
+      return :failed if error.to_i == 3
+
+      case status.to_i
+      when 0
+        # Status 0 is stopped. A seed ratio or idle limit of 0 stops a finished
+        # torrent here, before Transmission reports seeding (status 6).
+        transmission_download_finished?(percent, left_until_done) ? :completed : :paused
+      when 1, 2
+        :queued
+      when 3
+        :queued
+      when 4
+        :downloading
+      when 5
+        # Status 5 is queued to seed, so the download itself is already done.
+        transmission_download_finished?(percent, left_until_done) ? :completed : :queued
+      when 6
+        :completed
+      else
+        :downloading
+      end
+    end
+
+    def transmission_download_finished?(percent, left_until_done)
+      return false unless percent >= 100
+
+      left_until_done.nil? || left_until_done.to_f.zero?
+    end
+
+    # SABnzbd moves a job into history as soon as the download finishes, then
+    # continues repair/unpack/move there. Those statuses (Queued, QuickCheck,
+    # Verifying, Repairing, Fetching, Extracting, Moving, Running, Checking)
+    # must not be treated as import-ready. Completed with a blank storage path
+    # is the same race: the file is not visible yet.
+    def sabnzbd_history_download_state(status, path)
+      case status&.downcase
+      when "completed"
+        path.present? ? :completed : :downloading
+      when "failed"
+        :failed
+      else
+        :downloading
+      end
+    end
+
+    def sabnzbd_queue_download_state(status)
+      case status&.downcase
+      when "downloading"
+        :downloading
+      when "paused"
+        :paused
+      when "queued", "grabbing"
+        :queued
+      else
+        :queued
+      end
     end
   end
 end

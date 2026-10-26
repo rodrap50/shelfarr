@@ -36,8 +36,9 @@ module Shelfarr
       def stop!
         return false unless @owner_pid == Process.pid
 
-        # Puma's cluster shutdown hook can run inside a signal trap, where
-        # Ruby forbids Mutex#synchronize. Do cleanup on an ordinary thread.
+        # Puma can run shutdown hooks inside a signal trap, where Ruby forbids
+        # Mutex#synchronize. Keep signaling on an ordinary thread so it stays
+        # serialized with the sole reaper, including during interrupted startup.
         Thread.new { stop_supervisor }.value
       end
 
@@ -79,8 +80,7 @@ module Shelfarr
             { "SHELFARR_QUEUE_PARENT_PID" => @owner_pid.to_s },
             Gem.ruby, jobs_executable, spawn_options(log_path)
           )
-          # This thread is the sole reaper. It also serializes reaping with
-          # signaling to avoid racing our own cleanup.
+          # This thread is the sole reaper. It also serializes reaping with signaling to avoid racing our own cleanup.
           @reaper = Thread.new { monitor_supervisor }
           File.write(@pidfile, "#{@pid}\n")
           install_at_exit_hook!
@@ -114,26 +114,35 @@ module Shelfarr
 
       def monitor_supervisor
         loop do
-          finished = @mutex.synchronize do
+          exited_pid = nil
+          stop_puma = false
+          @mutex.synchronize do
             begin
               exited = Process.waitpid(@pid, Process::WNOHANG)
             rescue Errno::ECHILD
               exited = @pid
             end
             if exited
-              remove_pidfile(exited)
+              exited_pid = exited
               @pid = nil
-              unless @stopping
-                log("Solid Queue supervisor exited; stopping Puma")
-                Process.kill(:INT, @owner_pid)
-              end
-              true
+              stop_puma = !@stopping
             end
           end
-          break if finished
+          if exited_pid
+            # Keep logging and signaling Puma outside the mutex: shutdown
+            # needs that mutex to escalate to KILL, and the logger can block.
+            remove_pidfile(exited_pid)
+            if stop_puma
+              log("Solid Queue supervisor exited; stopping Puma")
+              Process.kill(:INT, @owner_pid)
+            end
+            break
+          end
 
           sleep 0.1
         end
+      rescue Errno::ESRCH
+        nil
       end
 
       def signal_supervisor(signal)

@@ -19,13 +19,11 @@ class ProwlarrClientTest < ActiveSupport::TestCase
   }.freeze
 
   setup do
-    # Configure Prowlarr settings for tests
     SettingsService.set(:prowlarr_url, "http://localhost:9696")
     SettingsService.set(:prowlarr_api_key, "test-api-key-12345")
   end
 
   teardown do
-    # Reset connection between tests
     ProwlarrClient.instance_variable_set(:@connection, nil)
   end
 
@@ -211,22 +209,17 @@ class ProwlarrClientTest < ActiveSupport::TestCase
     end
   end
 
-  test "search falls back to a free-text book query when indexer capabilities are unavailable" do
+  test "search does not widen to every indexer when the indexer list is unavailable" do
     VCR.turned_off do
       stub_request(:get, %r{localhost:9696/api/v1/indexer}).to_return(status: 500, body: "")
 
       search_stub = stub_request(:get, %r{localhost:9696/api/v1/search})
-        .with do |req|
-          query = req.uri.query_values
 
-          query["type"] == "book" &&
-            query["query"] == "Inferno Dan Brown" &&
-            query["indexerIds"].nil?
-        end
-        .to_return(status: 200, headers: { "Content-Type" => "application/json" }, body: [].to_json)
-
-      assert_equal [], ProwlarrClient.search("", book_type: :ebook, title: "Inferno", author: "Dan Brown")
-      assert_requested search_stub
+      error = assert_raises(IndexerClients::Base::Error) do
+        ProwlarrClient.search("", book_type: :ebook, title: "Inferno", author: "Dan Brown")
+      end
+      assert_match(/500/, error.message)
+      assert_not_requested search_stub
     end
   end
 
@@ -443,7 +436,6 @@ class ProwlarrClientTest < ActiveSupport::TestCase
     ProwlarrClient.instance_variable_set(:@connection, nil)
 
     VCR.turned_off do
-      # Should request /prowlarr/api/v1/indexer, not /api/v1/indexer
       stub_request(:get, "http://localhost:9696/prowlarr/api/v1/indexer")
         .to_return(status: 200, body: "[]")
 
@@ -514,7 +506,6 @@ class ProwlarrClientTest < ActiveSupport::TestCase
     ProwlarrClient.instance_variable_set(:@connection, nil)
 
     VCR.turned_off do
-      # Stub tags endpoint to map tag name to ID
       stub_request(:get, %r{localhost:9696/api/v1/tag})
         .to_return(
           status: 200,
@@ -525,7 +516,6 @@ class ProwlarrClientTest < ActiveSupport::TestCase
           ].to_json
         )
 
-      # Stub indexers endpoint
       stub_request(:get, %r{localhost:9696/api/v1/indexer})
         .to_return(
           status: 200,
@@ -545,7 +535,6 @@ class ProwlarrClientTest < ActiveSupport::TestCase
     ProwlarrClient.instance_variable_set(:@connection, nil)
 
     VCR.turned_off do
-      # Stub indexers endpoint
       stub_request(:get, %r{localhost:9696/api/v1/indexer})
         .to_return(
           status: 200,
@@ -556,7 +545,6 @@ class ProwlarrClientTest < ActiveSupport::TestCase
           ].to_json
         )
 
-      # Stub search endpoint - verify it includes indexerIds
       search_stub = stub_request(:get, %r{localhost:9696/api/v1/search})
         .with(query: hash_including("indexerIds" => "2"))
         .to_return(
@@ -575,7 +563,6 @@ class ProwlarrClientTest < ActiveSupport::TestCase
     ProwlarrClient.instance_variable_set(:@connection, nil)
 
     VCR.turned_off do
-      # Stub tags endpoint to map tag name to ID
       stub_request(:get, %r{localhost:9696/api/v1/tag})
         .to_return(
           status: 200,
@@ -586,7 +573,6 @@ class ProwlarrClientTest < ActiveSupport::TestCase
           ].to_json
         )
 
-      # Stub indexers endpoint
       stub_request(:get, %r{localhost:9696/api/v1/indexer})
         .to_return(
           status: 200,
@@ -597,7 +583,6 @@ class ProwlarrClientTest < ActiveSupport::TestCase
           ].to_json
         )
 
-      # Stub search endpoint - verify it includes indexerIds
       search_stub = stub_request(:get, %r{localhost:9696/api/v1/search})
         .with(query: hash_including("indexerIds" => "2"))
         .to_return(
@@ -608,6 +593,34 @@ class ProwlarrClientTest < ActiveSupport::TestCase
 
       ProwlarrClient.search("test query")
       assert_requested search_stub
+    end
+  end
+
+  test "a tag endpoint 500 does not clear the tag scope" do
+    SettingsService.set(:prowlarr_tags, "books")
+    ProwlarrClient.instance_variable_set(:@connection, nil)
+
+    VCR.turned_off do
+      stub_request(:get, %r{localhost:9696/api/v1/tag})
+        .to_return(
+          status: 500,
+          headers: { "Content-Type" => "application/json" },
+          body: { "error" => "boom" }.to_json
+        )
+      stub_indexers(
+        { "id" => 1, "name" => "Untagged", "tags" => [ 7 ],
+          "capabilities" => { "bookSearchParams" => [ "q" ] } },
+        { "id" => 2, "name" => "Tagged", "tags" => [ 42 ],
+          "capabilities" => { "bookSearchParams" => [ "q" ] } }
+      )
+      search_stub = stub_request(:get, %r{localhost:9696/api/v1/search})
+
+      error = assert_raises(IndexerClients::Base::Error) do
+        ProwlarrClient.search("", title: "Frankenstein", author: "Mary Shelley")
+      end
+
+      assert_match(/500/, error.message)
+      assert_not_requested search_stub
     end
   end
 
@@ -654,13 +667,112 @@ class ProwlarrClientTest < ActiveSupport::TestCase
     end
   end
 
-  # SSL error handling tests
-  test "test_connection returns false on SSL error" do
+  test "test_connection uses a supplied url and api key without replacing the saved connection" do
+    VCR.turned_off do
+      saved = stub_request(:get, "http://localhost:9696/api/v1/indexer")
+        .with(headers: { "X-Api-Key" => "test-api-key-12345" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+      unsaved = stub_request(:get, "http://prowlarr.example:9696/api/v1/indexer")
+        .with(headers: { "X-Api-Key" => "fresh-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      assert ProwlarrClient.test_connection(url: "http://prowlarr.example:9696", api_key: "fresh-key")
+      assert_requested unsaved
+      assert_not_requested saved
+      assert_equal "http://localhost:9696", SettingsService.get(:prowlarr_url)
+      assert_equal "test-api-key-12345", SettingsService.get(:prowlarr_api_key)
+
+      assert ProwlarrClient.test_connection
+      assert_requested saved
+    end
+  end
+
+  test "test_connection raises unauthorized when the API key is rejected" do
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:9696/api/v1/indexer").to_return(status: 401)
+
+      error = assert_raises(IndexerClients::Base::AuthenticationError) do
+        ProwlarrClient.test_connection
+      end
+
+      assert_equal "Unauthorized", error.message
+    end
+  end
+
+  test "test_connection raises a timeout instead of returning false" do
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:9696/api/v1/indexer").to_timeout
+
+      error = assert_raises(IndexerClients::Base::ConnectionError) do
+        ProwlarrClient.test_connection
+      end
+
+      assert_equal "Connection timed out", error.message
+    end
+  end
+
+  test "test_connection raises connection refused" do
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:9696/api/v1/indexer")
+        .to_raise(Errno::ECONNREFUSED.new("Connection refused - connect(2)"))
+
+      error = assert_raises(IndexerClients::Base::ConnectionError) do
+        ProwlarrClient.test_connection
+      end
+
+      assert_equal "Connection refused", error.message
+    end
+  end
+
+  test "test_connection raises DNS failures" do
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:9696/api/v1/indexer").to_raise(
+        SocketError.new("Failed to open TCP connection to prowlarr:9696 (getaddrinfo: Name or service not known)")
+      )
+
+      error = assert_raises(IndexerClients::Base::ConnectionError) do
+        ProwlarrClient.test_connection
+      end
+
+      assert_equal "Could not resolve host", error.message
+    end
+  end
+
+  test "test_connection raises TLS failures" do
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:9696/api/v1/indexer")
+        .to_raise(Faraday::SSLError.new("SSL certificate verify failed"))
+
+      error = assert_raises(IndexerClients::Base::ConnectionError) do
+        ProwlarrClient.test_connection
+      end
+
+      assert_equal "TLS connection failed", error.message
+    end
+  end
+
+  test "test_connection still raises unclassified API errors" do
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:9696/api/v1/indexer").to_return(status: 500, body: "")
+
+      error = assert_raises(IndexerClients::Base::Error) do
+        ProwlarrClient.test_connection
+      end
+
+      assert_match "500", error.message
+    end
+  end
+
+  test "test_connection does not retry TLS failures" do
     VCR.turned_off do
       request = stub_request(:get, "http://localhost:9696/api/v1/indexer")
         .to_raise(Faraday::SSLError.new("SSL certificate verify failed"))
 
-      assert_not ProwlarrClient.test_connection
+      error = assert_raises(IndexerClients::Base::ConnectionError) do
+        ProwlarrClient.test_connection
+      end
+
+      assert_equal "TLS connection failed", error.message
       assert_requested request, times: 1
     end
   end
@@ -725,7 +837,304 @@ class ProwlarrClientTest < ActiveSupport::TestCase
     end
   end
 
+  # The jobs process never sees the web process's reset_all_connections!.
+  test "search sends the corrected Prowlarr API key without resetting the connection" do
+    SettingsService.set(:prowlarr_url, "http://prowlarr.example:9696")
+    SettingsService.set(:prowlarr_api_key, "old-key")
+    ProwlarrClient.reset_connection!
+
+    VCR.turned_off do
+      stub_request(:get, "http://prowlarr.example:9696/api/v1/indexer")
+        .with(headers: { "X-Api-Key" => "old-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      assert ProwlarrClient.test_connection
+
+      SettingsService.set(:prowlarr_api_key, "new-key")
+
+      corrected = stub_request(:get, %r{\Ahttp://prowlarr\.example:9696/api/v1/search})
+        .with(headers: { "X-Api-Key" => "new-key" })
+        .to_raise(Faraday::ConnectionFailed.new("connection reset by peer"))
+        .then
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      assert_empty ProwlarrClient.search("atomic habits")
+      assert_requested corrected, times: 2
+    end
+  end
+
+  test "#504 failed idempotent Prowlarr GET retries with the key stored at the retry" do
+    SettingsService.set(:prowlarr_url, "http://prowlarr.example:9696")
+    SettingsService.set(:prowlarr_api_key, "baked-key")
+    ProwlarrClient.reset_connection!
+    baked = ProwlarrClient.send(:connection)
+    assert_equal "baked-key", baked.headers["X-Api-Key"]
+
+    VCR.turned_off do
+      stub_request(:get, %r{\Ahttp://prowlarr\.example:9696/api/v1/search})
+        .with(headers: { "X-Api-Key" => "baked-key" })
+        .to_raise(Faraday::ConnectionFailed.new("connection reset by peer"))
+      retry_request = stub_request(:get, %r{\Ahttp://prowlarr\.example:9696/api/v1/search})
+        .with(headers: { "X-Api-Key" => "retry-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      with_second_prowlarr_connection_key("retry-key") do
+        assert_empty ProwlarrClient.search("issue 504")
+      end
+
+      assert_not_same baked, ProwlarrClient.instance_variable_get(:@connection)
+      assert_equal "retry-key", ProwlarrClient.instance_variable_get(:@connection).headers["X-Api-Key"]
+      assert_requested :get, %r{api/v1/search}, headers: { "X-Api-Key" => "baked-key" }, times: 1
+      assert_requested retry_request, times: 1
+    end
+  end
+
+  test "#504 failed idempotent Prowlarr GET does not reuse the client that failed" do
+    SettingsService.set(:prowlarr_url, "http://prowlarr.example:9696")
+    SettingsService.set(:prowlarr_api_key, "stored-key")
+    ProwlarrClient.reset_connection!
+    baked = ProwlarrClient.send(:connection)
+
+    VCR.turned_off do
+      stub_request(:get, %r{\Ahttp://prowlarr\.example:9696/api/v1/search})
+        .with(headers: { "X-Api-Key" => "stored-key" })
+        .to_raise(Faraday::TimeoutError.new("execution expired"))
+        .then
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      assert_empty ProwlarrClient.search("issue 504")
+      assert_not_same baked, ProwlarrClient.instance_variable_get(:@connection)
+      assert_equal "stored-key", ProwlarrClient.instance_variable_get(:@connection).headers["X-Api-Key"]
+      assert_requested :get, %r{api/v1/search}, headers: { "X-Api-Key" => "stored-key" }, times: 2
+    end
+  end
+
+  test "#358 search uses the saved Prowlarr URL without reset_all_connections!" do
+    SettingsService.set(:prowlarr_url, "http://old-prowlarr.example:9696")
+    SettingsService.set(:prowlarr_api_key, "same-key")
+    ProwlarrClient.reset_connection!
+
+    VCR.turned_off do
+      stub_request(:get, "http://old-prowlarr.example:9696/api/v1/indexer")
+        .with(headers: { "X-Api-Key" => "same-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      assert ProwlarrClient.test_connection
+      memo = ProwlarrClient.instance_variable_get(:@connection)
+      assert_not_nil memo
+
+      SettingsService.set(:prowlarr_url, "http://new-prowlarr.example:9696")
+      assert_same memo, ProwlarrClient.instance_variable_get(:@connection)
+
+      search = stub_request(:get, %r{\Ahttp://new-prowlarr\.example:9696/api/v1/search})
+        .with(headers: { "X-Api-Key" => "same-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      assert_empty ProwlarrClient.search("atomic habits")
+      assert_requested search, times: 1
+      assert_not_requested :get, %r{old-prowlarr\.example:9696/api/v1/search}
+    end
+  end
+
+  test "search uses the corrected Prowlarr URL and API key without resetting the connection" do
+    SettingsService.set(:prowlarr_url, "http://old-prowlarr.example:9696")
+    SettingsService.set(:prowlarr_api_key, "old-key")
+    ProwlarrClient.reset_connection!
+
+    VCR.turned_off do
+      stub_request(:get, "http://old-prowlarr.example:9696/api/v1/indexer")
+        .with(headers: { "X-Api-Key" => "old-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      assert ProwlarrClient.test_connection
+
+      SettingsService.set(:prowlarr_url, "http://new-prowlarr.example:9696")
+      SettingsService.set(:prowlarr_api_key, "new-key")
+
+      corrected_indexer = stub_request(:get, "http://new-prowlarr.example:9696/api/v1/indexer")
+        .with(headers: { "X-Api-Key" => "new-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+      corrected_search = stub_request(:get, %r{\Ahttp://new-prowlarr\.example:9696/api/v1/search})
+        .with(headers: { "X-Api-Key" => "new-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      assert ProwlarrClient.test_connection
+      assert_empty ProwlarrClient.search("atomic habits")
+      assert_requested corrected_indexer, times: 1
+      assert_requested corrected_search, times: 1
+      assert_requested :get, %r{old-prowlarr\.example}, times: 1
+    end
+  end
+
+  test "search uses the corrected Prowlarr URL after the worker health check hit an unreachable host" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://old-prowlarr.example:9696")
+    SettingsService.set(:prowlarr_api_key, "old-key")
+    ProwlarrClient.reset_connection!
+
+    VCR.turned_off do
+      stub_request(:get, "http://old-prowlarr.example:9696/api/v1/indexer")
+        .with(headers: { "X-Api-Key" => "old-key" })
+        .to_raise(Faraday::ConnectionFailed.new("Failed to open TCP connection to old-prowlarr.example:9696"))
+
+      HealthCheckJob.perform_now(service: "indexer")
+      assert SystemHealth.for_service("indexer").down?
+
+      SettingsService.set(:prowlarr_url, "http://new-prowlarr.example:9696")
+      SettingsService.set(:prowlarr_api_key, "new-key")
+
+      corrected_search = stub_request(:get, %r{\Ahttp://new-prowlarr\.example:9696/api/v1/search})
+        .with(headers: { "X-Api-Key" => "new-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      assert_empty ProwlarrClient.search("atomic habits")
+      assert_requested corrected_search, times: 1
+      assert_requested :get, "http://old-prowlarr.example:9696/api/v1/indexer", times: 2
+    end
+  end
+
+  # curl to 127.0.0.1 succeeds in this layout. Net::HTTP spends the whole open
+  # timeout on blackholed ::1 and never tries IPv4, so the saved key still
+  # looks like a connection failure.
+  test "test_connection reaches an IPv4 Prowlarr when IPv6 localhost is blackholed" do
+    server = Ipv4OnlyProwlarr.start
+    addresses = Addrinfo.getaddrinfo("localhost", server.port, nil, :STREAM).map(&:ip_address)
+    assert_includes addresses, "::1"
+    assert_includes addresses, "127.0.0.1"
+
+    SettingsService.set(:prowlarr_url, "http://localhost:#{server.port}")
+    SettingsService.set(:prowlarr_api_key, "blackhole-key")
+    ProwlarrClient.reset_connection!
+    WebMock.allow_net_connect!
+
+    with_env("http_proxy" => nil, "HTTP_PROXY" => nil, "https_proxy" => nil, "HTTPS_PROXY" => nil,
+      "all_proxy" => nil, "ALL_PROXY" => nil, "no_proxy" => nil, "NO_PROXY" => nil) do
+      with_blackholed_ipv6_localhost(server.port) do
+        assert ProwlarrClient.test_connection
+        assert ProwlarrClient.test_connection(url: "http://localhost:#{server.port}", api_key: "blackhole-key")
+      end
+    end
+
+    assert_equal [ "blackhole-key", "blackhole-key" ], server.api_keys
+  ensure
+    WebMock.disable_net_connect!
+    server&.stop
+    ProwlarrClient.reset_connection!
+  end
+
+  test "proxied Prowlarr connections do not pin a direct address" do
+    SettingsService.set(:prowlarr_url, "https://prowlarr.example.test")
+    SettingsService.set(:prowlarr_api_key, "proxy-key")
+    ProwlarrClient.reset_connection!
+    connections = []
+    probes = []
+    new_http = Net::HTTP.method(:new)
+
+    with_env("https_proxy" => "http://127.0.0.1:8888", "HTTPS_PROXY" => nil,
+      "http_proxy" => nil, "HTTP_PROXY" => nil, "no_proxy" => nil, "NO_PROXY" => nil) do
+      VCR.turned_off do
+        stub_request(:get, "https://prowlarr.example.test/api/v1/indexer")
+          .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+        Net::HTTP.stub(:new, ->(*args) { new_http.call(*args).tap { |http| connections << http } }) do
+          ReachableAddress.stub(:reachable_ipaddr, ->(*) { probes << true; "203.0.113.10" }) do
+            assert ProwlarrClient.test_connection
+          end
+        end
+      end
+    end
+
+    assert_not_empty connections
+    connections.each do |http|
+      assert http.proxy?
+      assert_nil http.ipaddr
+      assert_equal "prowlarr.example.test", http.address
+    end
+    assert_empty probes
+  end
+
   private
+
+  def with_blackholed_ipv6_localhost(port)
+    rule = [ "-p", "tcp", "-d", "::1", "--dport", port.to_s, "-j", "DROP" ]
+    installed = system("sudo", "-n", "ip6tables", "-I", "INPUT", *rule, out: File::NULL, err: File::NULL)
+    raise "ip6tables could not blackhole ::1:#{port}" unless installed
+
+    yield
+  ensure
+    system("sudo", "-n", "ip6tables", "-D", "INPUT", *rule, out: File::NULL, err: File::NULL) if installed
+  end
+
+  # Prowlarr bound to IPv4 loopback only. curl reaches it when ::1 is
+  # blackholed; Net::HTTP's single open timeout does not.
+  class Ipv4OnlyProwlarr
+    attr_reader :port, :api_keys
+
+    def self.start
+      server = new
+      server.start
+      server
+    end
+
+    def initialize
+      @tcp = TCPServer.new("127.0.0.1", 0)
+      @port = @tcp.addr[1]
+      @api_keys = []
+      @mutex = Mutex.new
+    end
+
+    def start
+      @thread = Thread.new do
+        loop do
+          client = @tcp.accept
+          serve(client)
+        rescue IOError, Errno::EBADF
+          break
+        rescue StandardError
+          client&.close
+        end
+      end
+    end
+
+    def stop
+      @tcp.close
+      @thread&.join(1)
+    end
+
+    private
+
+    def serve(client)
+      head = +""
+      while (line = client.gets)
+        head << line
+        break if line == "\r\n"
+      end
+      return if head.empty?
+
+      key = head[/^X-Api-Key:\s*(\S+)/i, 1]
+      @mutex.synchronize { @api_keys << key }
+      body = "[]"
+      status = key == "blackhole-key" ? "200 OK" : "401 Unauthorized"
+      client.write "HTTP/1.1 #{status}\r\nContent-Type: application/json\r\nContent-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}"
+    ensure
+      client&.close
+    end
+  end
+
+  def with_second_prowlarr_connection_key(key)
+    singleton = ProwlarrClient.singleton_class
+    original = singleton.instance_method(:connection)
+    calls = 0
+    singleton.define_method(:connection) do
+      calls += 1
+      SettingsService.set(:prowlarr_api_key, key) if calls > 1
+      original.bind_call(self)
+    end
+    yield
+  ensure
+    singleton.define_method(:connection, original)
+    singleton.send(:private, :connection)
+  end
 
   def stub_indexers(*indexers)
     stub_request(:get, %r{localhost:9696/api/v1/indexer})

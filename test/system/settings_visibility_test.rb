@@ -194,6 +194,208 @@ class SettingsVisibilityTest < ApplicationSystemTestCase
     assert_equal "saved-zlibrary-password", SettingsService.get(:zlibrary_password)
   end
 
+  test "insertReplacementText on an api key is stored and a later blank save keeps it" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://prowlarr-save.example.test")
+    SettingsService.set(:prowlarr_api_key, "stored-prowlarr-key")
+    open_settings
+    assert_field "Prowlarr Api Key", with: "", placeholder: "********"
+
+    replace_secret_like_password_manager "Prowlarr Api Key", "posted-prowlarr-key"
+    save_all
+
+    submission = page.evaluate_script("window.settingsVisibilitySubmissions.at(-1)")
+    assert_equal "posted-prowlarr-key", submission.dig("values", "settings[prowlarr_api_key]")
+    assert_equal "posted-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_field "Prowlarr Api Key", with: "", placeholder: "********"
+    assert_no_match "posted-prowlarr-key", page.html
+
+    save_all
+
+    assert_equal "", page.evaluate_script("window.settingsVisibilitySubmissions.at(-1).values['settings[prowlarr_api_key]']")
+    assert_equal "posted-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_field "Prowlarr Api Key", with: "", placeholder: "********"
+  end
+
+  test "a posted api key already sitting in the field is stored on save all" do
+    SettingsService.set(:indexer_provider, "jackett")
+    SettingsService.set(:jackett_url, "http://jackett-save.example.test")
+    SettingsService.set(:jackett_api_key, "stored-jackett-key")
+    open_settings
+    assert_field "Jackett Api Key", with: "", placeholder: "********"
+
+    paste_without_changing "Jackett Api Key", "posted-jackett-key"
+    save_all
+
+    submission = page.evaluate_script("window.settingsVisibilitySubmissions.at(-1)")
+    assert_equal "posted-jackett-key", submission.dig("values", "settings[jackett_api_key]")
+    assert_equal "posted-jackett-key", SettingsService.get(:jackett_api_key)
+    assert_field "Jackett Api Key", with: "", placeholder: "********"
+    assert_no_match "posted-jackett-key", page.html
+  end
+
+  test "a first autofilled api key without an input type is stored and masked on save all" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://prowlarr-save.example.test")
+    SettingsService.set(:prowlarr_api_key, "")
+    open_settings
+    assert_field "Prowlarr Api Key", with: "", placeholder: ""
+    save_all
+    assert_field "Prowlarr Api Key", with: "", placeholder: ""
+
+    page.execute_script(<<~JAVASCRIPT, find_field("Prowlarr Api Key"))
+      const field = arguments[0]
+      field.focus()
+      field.value = "first-autofilled-key"
+      field.dispatchEvent(new Event("input", { bubbles: true }))
+      field.dispatchEvent(new Event("change", { bubbles: true }))
+    JAVASCRIPT
+    save_all
+
+    submission = page.evaluate_script("window.settingsVisibilitySubmissions.at(-1)")
+    assert_not_includes submission.fetch("manualKeys"), "prowlarr_api_key"
+    assert_equal "first-autofilled-key", SettingsService.get(:prowlarr_api_key)
+    assert_field "Prowlarr Api Key", with: "", placeholder: "********"
+    assert_no_match "first-autofilled-key", page.html
+  end
+
+  test "a first prefilled api key followed by an unchanged paste is stored and masked on save all" do
+    SettingsService.set(:indexer_provider, "jackett")
+    SettingsService.set(:jackett_url, "http://jackett-save.example.test")
+    SettingsService.set(:jackett_api_key, "")
+    open_settings
+    assert_field "Jackett Api Key", with: "", placeholder: ""
+
+    paste_without_changing "Jackett Api Key", "first-prefilled-key"
+    save_all
+
+    submission = page.evaluate_script("window.settingsVisibilitySubmissions.at(-1)")
+    assert_not_includes submission.fetch("manualKeys"), "jackett_api_key"
+    assert_equal "first-prefilled-key", SettingsService.get(:jackett_api_key)
+    assert_field "Jackett Api Key", with: "", placeholder: "********"
+    assert_no_match "first-prefilled-key", page.html
+  end
+
+  test "clearing a pasted api key before save keeps the stored secret" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://prowlarr-save.example.test")
+    SettingsService.set(:prowlarr_api_key, "stored-prowlarr-key")
+    open_settings
+
+    paste_secret_field "Prowlarr Api Key", "replacement-prowlarr-key"
+    clear_secret_field "Prowlarr Api Key"
+    save_all
+
+    submission = page.evaluate_script("window.settingsVisibilitySubmissions.at(-1)")
+    assert_equal "", submission.dig("values", "settings[prowlarr_api_key]")
+    assert_equal "stored-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_field "Prowlarr Api Key", with: "", placeholder: "********"
+  end
+
+  test "dropping text on an api key field saves it and masks the field" do
+    SettingsService.set(:indexer_provider, "newznab")
+    SettingsService.set(:newznab_url, "http://newznab-save.example.test")
+    SettingsService.set(:newznab_api_key, "")
+    open_settings
+
+    drop_on_secret_field "Newznab Api Key", "dropped-newznab-key"
+    save_all
+
+    submission = page.evaluate_script("window.settingsVisibilitySubmissions.at(-1)")
+    assert_includes submission.fetch("manualKeys"), "newznab_api_key"
+    assert_equal "dropped-newznab-key", submission.dig("values", "settings[newznab_api_key]")
+    assert_equal "dropped-newznab-key", SettingsService.get(:newznab_api_key)
+    assert_field "Newznab Api Key", with: "", placeholder: "********"
+  end
+
+  test "an unchanged masked api key is submitted blank and is not written over the stored secret" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://prowlarr-save.example.test")
+    SettingsService.set(:prowlarr_api_key, "stored-prowlarr-key")
+    open_settings
+    assert_field "Prowlarr Api Key", with: "", placeholder: "********"
+
+    save_all
+
+    submission = page.evaluate_script("window.settingsVisibilitySubmissions.at(-1)")
+    assert_not_includes submission.fetch("manualKeys"), "prowlarr_api_key"
+    assert_equal "", submission.dig("values", "settings[prowlarr_api_key]")
+    assert_equal "stored-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_field "Prowlarr Api Key", with: "", placeholder: "********"
+    assert_no_match "stored-prowlarr-key", page.html
+  end
+
+  test "a failed save leaves the pasted api key in the field and does not show a saved mask" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://prowlarr-save.example.test")
+    SettingsService.set(:prowlarr_api_key, "")
+    stub_request(:get, "http://prowlarr-save.example.test/api/v1/indexer")
+      .with(headers: { "X-Api-Key" => "retry-prowlarr-key" })
+      .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+    open_settings
+
+    paste_secret_field "Prowlarr Api Key", "retry-prowlarr-key"
+    fill_in "Prowlarr Url", with: "not-a-url"
+    save_all_and_wait
+
+    assert_text "must be a valid HTTP or HTTPS URL"
+    assert_equal "http://prowlarr-save.example.test", SettingsService.get(:prowlarr_url)
+    assert_equal "", SettingsService.get(:prowlarr_api_key)
+    assert_equal "retry-prowlarr-key", page.evaluate_script("document.getElementById('settings_prowlarr_api_key').value")
+    assert_equal "", page.evaluate_script("document.getElementById('settings_prowlarr_api_key').placeholder")
+    assert_no_match "retry-prowlarr-key", page.html
+
+    fill_in "Prowlarr Url", with: "http://prowlarr-save.example.test"
+    save_all
+
+    assert_equal "retry-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_field "Prowlarr Api Key", with: "", placeholder: "********"
+    assert_no_match "retry-prowlarr-key", page.html
+  end
+
+  test "testing the indexer uses the unsaved url and does not save it" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://saved.example:9696")
+    SettingsService.set(:prowlarr_api_key, "saved-key")
+    stub_request(:get, "http://prowlarr.example:9696/api/v1/indexer")
+      .with(headers: { "X-Api-Key" => "saved-key" })
+      .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+    open_settings
+
+    fill_in "Prowlarr Url", with: "http://prowlarr.example:9696"
+    click_on "Test Indexer Connection"
+
+    assert_text "Prowlarr connection successful!"
+    assert_equal "http://saved.example:9696", SettingsService.get(:prowlarr_url)
+    assert_equal "saved-key", SettingsService.get(:prowlarr_api_key)
+  end
+
+  test "pasting a prowlarr api key saves it, masks the field, and the connection check uses it" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://prowlarr-save.example.test")
+    SettingsService.set(:prowlarr_api_key, "")
+    stub_request(:get, "http://prowlarr-save.example.test/api/v1/indexer")
+      .with(headers: { "X-Api-Key" => "pasted-prowlarr-key" })
+      .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+    open_settings
+
+    # Paste without beforeinput. Some browsers insert into a password field
+    # without that event, and Save All then treats the key as an untouched
+    # autofill and drops it. The field is cleared anyway, so it looks blank
+    # and the connection check has no key.
+    paste_secret_field "Prowlarr Api Key", "pasted-prowlarr-key"
+    save_all
+
+    submission = page.evaluate_script("window.settingsVisibilitySubmissions.at(-1)")
+    assert_includes submission.fetch("manualKeys"), "prowlarr_api_key"
+    assert_equal "pasted-prowlarr-key", submission.dig("values", "settings[prowlarr_api_key]")
+    assert_equal "pasted-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_field "Prowlarr Api Key", with: "", placeholder: "********"
+
+    click_on "Test Indexer Connection"
+    assert_text "Prowlarr connection successful!"
+  end
+
   test "save controls and successful save feedback stay reachable while scrolling on mobile" do
     page.current_window.resize_to(390, 844)
     open_settings
@@ -224,9 +426,12 @@ class SettingsVisibilityTest < ApplicationSystemTestCase
         const url = new URL(typeof input === "string" ? input : input.url, window.location.origin)
         if (url.pathname !== "/admin/settings/bulk_update") return originalFetch(input, options)
 
+        const values = {}
+        for (const [name, value] of options.body.entries()) values[name] = value
         window.settingsVisibilitySubmissions.push({
           fields: Array.from(options.body.keys()),
-          manualKeys: (options.body.get("manual_keys") || "").split(",")
+          manualKeys: (options.body.get("manual_keys") || "").split(","),
+          values
         })
         return originalFetch(input, options).then((response) => {
           document.documentElement.dataset.settingsVisibilitySaves = window.settingsVisibilitySubmissions.length
@@ -234,6 +439,72 @@ class SettingsVisibilityTest < ApplicationSystemTestCase
         })
       }
     JAVASCRIPT
+  end
+
+  def paste_secret_field(label, value)
+    field = find_field(label)
+    page.execute_script(<<~JAVASCRIPT, field, value)
+      const field = arguments[0]
+      const value = arguments[1]
+      field.focus()
+      field.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true }))
+      field.value = value
+      field.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertFromPaste", data: value }))
+    JAVASCRIPT
+  end
+
+  def replace_secret_like_password_manager(label, value)
+    field = find_field(label)
+    page.execute_script(<<~JAVASCRIPT, field, value)
+      const field = arguments[0]
+      const value = arguments[1]
+      field.focus()
+      field.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: false, inputType: "insertReplacementText", data: value }))
+      field.value = value
+      field.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertReplacementText", data: value }))
+      field.dispatchEvent(new Event("change", { bubbles: true }))
+    JAVASCRIPT
+  end
+
+  def paste_without_changing(label, value)
+    field = find_field(label)
+    page.execute_script(<<~JAVASCRIPT, field, value)
+      const field = arguments[0]
+      const value = arguments[1]
+      field.focus()
+      field.value = value
+      field.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true }))
+    JAVASCRIPT
+    page.evaluate_async_script("setTimeout(arguments[arguments.length - 1], 0)")
+  end
+
+  def clear_secret_field(label)
+    field = find_field(label)
+    page.execute_script(<<~JAVASCRIPT, field)
+      const field = arguments[0]
+      field.focus()
+      field.value = ""
+      field.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }))
+    JAVASCRIPT
+  end
+
+  def drop_on_secret_field(label, value)
+    field = find_field(label)
+    page.execute_script(<<~JAVASCRIPT, field, value)
+      const field = arguments[0]
+      const value = arguments[1]
+      field.focus()
+      field.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertFromDrop", data: value }))
+      field.value = value
+      field.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertFromDrop", data: value }))
+    JAVASCRIPT
+  end
+
+  def save_all_and_wait
+    next_save = page.evaluate_script("window.settingsVisibilitySubmissions.length") + 1
+    click_button "Save All"
+    assert_selector "html[data-settings-visibility-saves='#{next_save}']"
+    assert_selector "form[data-settings-form-target~='form']:not([inert])[aria-busy='false']", visible: :all
   end
 
   def save_all

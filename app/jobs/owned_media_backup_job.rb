@@ -16,7 +16,11 @@ class OwnedMediaBackupJob < ApplicationJob
   JOB_CONCURRENCY_LEASE = 30.minutes
   COMPANION_DATA_ROOT = Pathname("/data").freeze
   DEFAULT_IMPORT_ROOT = "/imports/libation"
-  AUDIO_EXTENSIONS = %w[.m4b .m4a .mp3].freeze
+  PREFERRED_AUDIO_EXTENSIONS = %w[m4b m4a mp3].freeze
+  AUDIO_EXTENSIONS = (
+    (PREFERRED_AUDIO_EXTENSIONS & AudiobookBundleImportPlanner::KNOWN_AUDIO_EXTENSIONS) +
+    (AudiobookBundleImportPlanner::KNOWN_AUDIO_EXTENSIONS - PREFERRED_AUDIO_EXTENSIONS)
+  ).map { |extension| ".#{extension}" }.freeze
   LIBATION_COLLISION_SUFFIX = / \(([1-9][0-9]{0,8})\)\z/
   MAX_DIRECTORY_ENTRIES = 10_000
 
@@ -306,7 +310,6 @@ class OwnedMediaBackupJob < ApplicationJob
 
       # Re-resolve both paths after opening, then prove the pathname still
       # identifies the held descriptor. The descriptor remains authoritative
-      # if the shared path is changed after this point.
       current_root = import_root.realpath
       resolved_path = candidate.realpath
       path_stat = resolved_path.stat
@@ -641,7 +644,7 @@ class OwnedMediaBackupJob < ApplicationJob
       "[OwnedMediaBackupJob] Upload processing enqueue for upload ##{upload.id} " \
         "failed with #{error.class}; the durable backup poll will retry"
     )
-    false
+    RemoteResult::Failed.new(error)
   end
 
   def backup_expired?(media_import)

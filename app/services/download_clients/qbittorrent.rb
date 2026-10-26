@@ -6,14 +6,10 @@ require "faraday/multipart"
 require "stringio"
 
 module DownloadClients
-  # qBittorrent WebUI API client
-  # https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-(qBittorrent-5.0)
   class Qbittorrent < Base
     DEFAULT_TORRENT_VERIFICATION_MAX_ATTEMPTS = 10
     DEFAULT_TORRENT_VERIFICATION_WAIT_TIME = 2
 
-    # Add a torrent by URL or magnet link
-    # Returns the torrent hash on success, nil on failure
     def add_torrent(url, options = {})
       ensure_authenticated!
 
@@ -76,7 +72,6 @@ module DownloadClients
       raise Base::ConnectionError, "Failed to connect to qBittorrent: #{e.message}"
     end
 
-    # Get info for a specific torrent by hash
     def torrent_info(hash)
       ensure_authenticated!
 
@@ -89,7 +84,6 @@ module DownloadClients
       end
     end
 
-    # List all torrents
     def list_torrents(filter = {})
       ensure_authenticated!
 
@@ -105,34 +99,29 @@ module DownloadClients
     def test_connection
       ensure_authenticated!
 
-      # Actually call an API endpoint to verify the full path works
-      # (not just authentication which uses a different code path)
-      url = "#{base_url}/api/v2/app/version"
       response = connection.get("api/v2/app/version")
 
       if response.status == 200
         Rails.logger.info "[Qbittorrent] Connection test passed - version: #{response.body}"
-        ensure_category_exists!
-        true
-      else
-        # Clear stale session so next attempt re-authenticates
-        clear_session! if response.status == 401 || response.status == 403
-        Rails.logger.error "[Qbittorrent] Connection test failed: GET #{url} returned #{response.status} (#{response.body.to_s.truncate(200)})"
-        false
+        return true
       end
-    rescue AuthenticationError => e
-      Rails.logger.error "[Qbittorrent] Authentication failed for #{config.name} at #{base_url}: #{e.message}"
-      false
-    rescue ConnectionError => e
-      Rails.logger.error "[Qbittorrent] Connection failed for #{config.name} at #{base_url}: #{e.message}"
-      false
-    rescue Error => e
-      Rails.logger.error "[Qbittorrent] Unexpected error for #{config.name} at #{base_url}: #{e.message}"
-      false
+
+      clear_session! if response.status == 401 || response.status == 403
+      classified = ConnectionErrorClassifier.classify(status: response.status)
+      if classified
+        raise Base::AuthenticationError, classified.message
+      end
+
+      raise Base::Error, "qBittorrent API error: #{response.status}"
+    rescue Base::Error, Faraday::Error => e
+      Rails.logger.error "[Qbittorrent] Connection test failed for #{config.name} at #{base_url}: #{ConnectionErrorClassifier.describe(e)}"
+      ConnectionErrorClassifier.reraise!(
+        e,
+        connection_error: Base::ConnectionError,
+        authentication_error: Base::AuthenticationError
+      )
     end
 
-    # Remove a torrent by hash
-    # delete_files: if true, also delete downloaded files from disk
     def remove_torrent(hash, delete_files: false)
       ensure_authenticated!
 
@@ -156,23 +145,6 @@ module DownloadClients
       raise Base::ConnectionError, "Failed to connect to qBittorrent: #{e.message}"
     end
 
-    # Auto-create the configured category in qBittorrent (idempotent)
-    def ensure_category_exists!
-      return unless config.category.present?
-
-      response = connection.post("api/v2/torrents/createCategory", { category: config.category })
-      case response.status
-      when 200
-        Rails.logger.info "[Qbittorrent] Category '#{config.category}' created in #{config.name}"
-      when 409
-        # Already exists — expected
-      else
-        Rails.logger.warn "[Qbittorrent] Failed to create category '#{config.category}': HTTP #{response.status}"
-      end
-    rescue => e
-      Rails.logger.warn "[Qbittorrent] Failed to ensure category (non-fatal): #{e.message}"
-    end
-
     # Fetch qBittorrent's save path and category info for diagnostics
     def connection_diagnostics
       ensure_authenticated!
@@ -193,7 +165,7 @@ module DownloadClients
       }
     rescue => e
       Rails.logger.warn "[Qbittorrent] Failed to fetch diagnostics: #{e.message}"
-      nil
+      RemoteResult::Failed.new(e)
     end
 
     private
@@ -240,7 +212,7 @@ module DownloadClients
       else
         resolve_torrent_source(url)
       end
-      if source.blank?
+      if RemoteResult.failed?(source) || source.blank?
         raise Base::Error, "Could not safely fetch torrent source" if validate_source_url
 
         return { url: url }
@@ -259,7 +231,7 @@ module DownloadClients
       end
 
       hash = extract_hash_from_torrent_data(torrent_data)
-      if hash.present?
+      if RemoteResult.succeeded?(hash)
         { url: resolved_url, hash: hash, torrent_data: torrent_data }
       else
         raise Base::Error, "Torrent source did not return a valid torrent file" if validate_source_url
@@ -272,11 +244,9 @@ module DownloadClients
       MagnetLink.info_hash(url)
     end
 
-    # Check if URL points to a .torrent file
     def torrent_file_url?(url)
       return false if url.blank?
 
-      # Check file extension
       return true if url.match?(/\.torrent(\?|$)/i)
 
       # Many private trackers use URLs like /download.php?id=123 that return torrent files
@@ -284,11 +254,9 @@ module DownloadClients
       true
     end
 
-    # Resolve redirects and fetch torrent content when available.
-    # Returns { url: String, torrent_data: String? }.
     def resolve_torrent_source(raw_url)
       normalized_url = normalized_torrent_url(raw_url)
-      return nil unless normalized_url
+      return nil if RemoteResult.failed?(normalized_url) || normalized_url.blank?
 
       current_url = normalized_url
       max_redirects = 10
@@ -302,7 +270,7 @@ module DownloadClients
         location = response.headers["location"]
         if response.status.between?(300, 399) && location.present?
           redirected_url = absolutize_redirect_url(current_url, location)
-          return { url: current_url } if redirected_url.blank?
+          return { url: current_url } if RemoteResult.failed?(redirected_url) || redirected_url.blank?
           return { url: redirected_url } if redirected_url.start_with?("magnet:")
 
           current_url = redirected_url
@@ -321,20 +289,19 @@ module DownloadClients
       { url: current_url }
     rescue URI::InvalidURIError => e
       Rails.logger.warn "[Qbittorrent] Invalid torrent URL for hash extraction: #{e.message}"
-      nil
+      RemoteResult::Failed.new(e)
     rescue Faraday::Error => e
       Rails.logger.warn "[Qbittorrent] Failed to download torrent file: #{e.message}"
-      nil
+      RemoteResult::Failed.new(e)
     rescue => e
       Rails.logger.warn "[Qbittorrent] Unexpected error extracting hash: #{e.class} - #{e.message}"
-      nil
+      RemoteResult::Failed.new(e)
     end
 
     # Extract the torrent info hash from bencoded torrent content.
     def extract_hash_from_torrent_data(torrent_data)
       return nil if torrent_data.blank?
 
-      # Parse the torrent file (bencoded format)
       parsed = BEncode.load(torrent_data.dup)
       return nil unless parsed.is_a?(Hash) && parsed["info"].is_a?(Hash)
 
@@ -343,7 +310,7 @@ module DownloadClients
       Digest::SHA1.hexdigest(info_bencoded).downcase
     rescue BEncode::DecodeError => e
       Rails.logger.warn "[Qbittorrent] Failed to parse torrent file (not valid bencode): #{e.message}"
-      nil
+      RemoteResult::Failed.new(e)
     end
 
     def normalized_torrent_url(raw_url)
@@ -355,7 +322,7 @@ module DownloadClients
       uri.to_s
     rescue URI::InvalidURIError => e
       Rails.logger.warn "[Qbittorrent] Invalid torrent URL for hash extraction: #{e.message}"
-      nil
+      RemoteResult::Failed.new(e)
     end
 
     # Separate connection for downloading torrent files (different from qBittorrent API)
@@ -379,8 +346,8 @@ module DownloadClients
       return nil unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
 
       resolved
-    rescue URI::InvalidURIError
-      nil
+    rescue URI::InvalidURIError => error
+      RemoteResult::Failed.new(error)
     end
 
     def extract_magnet_from_body(body)
@@ -389,16 +356,7 @@ module DownloadClients
 
     # Upload a .torrent file directly to qBittorrent via multipart form upload.
     def upload_torrent_file(torrent_data, options = {})
-      upload_conn = Faraday.new(url: base_url) do |f|
-        f.request :multipart
-        f.request :url_encoded
-        f.adapter Faraday.default_adapter
-        apply_authentication_headers(f.headers)
-        f.headers["Referer"] = base_url
-        f.headers["Origin"] = base_url
-        f.options.timeout = 30
-        f.options.open_timeout = 10
-      end
+      upload_conn = api_connection(timeout: 30, open_timeout: 10, multipart: true, authenticate: true)
 
       payload = {
         torrents: Faraday::Multipart::FilePart.new(
@@ -436,11 +394,10 @@ module DownloadClients
       return nil unless body.is_a?(String)
 
       JSON.parse(body)
-    rescue JSON::ParserError
-      nil
+    rescue JSON::ParserError => error
+      RemoteResult::Failed.new(error)
     end
 
-    # Fetch torrent hashes as a Set, optionally filtered by category
     def fetch_torrent_hashes(category: nil)
       params = category.present? ? { category: category } : {}
       response = connection.get("api/v2/torrents/info", params)
@@ -489,16 +446,13 @@ module DownloadClients
     end
 
     def authenticate!
-      login_url = "#{base_url}/api/v2/auth/login"
+      login_url = "#{base_url.to_s.chomp("/")}/api/v2/auth/login"
       Rails.logger.info "[Qbittorrent] Authenticating to #{config.name} at #{login_url} (username: #{username})"
 
-      auth_response = Faraday.post(
+      auth_response = login_connection.post(
         login_url,
         { username: username, password: password }
-      ) do |req|
-        req.headers["Referer"] = base_url
-        req.headers["Origin"] = base_url
-      end
+      )
 
       if (auth_response.status == 200 && auth_response.body == "Ok.") ||
          (auth_response.status == 204 && auth_response.headers["set-cookie"].present?)
@@ -523,6 +477,10 @@ module DownloadClients
     end
 
     def session_key
+      # An unsaved probe has no id, so keep its login on this adapter instead of
+      # sharing one nil-keyed session with every other probe on the thread.
+      return @unsaved_session ||= {} if config.id.nil?
+
       # Use config.id to store session per client instance
       Thread.current[:qbittorrent_sessions] ||= {}
       Thread.current[:qbittorrent_sessions][config.id] ||= {}
@@ -557,16 +515,40 @@ module DownloadClients
       end
     end
 
+    def login_connection
+      api_connection(timeout: 15, open_timeout: 5)
+    end
+
     def connection
-      Faraday.new(url: base_url) do |f|
-        f.request :url_encoded
-        f.response :json, parser_options: { symbolize_names: false }
-        f.adapter Faraday.default_adapter
-        apply_authentication_headers(f.headers)
-        f.headers["Referer"] = base_url
-        f.headers["Origin"] = base_url
-        f.options.timeout = 15
-        f.options.open_timeout = 5
+      api_connection(timeout: 15, open_timeout: 5, json: true, authenticate: true)
+    end
+
+    def api_connection(timeout:, open_timeout:, json: false, multipart: false, authenticate: false)
+      Faraday.new(url: base_url) do |builder|
+        builder.request :multipart if multipart
+        builder.request :url_encoded
+        builder.response :json, parser_options: { symbolize_names: false } if json
+        install_reachable_address_adapter(builder, open_timeout)
+        apply_authentication_headers(builder.headers) if authenticate
+        builder.headers["Referer"] = base_url
+        builder.headers["Origin"] = base_url
+        builder.options.timeout = timeout
+        builder.options.open_timeout = open_timeout
+      end
+    end
+
+    # Net::HTTP uses one open timeout for every getaddrinfo result. A blackholed
+    # first address — IPv6 localhost in Docker — expires before IPv4 is tried.
+    # A proxy resolves the target itself. Pinning here also replaces the
+    # HTTPS CONNECT hostname, which can break proxy DNS and host allowlists.
+    def install_reachable_address_adapter(builder, open_timeout)
+      if builder.proxy
+        builder.adapter Faraday.default_adapter
+        return
+      end
+
+      builder.adapter :net_http do |http|
+        ReachableAddress.assign_reachable_address(http, base_url, http.open_timeout || open_timeout)
       end
     end
 

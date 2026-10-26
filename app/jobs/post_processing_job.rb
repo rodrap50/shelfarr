@@ -45,6 +45,7 @@ class PostProcessingJob < ApplicationJob
     @referenced_file_count = 0
     @reused_file_count = 0
     @completed_reference_target_roots = []
+    @imported_library_entry = false
     download = Download.find_by(id: download_id)
     return unless download&.completed?
 
@@ -58,7 +59,8 @@ class PostProcessingJob < ApplicationJob
     return unless download.completed?
 
     request = download.request
-    return unless claim_request_for_post_processing(download, request, expected_owner_job_id)
+    claimed = claim_request_for_post_processing(download, request, expected_owner_job_id)
+    return if RemoteResult.failed?(claimed) || !claimed
 
     book = request.book
     acquisition_finalized = false
@@ -72,22 +74,22 @@ class PostProcessingJob < ApplicationJob
           "This title already has an acquisition in progress; its recovery reservation was preserved"
       end
 
-      # Shelfarr versions which predate atomic finalization could be killed
-      # after attaching the imported path to Book but before completing the
-      # Request. The durable Download owner proves this request still needs
-      # reconciliation, so finish only the database transition and retain the
+      # A verifiable library path means a prior (or legacy) acquisition already
+      # published the file. Finish only the database transition and retain the
       # download source for manual cleanup.
-      if book.acquired?
-        unless verifiable_library_entry?(book.file_path)
-          raise BookAcquisitionConflictError,
-            "The existing library entry could not be verified; its database state was preserved for review"
-        end
-
-        acquisition_finalized = finalize_acquisition!(
-          download,
-          request,
-          book,
-          book.file_path
+      #
+      # An unverifiable path is stale: re-import from the completed download
+      # instead of leaving Retry stuck in Attention Required. A later
+      # finalize_acquisition! replaces that path only after import succeeds,
+      # and still preserves a different verifiable library file.
+      if book.acquired? && RemoteResult.succeeded?(verifiable_library_entry?(book.file_path))
+        acquisition_finalized = RemoteResult.succeeded?(
+          finalize_acquisition!(
+            download,
+            request,
+            book,
+            book.file_path
+          )
         )
         return unless acquisition_finalized
 
@@ -142,8 +144,11 @@ class PostProcessingJob < ApplicationJob
       end
 
       book_path = imported_book_path(book, destination)
+      @imported_library_entry = true
       cleanup_state = source_cleanup&.fetch(:state)
-      acquisition_finalized = finalize_acquisition!(download, request, book, book_path, cleanup_state)
+      acquisition_finalized = RemoteResult.succeeded?(
+        finalize_acquisition!(download, request, book, book_path, cleanup_state)
+      )
       return unless acquisition_finalized
 
       # Destructive source/client cleanup happens only after Book, Request, and
@@ -165,6 +170,7 @@ class PostProcessingJob < ApplicationJob
     rescue => e
       error_detail = "#{e.class}: #{bounded_exception_message(e)}"
       diagnostic_path = bounded_error_path(e)
+      diagnostic_path = nil if RemoteResult.failed?(diagnostic_path)
       error_detail << " at #{diagnostic_path.inspect}" if diagnostic_path
       cause = e.cause
       if cause && !cause.equal?(e)
@@ -203,8 +209,8 @@ class PostProcessingJob < ApplicationJob
     end
 
     true
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def finalize_acquisition!(download, request, book, imported_path, cleanup_state = nil)
@@ -222,26 +228,22 @@ class PostProcessingJob < ApplicationJob
       end
 
       if book.file_path.blank?
-        reference_target_roots = Book.dump_reference_target_roots(
-          @completed_reference_target_roots
-        )
-        claimed = Book.where(id: book.id)
-          .where("file_path IS NULL OR TRIM(file_path) = ''")
-          .where(acquisition_reservation_token: nil)
-          .update_all(
-            file_path: imported_path,
-            reference_target_roots: reference_target_roots,
-            updated_at: Time.current
-          )
-        unless claimed == 1
-          raise BookAcquisitionConflictError,
-            "Another acquisition claimed this title while post-processing was finalizing"
+        claim_imported_path!(book, imported_path) do
+          Book.where(id: book.id)
+            .where("file_path IS NULL OR TRIM(file_path) = ''")
+            .where(acquisition_reservation_token: nil)
         end
-        book.file_path = imported_path
-        book[:reference_target_roots] = reference_target_roots
-      elsif book.file_path != imported_path
-        raise BookAcquisitionConflictError,
-          "Another acquisition already attached a different library file to this title"
+      elsif book.file_path != imported_path || @imported_library_entry
+        if book.file_path != imported_path && RemoteResult.succeeded?(verifiable_library_entry?(book.file_path))
+          raise BookAcquisitionConflictError,
+            "Another acquisition already attached a different library file to this title"
+        end
+
+        stale_path = book.file_path
+        claim_imported_path!(book, imported_path) do
+          Book.where(id: book.id, file_path: stale_path)
+            .where(acquisition_reservation_token: nil)
+        end
       end
 
       # Clearing the owner and completing the Request in one transaction closes
@@ -257,8 +259,26 @@ class PostProcessingJob < ApplicationJob
     end
 
     finalized == true
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
+  end
+
+  def claim_imported_path!(book, imported_path)
+    reference_target_roots = Book.dump_reference_target_roots(
+      @completed_reference_target_roots
+    )
+    claimed = yield.update_all(
+      file_path: imported_path,
+      reference_target_roots: reference_target_roots,
+      updated_at: Time.current
+    )
+    unless claimed == 1
+      raise BookAcquisitionConflictError,
+        "Another acquisition claimed this title while post-processing was finalizing"
+    end
+
+    book.file_path = imported_path
+    book[:reference_target_roots] = reference_target_roots
   end
 
   def mark_post_processing_failure!(download, request, error)
@@ -272,8 +292,8 @@ class PostProcessingJob < ApplicationJob
       true
     end
     marked == true
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def run_completion_side_effects(request, download, book, book_path)
@@ -307,8 +327,7 @@ class PostProcessingJob < ApplicationJob
 
     Rails.logger.info "[PostProcessingJob] Completed processing for download #{download&.id}"
   rescue => error
-    # These are post-commit conveniences. Their failure must never reopen or
-    # overwrite the completed acquisition state.
+    # These are post-commit conveniences. Their failure must never reopen or overwrite the completed acquisition state.
     Rails.logger.warn(
       "[PostProcessingJob] Completion side effect failed for download #{download&.id}: #{error.class}"
     )
@@ -319,10 +338,10 @@ class PostProcessingJob < ApplicationJob
     when BookAcquisitionConflictError
       bounded_exception_message(error)
     when FileCopyService::DirectoryNotWritableError
-      location = safe_attention_library_path(error)
+      location = attention_library_location(error)
       "Shelfarr cannot write to #{location || "the configured library directory"}"
     when FileCopyService::UnsafeFilePermissionsError
-      location = safe_attention_library_path(error)
+      location = attention_library_location(error)
       message = "The library filesystem reported unsupported file or directory permissions"
       location ? "#{message} at #{location}" : message
     when FileCopyService::DurabilityUnsupportedError
@@ -370,12 +389,19 @@ class PostProcessingJob < ApplicationJob
     ).squish.first(ERROR_DETAIL_CHARACTER_LIMIT)
   end
 
+  def attention_library_location(error)
+    location = safe_attention_library_path(error)
+    return if RemoteResult.failed?(location)
+
+    location
+  end
+
   def bounded_error_path(error)
     return unless error.respond_to?(:path) && error.path.present?
 
     bounded_diagnostic_text(error.path)
-  rescue StandardError
-    nil
+  rescue StandardError => failure
+    RemoteResult::Failed.new(failure)
   end
 
   def safe_attention_library_path(error)
@@ -389,8 +415,8 @@ class PostProcessingJob < ApplicationJob
     return "the configured library root" if relative.to_s == "."
 
     "library path #{bounded_diagnostic_text(relative.to_s).inspect}"
-  rescue StandardError
-    nil
+  rescue StandardError => failure
+    RemoteResult::Failed.new(failure)
   end
 
   def safe_attention_detail(error)
@@ -418,8 +444,8 @@ class PostProcessingJob < ApplicationJob
     stat = File.lstat(path)
     # Reference import mode publishes leaf symlinks under the library root.
     stat.file? || stat.directory? || stat.symlink?
-  rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR
-    false
+  rescue Errno::ENOENT, Errno::ENOTDIR => error
+    RemoteResult::Failed.new(error)
   end
 
   def source_path_unavailable?(source_path)
@@ -430,8 +456,8 @@ class PostProcessingJob < ApplicationJob
   def validate_download_specific_source_path!(source_path, authorized_roots, download)
     return unless source_path.present?
 
-    roots = Array(authorized_roots).filter_map { |path| canonical_download_root(path) }.uniq
-    shared_roots = shared_download_roots(download).filter_map { |path| canonical_download_root(path) }.uniq
+    roots = canonical_download_roots(authorized_roots)
+    shared_roots = canonical_download_roots(shared_download_roots(download))
     source_stat = File.lstat(source_path)
     reference_link = source_stat.symlink? && reference_completed_downloads?
     source = if reference_link
@@ -529,6 +555,13 @@ class PostProcessingJob < ApplicationJob
     File.realpath(expanded)
   end
 
+  def canonical_download_roots(paths)
+    Array(paths).filter_map { |path|
+      root = canonical_download_root(path)
+      root if RemoteResult.succeeded?(root)
+    }.uniq
+  end
+
   def canonical_download_root(path)
     expanded = File.expand_path(normalize_path_separators(path))
     return unless File.directory?(expanded)
@@ -537,8 +570,8 @@ class PostProcessingJob < ApplicationJob
     return if Pathname(canonical).root?
 
     canonical
-  rescue ArgumentError, SystemCallError
-    nil
+  rescue ArgumentError, SystemCallError => error
+    RemoteResult::Failed.new(error)
   end
 
   def path_inside_root?(path, root)
@@ -623,14 +656,17 @@ class PostProcessingJob < ApplicationJob
       SettingsService.get(:download_local_path, default: "/downloads"),
       SettingsService.get(:download_remote_path),
       download.download_client&.download_path
-    ].compact_blank.filter_map { |path| canonical_download_root(path) }.uniq
-    shared_roots = shared_download_roots(download).filter_map { |path| canonical_download_root(path) }.uniq
+    ].compact_blank.then { |paths| canonical_download_roots(paths) }
+    shared_roots = canonical_download_roots(shared_download_roots(download))
     canonical_source = snapshot.canonical_path.to_s
 
     return if shared_roots.include?(canonical_source)
     return unless authorized_roots.any? { |root| path_inside_root?(canonical_source, root) }
 
-    if FileCopyService.remove_source_tree(snapshot)
+    if RemoteResult.succeeded?(FileCopyService.remove_source_tree(
+      snapshot,
+      allow_nonatomic: SettingsService.get(:allow_nonatomic_nfs_directory_publication)
+    ))
       Rails.logger.info "[PostProcessingJob] Removed empty download job directory"
     end
   rescue FileCopyService::UnsafePathError, SystemCallError => e
@@ -756,7 +792,6 @@ class PostProcessingJob < ApplicationJob
         }
       end
     else
-      # Import single file with renamed filename based on template
       ensure_real_import_directory!(destination)
       import_renamed_file(source, destination, book, language: language)
       source_snapshot = @import_source_file_snapshot
@@ -970,14 +1005,17 @@ class PostProcessingJob < ApplicationJob
       extension ||= File.extname(path).delete_prefix(".").downcase
       return false unless File.file?(target) && !File.symlink?(target)
 
-      return EBOOK_ALLOWED_EXTENSIONS.include?(extension) &&
-        valid_ebook_import_content?(target, extension)
+      return false unless EBOOK_ALLOWED_EXTENSIONS.include?(extension)
+
+      return RemoteResult.succeeded?(valid_ebook_import_content?(target, extension))
     end
     return false if File.symlink?(path)
     return false unless File.file?(path)
 
     extension ||= File.extname(path).delete_prefix(".").downcase
-    EBOOK_ALLOWED_EXTENSIONS.include?(extension) && valid_ebook_import_content?(path, extension)
+    return false unless EBOOK_ALLOWED_EXTENSIONS.include?(extension)
+
+    RemoteResult.succeeded?(valid_ebook_import_content?(path, extension))
   end
 
   def valid_ebook_import_content?(path, extension)
@@ -1014,8 +1052,8 @@ class PostProcessingJob < ApplicationJob
     else
       false
     end
-  rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENXIO, Errno::ENODEV, Errno::ENOTDIR
-    false
+  rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENXIO, Errno::ENODEV, Errno::ENOTDIR => error
+    RemoteResult::Failed.new(error)
   end
 
   def executable_file_signature?(head)
@@ -1143,10 +1181,10 @@ class PostProcessingJob < ApplicationJob
       break unless path_occupied?(candidate)
 
       if reference_completed_downloads?
-        if reference_target_matches?(source, candidate)
+        if RemoteResult.succeeded?(reference_target_matches?(source, candidate))
           return [ candidate, true ]
         end
-      elsif !File.symlink?(candidate) && same_file_content?(source, candidate)
+      elsif !File.symlink?(candidate) && RemoteResult.succeeded?(same_file_content?(source, candidate))
         unless hardlink_completed_downloads?
           return [ candidate, true ]
         end
@@ -1162,7 +1200,7 @@ class PostProcessingJob < ApplicationJob
           candidate,
           root: @import_base_path
         )
-        if same_source_inode || prior_fallback_copy
+        if RemoteResult.succeeded?(same_source_inode) || RemoteResult.succeeded?(prior_fallback_copy)
           return [ candidate, true ]
         end
       end
@@ -1201,7 +1239,7 @@ class PostProcessingJob < ApplicationJob
 
   def verify_imported_destination!(source, destination, require_durable:)
     if reference_completed_downloads?
-      unless reference_target_matches?(source, destination)
+      unless RemoteResult.succeeded?(reference_target_matches?(source, destination))
         raise Errno::ESTALE, "library reference changed after import"
       end
       return
@@ -1271,10 +1309,10 @@ class PostProcessingJob < ApplicationJob
     return :complete unless source_cleanup
 
     removed = source_cleanup.fetch(:operation).call
-    return :complete unless removed == false
+    return :complete if removed == true
 
     source_snapshot = source_cleanup.fetch(:source_snapshot)
-    if source_snapshot && FileCopyService.source_file_quarantined?(source_snapshot)
+    if source_snapshot && RemoteResult.succeeded?(FileCopyService.source_file_quarantined?(source_snapshot))
       :retry
     else
       :retained
@@ -1289,7 +1327,7 @@ class PostProcessingJob < ApplicationJob
       source_snapshot,
       destination_snapshot: destination_snapshot
     )
-    Rails.logger.warn "[PostProcessingJob] Source file changed; it was retained" unless removed
+    Rails.logger.warn "[PostProcessingJob] Source file changed; it was retained" unless removed == true
     removed
   end
 
@@ -1311,14 +1349,19 @@ class PostProcessingJob < ApplicationJob
       return false
     end
 
-    removed = FileCopyService.remove_source_tree(source_root)
-    Rails.logger.warn "[PostProcessingJob] Source directory changed; it was retained" unless removed
+    removed = FileCopyService.remove_source_tree(
+      source_root,
+      allow_nonatomic: SettingsService.get(:allow_nonatomic_nfs_directory_publication)
+    )
+    unless removed == true
+      Rails.logger.warn "[PostProcessingJob] Source directory was retained"
+    end
     removed
   end
 
   def destination_snapshots_current?(snapshots)
     snapshots.all? do |snapshot|
-      FileCopyService.file_snapshot_current?(snapshot, require_durable: true)
+      RemoteResult.succeeded?(FileCopyService.file_snapshot_current?(snapshot, require_durable: true))
     end
   end
 
@@ -1393,8 +1436,8 @@ class PostProcessingJob < ApplicationJob
 
     relative = expanded.relative_path_from(@import_source_root.path).to_s
     @import_source_root.reference_snapshots[relative]
-  rescue ArgumentError
-    nil
+  rescue ArgumentError => error
+    RemoteResult::Failed.new(error)
   end
 
   def renamed_destination_file(source, destination, book, language: nil)
@@ -1472,7 +1515,6 @@ class PostProcessingJob < ApplicationJob
     end
     candidates = deduplicate_path_candidates(candidates)
 
-    # Return the first candidate that actually exists on disk.
     candidates.each do |candidate|
       next if candidate[:path].blank?
 
@@ -1482,12 +1524,10 @@ class PostProcessingJob < ApplicationJob
       end
     end
 
-    # None found - log all candidates for debugging
     Rails.logger.warn(
       "[PostProcessingJob] No remapped path exists on disk; tried #{candidates.size} strategies"
     )
 
-    # Return the first non-nil candidate so import_files produces a clear "not found" error
     best_guess = candidates.find { |c| c[:path].present? }
     best_guess || { path: path, authorized_roots: [] }
   end
@@ -1510,7 +1550,7 @@ class PostProcessingJob < ApplicationJob
     Rails.logger.warn(
       "[PostProcessingJob] Could not refresh blank download path from client for download ##{download.id}: #{e.class}"
     )
-    nil
+    RemoteResult::Failed.new(e)
   end
 
   def build_path_candidates(path, download)
@@ -1528,6 +1568,24 @@ class PostProcessingJob < ApplicationJob
       candidates << {
         strategy: "global_prefix_remap",
         path: replace_path_prefix(normalized_path, remote_path, local_path),
+        authorized_roots: [ local_path ]
+      }
+    end
+
+    # 1b. Per-client download_path → local_path prefix replacement.
+    # Users often store the torrent client's host path on the client record and
+    # leave download_remote_path blank. Treat that value as a remap prefix so
+    # nested completed downloads stay visible on the container mount.
+    if client_download_path.present? &&
+        local_path.present? &&
+        remote_path.blank? &&
+        !path_prefix_match?(client_download_path, local_path) &&
+        !Dir.exist?(client_download_path) &&
+        !File.exist?(normalized_path) &&
+        path_prefix_match?(normalized_path, client_download_path)
+      candidates << {
+        strategy: "client_prefix_remap",
+        path: replace_path_prefix(normalized_path, client_download_path, local_path),
         authorized_roots: [ local_path ]
       }
     end
@@ -1562,7 +1620,6 @@ class PostProcessingJob < ApplicationJob
       end
     end
 
-    # 4. Client download_path + basename
     if client_download_path.present?
       candidates << {
         strategy: "client_download_path",
@@ -1668,13 +1725,12 @@ class PostProcessingJob < ApplicationJob
   end
 
   def sanitize_filename(name)
-    # Remove invalid filename characters, collapse whitespace
     name
-      .gsub(/[<>:"\/\\|?*]/, "")  # Remove invalid chars
-      .gsub(/[\x00-\x1f]/, "")    # Remove control characters
+      .gsub(/[<>:"\/\\|?*]/, "")
+      .gsub(/[\x00-\x1f]/, "")
       .strip
-      .gsub(/\s+/, " ")           # Collapse whitespace
-      .truncate(100, omission: "") # Limit length
+      .gsub(/\s+/, " ")
+      .truncate(100, omission: "")
   end
 
   def trigger_library_scan(book)

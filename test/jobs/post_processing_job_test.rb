@@ -9,21 +9,18 @@ class PostProcessingJobTest < ActiveJob::TestCase
   setup do
     LibraryPlatformClient.reset_connections!
 
-    # Create an audiobook for testing (not ebook)
     @book = Book.create!(
       title: "Test Audiobook",
       author: "Test Author",
       book_type: :audiobook
     )
 
-    # Create a request for the audiobook
     @request = Request.create!(
       book: @book,
       user: users(:one),
       status: :downloading
     )
 
-    # Create a completed download
     @download = @request.downloads.create!(
       name: @book.title,
       size_bytes: 1073741824,
@@ -32,27 +29,22 @@ class PostProcessingJobTest < ActiveJob::TestCase
       progress: 100
     )
 
-    # Setup Audiobookshelf settings
     SettingsService.set(:audiobookshelf_url, "http://localhost:13378")
     SettingsService.set(:audiobookshelf_api_key, "test-api-key")
     SettingsService.set(:audiobookshelf_audiobook_library_id, "lib-123")
 
-    # Create temp directories for testing file operations
     @temp_download_base = Dir.mktmpdir("downloads")
     @temp_source = File.join(@temp_download_base, "source")
     FileUtils.mkdir_p(@temp_source)
     @temp_dest_base = Dir.mktmpdir("dest")
 
-    # Set output path to temp destination (Shelfarr always uses its own settings)
     SettingsService.set(:audiobook_output_path, @temp_dest_base)
     SettingsService.set(:download_local_path, @temp_download_base)
     SettingsService.set(:completed_download_import_mode, "copy")
     Setting.where(key: "precreate_download_archives").delete_all
 
-    # Update download path to temp source
     @download.update!(download_path: @temp_source)
 
-    # Create test file in source
     File.write(File.join(@temp_source, "audiobook.mp3"), "test audio content")
   end
 
@@ -338,11 +330,9 @@ class PostProcessingJobTest < ActiveJob::TestCase
       stub_audiobookshelf_library(@temp_dest_base)
       stub_audiobookshelf_scan
 
-      # Capture status changes during job execution
       PostProcessingJob.perform_now(@download.id)
       @request.reload
 
-      # After job completes, status should be completed (went through processing first)
       assert @request.completed?
     end
   end
@@ -503,6 +493,65 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert_not File.exist?(File.join(@temp_dest_base, "Frank Herbert", "Dune", "Frank Herbert - Dune.epub"))
   end
 
+  test "ebook and audiobook downloads share one folder on a shared root and template" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:ebook_output_path, @temp_dest_base)
+    SettingsService.set(:audiobook_output_path, @temp_dest_base)
+    SettingsService.set(:ebook_path_template, "{series/}{seriesNum:00 - }{title}")
+    SettingsService.set(:audiobook_path_template, "{series/}{seriesNum:00 - }{title}")
+    SettingsService.set(:ebook_filename_template, "{author} - {title}")
+
+    FileUtils.rm_rf(@temp_source)
+    FileUtils.mkdir_p(@temp_source)
+    write_valid_ebook_file(File.join(@temp_source, "The Final Empire.epub"))
+    @book.update!(
+      title: "The Final Empire",
+      author: "Brandon Sanderson",
+      series: "Mistborn",
+      series_position: "1",
+      book_type: :ebook
+    )
+
+    PostProcessingJob.perform_now(@download.id)
+
+    shared_folder = File.join(@temp_dest_base, "Mistborn", "01 - The Final Empire")
+    ebook_file = File.join(shared_folder, "Brandon Sanderson - The Final Empire.epub")
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal shared_folder, @book.reload.file_path
+    assert File.exist?(ebook_file)
+
+    audiobook = Book.create!(
+      title: @book.title,
+      author: @book.author,
+      series: @book.series,
+      series_position: @book.series_position,
+      book_type: :audiobook
+    )
+    audio_request = Request.create!(
+      book: audiobook,
+      user: users(:one),
+      status: :downloading
+    )
+    audio_source = File.join(@temp_download_base, "audio-source")
+    FileUtils.mkdir_p(audio_source)
+    File.write(File.join(audio_source, "audiobook.mp3"), "companion audio")
+    audio_download = audio_request.downloads.create!(
+      name: audiobook.title,
+      size_bytes: 1024,
+      status: :completed,
+      download_path: audio_source,
+      progress: 100
+    )
+
+    PostProcessingJob.perform_now(audio_download.id)
+
+    assert audio_request.reload.completed?, audio_request.issue_description
+    assert_equal shared_folder, audiobook.reload.file_path
+    assert File.exist?(ebook_file)
+    assert File.exist?(File.join(shared_folder, "audiobook.mp3"))
+    assert_not File.exist?("#{shared_folder} (2)")
+  end
+
   test "preserves original files for seeding" do
     VCR.turned_off do
       stub_audiobookshelf_library(@temp_dest_base)
@@ -513,10 +562,8 @@ class PostProcessingJobTest < ActiveJob::TestCase
 
       PostProcessingJob.perform_now(@download.id)
 
-      # Original file should still exist (copy, not move)
       assert File.exist?(original_file), "Source file should still exist after processing (copy, not move)"
 
-      # Destination file should also exist
       expected_dest = File.join(@temp_dest_base, @book.author, @book.title)
       destination_file = File.join(expected_dest, "audiobook.mp3")
       assert File.exist?(destination_file), "Destination file should exist"
@@ -1155,6 +1202,40 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert File.exist?(File.join(expected_dest, "audiobook.mp3")), "Destination file should exist"
     assert_not File.exist?(original_file), "Source file should be removed after successful import"
     assert_not File.exist?(@temp_source), "Source download folder should be removed after successful import"
+  end
+
+  test "move import removes the source on NFS EINVAL when non-atomic publication is enabled" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:allow_nonatomic_nfs_directory_publication, true)
+
+    with_nfs_rejecting_source_quarantine_renames do
+      PostProcessingJob.perform_now(@download.id)
+    end
+
+    expected_dest = File.join(@temp_dest_base, @book.author, @book.title)
+    assert File.exist?(File.join(expected_dest, "audiobook.mp3"))
+    assert_not File.exist?(@temp_source)
+  ensure
+    SettingsService.set(:allow_nonatomic_nfs_directory_publication, false)
+  end
+
+  test "move import retains the source on NFS EINVAL and logs atomic rename unsupported" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:allow_nonatomic_nfs_directory_publication, false)
+
+    output = capture_private_post_processing_logs do
+      with_nfs_rejecting_source_quarantine_renames do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    expected_dest = File.join(@temp_dest_base, @book.author, @book.title)
+    assert File.exist?(File.join(expected_dest, "audiobook.mp3"))
+    assert File.exist?(@temp_source)
+    assert_match(/atomic source (quarantine|rename) is unsupported/i, output)
+    assert_no_match(/Source directory changed/, output)
   end
 
   test "removes source directory after split audiobook bundle move import" do
@@ -2280,7 +2361,6 @@ class PostProcessingJobTest < ActiveJob::TestCase
       stub_request(:post, "http://localhost:13378/api/libraries/lib-123/scan")
         .to_return(status: 500)
 
-      # Should not raise, just log warning
       assert_nothing_raised do
         PostProcessingJob.perform_now(@download.id)
       end
@@ -2324,17 +2404,14 @@ class PostProcessingJobTest < ActiveJob::TestCase
       PostProcessingJob.perform_now(@download.id)
       @book.reload
 
-      # Extract just the folder names from the path
       path_parts = @book.file_path.split(File::SEPARATOR)
       author_folder = path_parts[-2]
       title_folder = path_parts[-1]
 
-      # Author folder should have invalid chars removed
       assert_not_includes author_folder, ":"
       assert_not_includes author_folder, "|"
       assert_not_includes author_folder, "*"
 
-      # Title folder should have invalid chars removed
       assert_not_includes title_folder, "<"
       assert_not_includes title_folder, ">"
       assert_not_includes title_folder, "?"
@@ -2342,8 +2419,6 @@ class PostProcessingJobTest < ActiveJob::TestCase
   end
 
   test "succeeds even when audiobookshelf library fetch fails" do
-    # Shelfarr now uses its own configured paths, not Audiobookshelf's.
-    # Processing should succeed regardless of ABS API issues.
     VCR.turned_off do
       stub_request(:get, "http://localhost:13378/api/libraries/lib-123")
         .to_return(status: 500)
@@ -2353,20 +2428,49 @@ class PostProcessingJobTest < ActiveJob::TestCase
       PostProcessingJob.perform_now(@download.id)
       @request.reload
 
-      # Request should complete successfully since we use Shelfarr's output path
       assert @request.completed?
       expected_dest = File.join(@temp_dest_base, @book.author, @book.title)
       assert File.exist?(File.join(expected_dest, "audiobook.mp3"))
     end
   end
 
+  test "remaps a host-style client download_path prefix onto the local mount" do
+    FileUtils.rm_rf(@temp_source)
+    nested_source = File.join(@temp_source, "completed", "shelfarr")
+    FileUtils.mkdir_p(nested_source)
+    write_valid_ebook_file(File.join(nested_source, "Host Client Book.epub"))
+
+    client = DownloadClient.create!(
+      name: "Host Path Client",
+      client_type: :qbittorrent,
+      url: "http://localhost:8080",
+      download_path: "/mnt/torrents"
+    )
+
+    @book.update!(book_type: :ebook)
+    @download.update!(
+      download_client: client,
+      download_path: "/mnt/torrents/completed/shelfarr/Host Client Book.epub"
+    )
+
+    SettingsService.set(:download_remote_path, "")
+    SettingsService.set(:download_local_path, @temp_source)
+    SettingsService.set(:ebook_output_path, @temp_dest_base)
+    SettingsService.set(:audiobookshelf_url, "")
+
+    resolution = PostProcessingJob.new.send(
+      :remap_download_path,
+      @download.download_path,
+      @download.reload
+    )
+    assert_equal File.join(nested_source, "Host Client Book.epub"), resolution[:path]
+  end
+
   test "uses per-client download path when configured" do
-    # Create a subdirectory in temp_source to simulate a download folder
     download_subdir = File.join(@temp_source, "Test Audiobook")
     FileUtils.mkdir_p(download_subdir)
     File.write(File.join(download_subdir, "audiobook.mp3"), "test audio content")
 
-    # Create a download client with a specific download path
     client = DownloadClient.create!(
       name: "Test Client",
       client_type: :qbittorrent,
@@ -2387,7 +2491,6 @@ class PostProcessingJobTest < ActiveJob::TestCase
 
     PostProcessingJob.perform_now(@download.id)
 
-    # File should be copied to destination
     expected_dest = File.join(@temp_dest_base, @book.author, @book.title)
     assert File.exist?(File.join(expected_dest, "audiobook.mp3")), "File should be copied using client-specific path"
   end
@@ -2404,7 +2507,6 @@ class PostProcessingJobTest < ActiveJob::TestCase
     SettingsService.set(:audiobookshelf_url, "")
 
     VCR.turned_off do
-      # Stub the SABnzbd queue delete API call
       remove_stub = stub_request(:get, "http://localhost:8080/api")
         .with(query: hash_including("mode" => "queue", "name" => "delete", "value" => "SABnzbd_nzo_abc123", "del_files" => "1"))
         .to_return(status: 200, body: { "status" => true }.to_json, headers: { "Content-Type" => "application/json" })
@@ -2503,7 +2605,6 @@ class PostProcessingJobTest < ActiveJob::TestCase
     PostProcessingJob.perform_now(@download.id)
 
     assert @request.reload.completed?
-    # Source files should still exist (copied, not removed)
     assert File.exist?(File.join(@temp_source, "audiobook.mp3"))
   end
 
@@ -2520,7 +2621,6 @@ class PostProcessingJobTest < ActiveJob::TestCase
 
     SettingsService.set(:audiobookshelf_url, "")
 
-    # No HTTP stubs for SABnzbd - if cleanup ran, it would hit VCR and fail
     PostProcessingJob.perform_now(@download.id)
 
     assert @request.reload.completed?
@@ -2538,7 +2638,6 @@ class PostProcessingJobTest < ActiveJob::TestCase
     SettingsService.set(:audiobookshelf_url, "")
 
     VCR.turned_off do
-      # Stub SABnzbd to return an error
       stub_request(:get, "http://localhost:8080/api")
         .with(query: hash_including("mode" => "queue", "name" => "delete"))
         .to_return(status: 500)
@@ -2548,7 +2647,6 @@ class PostProcessingJobTest < ActiveJob::TestCase
 
       PostProcessingJob.perform_now(@download.id)
 
-      # Import should still complete despite cleanup failure
       assert @request.reload.completed?
     end
   end
@@ -2636,7 +2734,6 @@ class PostProcessingJobTest < ActiveJob::TestCase
     # but download_remote_path is /mnt/media/Torrents/Completed (SABnzbd path)
     # The category-aware remapping should detect the shared parent and remap correctly
 
-    # Create a subdirectory simulating the category-based download path
     category_dir = File.join(@temp_source, "shelfarr")
     download_dir = File.join(category_dir, "Test Audiobook")
     FileUtils.mkdir_p(download_dir)
@@ -2649,7 +2746,6 @@ class PostProcessingJobTest < ActiveJob::TestCase
       category: "shelfarr"
     )
 
-    # Host path: /mnt/media/Torrents/shelfarr/Test Audiobook
     @download.update!(
       download_client: client,
       download_path: "/mnt/media/Torrents/shelfarr/Test Audiobook"
@@ -2975,6 +3071,50 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert File.exist?(File.join(expected_dest, "Test Author - Test Audiobook.epub"))
   end
 
+  test "preserves a visible per-client path when the global mount has a matching release" do
+    client_root = Dir.mktmpdir("client-download-root")
+    relative = File.join("completed", "release", "Book.epub")
+    client_file = File.join(client_root, relative)
+    global_file = File.join(@temp_download_base, relative)
+    FileUtils.mkdir_p(File.dirname(client_file))
+    FileUtils.mkdir_p(File.dirname(global_file))
+    write_valid_ebook_file(client_file)
+    write_valid_ebook_file(global_file)
+    client = DownloadClient.create!(
+      name: "Separate Local Client", client_type: :transmission,
+      url: "http://localhost:9091", download_path: client_root
+    )
+    @download.update!(download_client: client, download_path: client_file)
+    SettingsService.set(:download_remote_path, "")
+
+    resolution = PostProcessingJob.new.send(:remap_download_path, client_file, @download.reload)
+
+    assert_equal client_file, resolution[:path]
+    assert_includes resolution[:authorized_roots], client_root
+  ensure
+    FileUtils.rm_rf(client_root) if client_root
+  end
+
+  test "does not infer a host prefix for a missing local client directory" do
+    client_root = File.join(@temp_download_base, "missing-client")
+    relative = File.join("completed", "release", "Book.epub")
+    global_file = File.join(@temp_download_base, relative)
+    FileUtils.mkdir_p(File.dirname(global_file))
+    write_valid_ebook_file(global_file)
+    reported_file = File.join(client_root, relative)
+    client = DownloadClient.create!(
+      name: "Missing Local Client", client_type: :transmission,
+      url: "http://localhost:9091", download_path: client_root
+    )
+    @download.update!(download_client: client, download_path: reported_file)
+    SettingsService.set(:download_remote_path, "")
+
+    resolution = PostProcessingJob.new.send(:remap_download_path, reported_file, @download.reload)
+
+    assert_not_equal global_file, resolution[:path]
+    assert_not File.exist?(resolution[:path])
+  end
+
   test "does not remap a single-file path up to the shared category folder" do
     category_dir = File.join(@temp_download_base, "books")
     FileUtils.mkdir_p(category_dir)
@@ -3014,7 +3154,7 @@ class PostProcessingJobTest < ActiveJob::TestCase
       client_type: :qbittorrent,
       url: "http://localhost:8080",
       category: "shelfarr",
-      download_path: @temp_source  # Local path for this client's files
+      download_path: @temp_source
     )
 
     @download.update!(
@@ -3374,6 +3514,68 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert File.exist?(@temp_source), "legacy recovery must not remove an unverified source"
   end
 
+  test "retry recovers when an existing library entry cannot be verified" do
+    SettingsService.set(:audiobookshelf_url, "")
+    stale_path = File.join(@temp_dest_base, "unmapped-host-library", @book.title)
+    @book.update!(file_path: stale_path)
+    @request.update!(
+      status: :processing,
+      attention_needed: true,
+      issue_description: "Post-processing failed: The existing library entry could not be verified; its database state was preserved for review"
+    )
+    @download.update!(post_processing_job_id: "unverified-library-owner")
+
+    assert_equal :post_processing_queued, @request.retry_now!
+    perform_enqueued_jobs only: PostProcessingJob
+
+    expected_dest = File.join(@temp_dest_base, @book.author, @book.title)
+    assert @request.reload.completed?, @request.issue_description
+    assert_not @request.attention_needed?
+    assert_nil @request.issue_description
+    assert_nil @download.reload.post_processing_job_id
+    assert File.exist?(File.join(expected_dest, "audiobook.mp3"))
+    assert_equal expected_dest, @book.reload.file_path
+    assert File.exist?(@temp_source), "copy-mode recovery must retain the download source"
+  end
+
+  test "recovery preserves an existing library entry when access is denied" do
+    SettingsService.set(:audiobookshelf_url, "")
+    existing_path = File.join(@temp_dest_base, "existing.m4b")
+    File.binwrite(existing_path, "existing library bytes")
+    @book.update!(file_path: existing_path)
+    real_lstat = File.method(:lstat)
+    denied_lstat = lambda do |path|
+      raise Errno::EACCES, "library temporarily inaccessible" if path.to_s == existing_path
+
+      real_lstat.call(path)
+    end
+
+    File.stub(:lstat, denied_lstat) { PostProcessingJob.perform_now(@download.id) }
+
+    assert_not @request.reload.completed?
+    assert @request.attention_needed?
+    assert_equal existing_path, @book.reload.file_path
+    assert_equal "existing library bytes", File.binread(existing_path)
+    assert_not File.exist?(File.join(@temp_dest_base, @book.author, @book.title))
+    assert File.exist?(@temp_source)
+  end
+
+  test "reimport at the stale path replaces obsolete reference provenance" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "reference")
+    stale_path = File.join(@temp_dest_base, @book.author, @book.title)
+    @book.update!(file_path: stale_path, reference_target_roots: [
+      { "path" => "/obsolete-download-mount", "device" => 1, "inode" => 2 }
+    ])
+
+    PostProcessingJob.perform_now(@download.id)
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal stale_path, @book.reload.file_path
+    assert_equal [ File.realpath(@temp_download_base) ], @book.reference_target_roots.map { |root| root.path.to_s }
+    assert File.symlink?(File.join(stale_path, "audiobook.mp3"))
+  end
+
   test "a late completion-side-effect failure cannot reopen a completed request" do
     SettingsService.set(:audiobookshelf_url, "")
     job = PostProcessingJob.new(@download.id)
@@ -3685,6 +3887,17 @@ class PostProcessingJobTest < ActiveJob::TestCase
     FileCopyService.stub(:native_linkat, ->(*) { raise Errno::EOPNOTSUPP }) do
       FileCopyService.stub(:native_rename_noreplace, false, &operation)
     end
+  end
+
+  def with_nfs_rejecting_source_quarantine_renames(&operation)
+    real_rename = FileCopyService.method(:native_rename_noreplace)
+    FileCopyService.stub(:native_rename_noreplace, lambda { |source_fd, source_name, destination_fd, destination_name|
+      if destination_name.to_s.start_with?(".shelfarr-remove")
+        raise Errno::EINVAL, "renameat2"
+      end
+
+      real_rename.call(source_fd, source_name, destination_fd, destination_name)
+    }, &operation)
   end
 
   def capture_private_post_processing_logs

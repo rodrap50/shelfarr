@@ -95,6 +95,18 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_select "select[name='settings[metadata_source]'] option[value='comic_vine']", text: "Comic Vine"
   end
 
+  test "index posts connection tests with the current form" do
+    get admin_settings_url
+
+    assert_response :success
+    assert_select "button[formaction='#{test_indexer_admin_settings_path}'][formmethod='post'][data-connection-probe='true']", text: "Test Indexer Connection"
+    assert_select "button[formaction='#{test_audiobookshelf_admin_settings_path}'][formmethod='post'][data-connection-probe='true']", text: "Test Library Platform Connection"
+    assert_match "http://prowlarr:9696", response.body
+    assert_match "http://audiobookshelf:13378", response.body
+    assert_no_match "http://localhost:9696", response.body
+    assert_no_match "http://localhost:13378", response.body
+  end
+
   test "index shows beta eBooks.com store settings" do
     get admin_settings_url
 
@@ -424,7 +436,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
       get admin_settings_url
       assert_response :success
 
-      # Check that library options appear in the page
       assert_select "select[name='settings[audiobookshelf_audiobook_library_id]']" do
         assert_select "option[value='lib-audio']", text: "Audiobooks (book)"
         assert_select "option[value='lib-ebook']", text: "Ebooks (book)"
@@ -455,7 +466,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
       get admin_settings_url
       assert_response :success
 
-      # Check that library options appear in the page as a multi-select
       assert_select "select[name='settings[audiobookshelf_audiobook_scan_library_ids][]'][multiple]" do
         assert_select "option[value='lib-audio'][selected]", text: "Audiobooks (book)"
         assert_select "option[value='lib-ebook']", text: "Ebooks (book)"
@@ -516,7 +526,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     get admin_settings_url
     assert_response :success
 
-    # Should show text input instead of select
     assert_select "input[name='settings[audiobookshelf_audiobook_library_id]']"
   end
 
@@ -528,7 +537,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
       stub_request(:get, "http://localhost:13378/api/libraries")
         .to_return(status: 500)
 
-      # Should not raise, should show text input as fallback
       get admin_settings_url
       assert_response :success
       assert_select "input[name='settings[audiobookshelf_audiobook_library_id]']"
@@ -647,10 +655,13 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_no_match "https://discord.com/api/webhooks/existing", response.body
   end
 
-  test "autosave rejects manual settings in its dirty manifest" do
+  test "autosave does not write manual settings posted beside a dirty value" do
     SettingsService.set(:library_platform, "audiobookshelf")
     SettingsService.set(:bookorbit_username, "existing-user")
     SettingsService.set(:bookorbit_password, "existing-password")
+    platform_stamp = setting_row_stamp("library_platform")
+    username_stamp = setting_row_stamp("bookorbit_username")
+    password_stamp = setting_row_stamp("bookorbit_password")
 
     patch bulk_update_admin_settings_url,
       params: {
@@ -665,17 +676,19 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
       },
       headers: { "Accept" => "text/vnd.turbo-stream.html" }
 
-    assert_response :unprocessable_entity
-    assert_match "Invalid autosave setting manifest", response.body
-    assert_equal 10, SettingsService.get(:max_retries)
+    assert_response :no_content
+    assert_empty response.body
+    assert_equal 23, SettingsService.get(:max_retries)
     assert_equal "audiobookshelf", SettingsService.get(:library_platform)
     assert_equal "existing-user", SettingsService.get(:bookorbit_username)
     assert_equal "existing-password", SettingsService.get(:bookorbit_password)
-    assert_select "turbo-stream[target='flash']", count: 1
-    assert_select "turbo-stream[target='settings-form']", count: 0
+    assert_equal platform_stamp, Setting.find_by!(key: "library_platform").updated_at
+    assert_equal username_stamp, Setting.find_by!(key: "bookorbit_username").updated_at
+    assert_equal password_stamp, Setting.find_by!(key: "bookorbit_password").updated_at
   end
 
-  test "manual manifest excludes untouched password manager values from explicit save" do
+  test "manual manifest still gates non-secret fields while a different secret is stored" do
+    SettingsService.set(:bookorbit_url, "https://old.example")
     SettingsService.set(:bookorbit_username, "existing-user")
     SettingsService.set(:bookorbit_password, "existing-password")
 
@@ -683,6 +696,7 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
       manual_keys: "bookorbit_username",
       settings: {
         max_retries: "23",
+        bookorbit_url: "https://new.example",
         bookorbit_username: "deliberate-user",
         bookorbit_password: "autofilled-password"
       }
@@ -690,8 +704,55 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
 
     assert_redirected_to admin_settings_path
     assert_equal 23, SettingsService.get(:max_retries)
+    assert_equal "https://old.example", SettingsService.get(:bookorbit_url)
     assert_equal "deliberate-user", SettingsService.get(:bookorbit_username)
-    assert_equal "existing-password", SettingsService.get(:bookorbit_password)
+    assert_equal "autofilled-password", SettingsService.get(:bookorbit_password)
+  end
+
+  test "bulk_update keeps a blank prowlarr api key and stores a different one" do
+    SettingsService.set(:prowlarr_api_key, "stored-prowlarr-key")
+    SettingsService.set(:grimmory_password, "stored-password")
+
+    patch bulk_update_admin_settings_url, params: {
+      manual_keys: "",
+      settings: {
+        prowlarr_api_key: "",
+        grimmory_password: ""
+      }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal "stored-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_equal "stored-password", SettingsService.get(:grimmory_password)
+
+    patch bulk_update_admin_settings_url, params: {
+      manual_keys: "",
+      settings: { prowlarr_api_key: "posted-prowlarr-key" }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal "posted-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_equal "stored-password", SettingsService.get(:grimmory_password)
+
+    reset_called = false
+    IndexerClient.stub(:reset_all_connections!, -> { reset_called = true }) do
+      patch bulk_update_admin_settings_url, params: {
+        manual_keys: "",
+        settings: { prowlarr_api_key: "posted-prowlarr-key" }
+      }
+    end
+
+    assert_redirected_to admin_settings_path
+    assert_equal "posted-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_not reset_called
+
+    patch bulk_update_admin_settings_url, params: {
+      settings: { prowlarr_api_key: "   ", grimmory_password: "" }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal "posted-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_equal "stored-password", SettingsService.get(:grimmory_password)
   end
 
   test "explicit save persists manual-save credentials" do
@@ -743,14 +804,173 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_equal 10, SettingsService.get(:max_retries)
   end
 
-  test "autosave requires a valid nonempty dirty manifest" do
+  test "autosave with an empty key list writes the dirty value and leaves an unchanged field" do
+    SettingsService.set(:download_check_interval, 60)
+    interval_stamp = setting_row_stamp("download_check_interval")
+
     patch bulk_update_admin_settings_url,
-      params: { autosave: "true", autosave_keys: "", settings: { max_retries: "24" } },
+      params: {
+        autosave: "true",
+        autosave_keys: "",
+        settings: { max_retries: "24", download_check_interval: "60" }
+      },
       headers: { "Accept" => "text/vnd.turbo-stream.html" }
 
-    assert_response :unprocessable_entity
-    assert_match "Invalid autosave setting manifest", response.body
-    assert_equal 10, SettingsService.get(:max_retries)
+    assert_response :no_content
+    assert_equal 24, SettingsService.get(:max_retries)
+    assert_equal 60, SettingsService.get(:download_check_interval)
+    assert_equal interval_stamp, Setting.find_by!(key: "download_check_interval").updated_at
+  end
+
+  test "issues 87 and 91 autosave below download settings keeps the edit and does not revert other keys" do
+    SettingsService.set(:audiobook_preferred_formats, [ "m4b" ])
+    SettingsService.set(:ebook_preferred_formats, [ "epub" ])
+    SettingsService.set(:audiobook_prefer_single_file, true)
+    SettingsService.set(:preferred_download_types, %w[usenet direct torrent])
+    SettingsService.set(:audiobookshelf_library_sync_interval, 7200)
+    SettingsService.set(:rate_limit_delay, 9)
+    unchanged_keys = %w[
+      ebook_preferred_formats
+      audiobook_prefer_single_file
+      preferred_download_types
+      audiobookshelf_library_sync_interval
+      rate_limit_delay
+    ]
+    stamps = unchanged_keys.to_h { |key| [ key, setting_row_stamp(key) ] }
+
+    patch bulk_update_admin_settings_url,
+      params: {
+        autosave: "true",
+        autosave_keys: "",
+        settings: {
+          audiobook_preferred_formats: "m4b, mp3",
+          ebook_preferred_formats: "epub",
+          audiobook_prefer_single_file: "true",
+          preferred_download_types: %w[usenet direct torrent],
+          audiobookshelf_library_sync_interval: "7200"
+        }
+      },
+      headers: { "Accept" => "text/vnd.turbo-stream.html" }
+
+    assert_response :no_content
+    assert_equal %w[m4b mp3], SettingsService.get(:audiobook_preferred_formats)
+    assert_equal %w[epub], SettingsService.get(:ebook_preferred_formats)
+    assert_equal true, SettingsService.get(:audiobook_prefer_single_file)
+    assert_equal %w[usenet direct torrent], SettingsService.preferred_download_types
+    assert_equal 7200, SettingsService.get(:audiobookshelf_library_sync_interval)
+    assert_equal 9, SettingsService.get(:rate_limit_delay)
+    unchanged_keys.each do |key|
+      assert_equal stamps[key], Setting.find_by!(key: key).updated_at, "#{key} was written"
+    end
+  end
+
+  test "issue 385 does not write a posted field the user did not change" do
+    SettingsService.set(:download_check_interval, 90)
+    SettingsService.set(:bookorbit_username, "reader@example.com")
+    SettingsService.set(:bookorbit_password, "stored-password")
+    interval_stamp = setting_row_stamp("download_check_interval")
+    username_stamp = setting_row_stamp("bookorbit_username")
+    password_stamp = setting_row_stamp("bookorbit_password")
+
+    patch bulk_update_admin_settings_url,
+      params: {
+        autosave: "true",
+        autosave_keys: "download_check_interval",
+        settings: {
+          download_check_interval: "90",
+          bookorbit_username: "reader@example.com"
+        }
+      },
+      headers: { "Accept" => "text/vnd.turbo-stream.html" }
+
+    assert_response :no_content
+    assert_equal 90, SettingsService.get(:download_check_interval)
+    assert_equal "reader@example.com", SettingsService.get(:bookorbit_username)
+    assert_equal interval_stamp, Setting.find_by!(key: "download_check_interval").updated_at
+    assert_equal username_stamp, Setting.find_by!(key: "bookorbit_username").updated_at
+
+    patch bulk_update_admin_settings_url, params: {
+      settings: {
+        bookorbit_username: "reader@example.com",
+        bookorbit_password: "stored-password"
+      }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal "reader@example.com", SettingsService.get(:bookorbit_username)
+    assert_equal "stored-password", SettingsService.get(:bookorbit_password)
+    assert_equal username_stamp, Setting.find_by!(key: "bookorbit_username").updated_at
+    assert_equal password_stamp, Setting.find_by!(key: "bookorbit_password").updated_at
+  end
+
+  test "issue 588 blank prowlarr api key on autosave does not wipe the stored key" do
+    SettingsService.set(:prowlarr_api_key, "stored-prowlarr-key")
+    stamp = setting_row_stamp("prowlarr_api_key")
+
+    patch bulk_update_admin_settings_url,
+      params: {
+        autosave: "true",
+        autosave_keys: "",
+        settings: { prowlarr_api_key: "" }
+      },
+      headers: { "Accept" => "text/vnd.turbo-stream.html" }
+
+    assert_response :no_content
+    assert_equal "stored-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_equal stamp, Setting.find_by!(key: "prowlarr_api_key").updated_at
+  end
+
+  test "missing manifest autosave writes only max retries and leaves the manual key and blank secret" do
+    SettingsService.set(:max_retries, 10)
+    SettingsService.set(:allow_nonatomic_nfs_directory_publication, false)
+    SettingsService.set(:prowlarr_api_key, "stored-prowlarr-key")
+    SettingsService.set(:download_check_interval, 60)
+    manual_stamp = setting_row_stamp("allow_nonatomic_nfs_directory_publication")
+    secret_stamp = setting_row_stamp("prowlarr_api_key")
+    interval_stamp = setting_row_stamp("download_check_interval")
+
+    patch bulk_update_admin_settings_url,
+      params: {
+        autosave: "true",
+        autosave_keys: "",
+        settings: {
+          max_retries: "24",
+          allow_nonatomic_nfs_directory_publication: "true",
+          prowlarr_api_key: "",
+          download_check_interval: "60"
+        }
+      },
+      headers: { "Accept" => "text/vnd.turbo-stream.html" }
+
+    assert_response :no_content
+    assert_equal 24, SettingsService.get(:max_retries)
+    assert_equal false, SettingsService.get(:allow_nonatomic_nfs_directory_publication)
+    assert_equal "stored-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_equal 60, SettingsService.get(:download_check_interval)
+    assert_equal manual_stamp, Setting.find_by!(key: "allow_nonatomic_nfs_directory_publication").updated_at
+    assert_equal secret_stamp, Setting.find_by!(key: "prowlarr_api_key").updated_at
+    assert_equal interval_stamp, Setting.find_by!(key: "download_check_interval").updated_at
+  end
+
+  test "explicit save writes the dirty retry count and the manual key" do
+    SettingsService.set(:max_retries, 10)
+    SettingsService.set(:allow_nonatomic_nfs_directory_publication, false)
+    SettingsService.set(:prowlarr_api_key, "stored-prowlarr-key")
+    secret_stamp = setting_row_stamp("prowlarr_api_key")
+
+    patch bulk_update_admin_settings_url, params: {
+      settings: {
+        max_retries: "24",
+        allow_nonatomic_nfs_directory_publication: "true",
+        prowlarr_api_key: ""
+      }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal 24, SettingsService.get(:max_retries)
+    assert_equal true, SettingsService.get(:allow_nonatomic_nfs_directory_publication)
+    assert_equal "stored-prowlarr-key", SettingsService.get(:prowlarr_api_key)
+    assert_equal secret_stamp, Setting.find_by!(key: "prowlarr_api_key").updated_at
   end
 
   test "index renders env managed settings as read-only and masks secret values" do
@@ -923,6 +1143,9 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_select "button[aria-label='Add Z-Library URL']"
     assert_select "input[name='settings[zlibrary_email]']"
     assert_select "input[name='settings[zlibrary_password]']"
+    assert_select "input[name='settings[zlibrary_remix_userid]']"
+    assert_select "input[type='password'][name='settings[zlibrary_remix_userkey]']"
+    assert_select "p", text: /clear Email to switch from password login/
     assert_select "a", text: "Test Z-Library Connection"
   end
 
@@ -1153,7 +1376,33 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
-  # Test connection tests for Prowlarr
+  test "bulk_update immediately updates download_paths health with failure reason" do
+    DownloadClient.destroy_all
+    DownloadClient.create!(
+      name: "Settings Path Client",
+      client_type: "qbittorrent",
+      url: "http://localhost:8080",
+      username: "admin",
+      password: "password",
+      category: "",
+      priority: 0,
+      enabled: true
+    )
+
+    patch bulk_update_admin_settings_url, params: {
+      settings: {
+        download_local_path: "/definitely/missing/downloads",
+        download_remote_path: "/mnt/torrents/complete"
+      }
+    }
+
+    assert_redirected_to admin_settings_path
+
+    health = SystemHealth.for_service("download_paths")
+    assert health.down?
+    assert_includes health.message, "does not exist"
+  end
+
   test "test_prowlarr fails when not configured" do
     SettingsService.set(:prowlarr_url, "")
     SettingsService.set(:prowlarr_api_key, "")
@@ -1177,6 +1426,203 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
 
       assert_redirected_to admin_settings_path
       assert_match /successful/i, flash[:notice]
+    end
+  end
+
+  test "test_prowlarr names an unauthorized API key" do
+    SettingsService.set(:prowlarr_url, "http://localhost:9696")
+    SettingsService.set(:prowlarr_api_key, "test-api-key")
+
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:9696/api/v1/indexer")
+        .with(headers: { "X-Api-Key" => "test-api-key" })
+        .to_return(status: 401)
+
+      post test_prowlarr_admin_settings_url
+
+      assert_redirected_to admin_settings_path
+      assert_match "Unauthorized", flash[:alert]
+    end
+  end
+
+  test "test_indexer probes posted prowlarr fields without saving them" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://saved.example:9696")
+    SettingsService.set(:prowlarr_api_key, "saved-key")
+
+    VCR.turned_off do
+      stub_request(:get, "http://prowlarr.example:9696/api/v1/indexer")
+        .with(headers: { "X-Api-Key" => "typed-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      post test_indexer_admin_settings_url, params: {
+        settings: {
+          indexer_provider: "prowlarr",
+          prowlarr_url: "http://prowlarr.example:9696",
+          prowlarr_api_key: "typed-key"
+        }
+      }
+
+      assert_redirected_to admin_settings_path
+      assert_match(/successful/i, flash[:notice])
+      assert_equal "http://saved.example:9696", SettingsService.get(:prowlarr_url)
+      assert_equal "saved-key", SettingsService.get(:prowlarr_api_key)
+      assert_not_requested :get, %r{saved\.example}
+    end
+  end
+
+  test "test_indexer records health only when it probes the saved connection" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://saved.example:9696")
+    SettingsService.set(:prowlarr_api_key, "saved-key")
+    SystemHealth.for_service("indexer").check_succeeded!(message: "Connection successful")
+
+    VCR.turned_off do
+      stub_request(:get, "http://typo.example:9696/api/v1/indexer")
+        .to_raise(Faraday::ConnectionFailed.new("Failed to open TCP connection (getaddrinfo: Name or service not known)"))
+      stub_request(:get, "http://saved.example:9696/api/v1/indexer")
+        .to_return(status: 401, body: "{}", headers: { "Content-Type" => "application/json" })
+
+      post test_indexer_admin_settings_url, params: {
+        settings: { indexer_provider: "prowlarr", prowlarr_url: "http://typo.example:9696", prowlarr_api_key: "" }
+      }
+
+      assert_match(/Could not resolve host/, flash[:alert])
+      assert SystemHealth.for_service("indexer").healthy?
+
+      post test_indexer_admin_settings_url, params: {
+        settings: { indexer_provider: "prowlarr", prowlarr_url: "http://saved.example:9696", prowlarr_api_key: "" }
+      }
+
+      assert_match(/Unauthorized/, flash[:alert])
+      assert SystemHealth.for_service("indexer").down?
+    end
+  end
+
+  test "test_indexer keeps the saved api key when the posted secret is blank" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://saved.example:9696")
+    SettingsService.set(:prowlarr_api_key, "saved-key")
+
+    VCR.turned_off do
+      stub_request(:get, "http://prowlarr.example:9696/api/v1/indexer")
+        .with(headers: { "X-Api-Key" => "saved-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      post test_indexer_admin_settings_url, params: {
+        settings: {
+          indexer_provider: "prowlarr",
+          prowlarr_url: "http://prowlarr.example:9696",
+          prowlarr_api_key: ""
+        }
+      }
+
+      assert_redirected_to admin_settings_path
+      assert_match(/successful/i, flash[:notice])
+      assert_equal "saved-key", SettingsService.get(:prowlarr_api_key)
+    end
+  end
+
+  test "test_indexer explains a loopback address when the connection is refused" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://saved.example:9696")
+    SettingsService.set(:prowlarr_api_key, "saved-key")
+
+    VCR.turned_off do
+      %w[http://localhost:9696 http://127.0.0.1:9696 http://[::1]:9696].each do |url|
+        stub_request(:get, "#{url}/api/v1/indexer").to_raise(Errno::ECONNREFUSED.new("Connection refused - connect(2)"))
+
+        post test_indexer_admin_settings_url, params: {
+          settings: {
+            indexer_provider: "prowlarr",
+            prowlarr_url: url,
+            prowlarr_api_key: "typed-key"
+          }
+        }
+
+        assert_redirected_to admin_settings_path
+        assert_match "Connection refused", flash[:alert]
+        assert_match ConnectionErrorClassifier::LOCALHOST_HINT, flash[:alert]
+        assert_equal "http://saved.example:9696", SettingsService.get(:prowlarr_url)
+      end
+    end
+  end
+
+  test "test_indexer does not add the loopback hint for a remote timeout or a localhost rejection" do
+    SettingsService.set(:indexer_provider, "prowlarr")
+    SettingsService.set(:prowlarr_url, "http://saved.example:9696")
+    SettingsService.set(:prowlarr_api_key, "saved-key")
+
+    VCR.turned_off do
+      stub_request(:get, "http://prowlarr.example:9696/api/v1/indexer").to_timeout
+
+      post test_indexer_admin_settings_url, params: {
+        settings: {
+          indexer_provider: "prowlarr",
+          prowlarr_url: "http://prowlarr.example:9696",
+          prowlarr_api_key: "typed-key"
+        }
+      }
+
+      assert_match "Connection timed out", flash[:alert]
+      assert_no_match ConnectionErrorClassifier::LOCALHOST_HINT, flash[:alert]
+
+      stub_request(:get, "http://localhost:9696/api/v1/indexer").to_return(status: 401)
+
+      post test_indexer_admin_settings_url, params: {
+        settings: {
+          indexer_provider: "prowlarr",
+          prowlarr_url: "http://localhost:9696",
+          prowlarr_api_key: "typed-key"
+        }
+      }
+
+      assert_match "Unauthorized", flash[:alert]
+      assert_no_match ConnectionErrorClassifier::LOCALHOST_HINT, flash[:alert]
+    end
+  end
+
+  test "test_audiobookshelf probes posted fields without saving them" do
+    SettingsService.set(:library_platform, "audiobookshelf")
+    SettingsService.set(:audiobookshelf_url, "http://saved.example:13378")
+    SettingsService.set(:audiobookshelf_api_key, "saved-token")
+
+    VCR.turned_off do
+      stub_request(:get, "http://audiobookshelf.example:13378/api/libraries")
+        .with(headers: { "Authorization" => "Bearer typed-token" })
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { "libraries" => [ { "id" => "lib-1", "name" => "Books", "folders" => [] } ] }.to_json
+        )
+
+      post test_audiobookshelf_admin_settings_url, params: {
+        settings: {
+          library_platform: "audiobookshelf",
+          audiobookshelf_url: "http://audiobookshelf.example:13378",
+          audiobookshelf_api_key: "typed-token"
+        }
+      }
+
+      assert_redirected_to admin_settings_path
+      assert_match(/successful/i, flash[:notice])
+      assert_equal "http://saved.example:13378", SettingsService.get(:audiobookshelf_url)
+      assert_equal "saved-token", SettingsService.get(:audiobookshelf_api_key)
+      assert_not_requested :get, %r{saved\.example}
+    end
+  end
+
+  test "test_prowlarr names a timeout" do
+    SettingsService.set(:prowlarr_url, "http://localhost:9696")
+    SettingsService.set(:prowlarr_api_key, "test-api-key")
+
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:9696/api/v1/indexer").to_timeout
+
+      post test_prowlarr_admin_settings_url
+
+      assert_redirected_to admin_settings_path
+      assert_match "Connection timed out", flash[:alert]
     end
   end
 
@@ -1210,7 +1656,7 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
       post test_indexer_admin_settings_url
 
       assert_redirected_to admin_settings_path
-      assert_match(/connection failed/i, flash[:alert], "expected #{provider} to fail without a server error")
+      assert_match(/connection failed|must be a valid http/i, flash[:alert], "expected #{provider} to fail without a server error")
     end
   end
 
@@ -1560,6 +2006,12 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     SettingsService.set(:zlibrary_password, "secret")
 
     VCR.turned_off do
+      stub_request(:get, "https://z-library.sk/eapi/info/domains")
+        .to_return(
+          status: 200,
+          body: { success: 1 }.to_json,
+          headers: { "Content-Type" => "application/json" }
+        )
       stub_request(:post, "https://z-library.sk/eapi/user/login")
         .with(body: "email=reader%40example.com&password=secret")
         .to_return(
@@ -1671,7 +2123,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_match /failed/i, flash[:alert]
   end
 
-  # Test connection tests for Audiobookshelf
   test "test_audiobookshelf fails when not configured" do
     SettingsService.set(:audiobookshelf_url, "")
     SettingsService.set(:audiobookshelf_api_key, "")
@@ -1699,6 +2150,22 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
 
       assert_redirected_to admin_settings_path
       assert_match /successful/i, flash[:notice]
+    end
+  end
+
+  test "test_audiobookshelf names an unauthorized token" do
+    SettingsService.set(:audiobookshelf_url, "http://localhost:13378")
+    SettingsService.set(:audiobookshelf_api_key, "test-api-key")
+
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:13378/api/libraries")
+        .with(headers: { "Authorization" => "Bearer test-api-key" })
+        .to_return(status: 401)
+
+      post test_audiobookshelf_admin_settings_url
+
+      assert_redirected_to admin_settings_path
+      assert_match "Unauthorized", flash[:alert]
     end
   end
 
@@ -1737,7 +2204,7 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     SettingsService.set(:audiobookshelf_url, "http://localhost:13378")
     SettingsService.set(:audiobookshelf_api_key, "test-api-key")
 
-    LibraryPlatformClient.stub(:test_connection, -> { raise LibraryPlatformClient::Error, "abs boom" }) do
+    ConnectionProbe.stub(:audiobookshelf, ->(**) { raise AudiobookshelfClient::Error, "abs boom" }) do
       post test_audiobookshelf_admin_settings_url
     end
 
@@ -1777,7 +2244,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_match /sync started/i, flash[:notice]
   end
 
-  # Test connection tests for OIDC
   test "test_oidc fails when not enabled" do
     SettingsService.set(:oidc_enabled, false)
 
@@ -1890,7 +2356,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
-  # Turbo Stream response tests
   test "bulk_update returns turbo stream when requested" do
     patch bulk_update_admin_settings_url,
       params: { settings: { max_retries: "25" } },
@@ -1905,12 +2370,14 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
 
   test "successful autosave does not replace the settings form" do
     SettingsService.set(:rate_limit_delay, 5)
+    SettingsService.set(:download_check_interval, 60)
+    interval_stamp = setting_row_stamp("download_check_interval")
 
     patch bulk_update_admin_settings_url,
       params: {
         autosave: "true",
-        autosave_keys: "max_retries",
-        settings: { max_retries: "24", rate_limit_delay: "2" }
+        autosave_keys: "max_retries,download_check_interval",
+        settings: { max_retries: "24", rate_limit_delay: "2", download_check_interval: "60" }
       },
       headers: { "Accept" => "text/vnd.turbo-stream.html" }
 
@@ -1919,6 +2386,8 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_empty response.body
     assert_equal 24, SettingsService.get(:max_retries)
     assert_equal 5, SettingsService.get(:rate_limit_delay)
+    assert_equal 60, SettingsService.get(:download_check_interval)
+    assert_equal interval_stamp, Setting.find_by!(key: "download_check_interval").updated_at
   end
 
   test "side effect failure reports a warning without retrying persisted settings" do
@@ -2020,7 +2489,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
-  # SSL error handling tests
   test "test_prowlarr handles SSL errors" do
     SettingsService.set(:prowlarr_url, "https://localhost:9696")
     SettingsService.set(:prowlarr_api_key, "test-api-key")
@@ -2083,14 +2551,11 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_match /unexpected/, flash[:alert]
   end
 
-  # Connection cache reset tests
   test "bulk_update uses new audiobookshelf url after settings change" do
     SettingsService.set(:audiobookshelf_url, "http://old.example.com")
     SettingsService.set(:audiobookshelf_api_key, "test-key")
 
     VCR.turned_off do
-      # The controller should use the NEW url after updating settings
-      # This verifies the connection was reset and recreated with new credentials
       stub_request(:get, "http://new.example.com/api/libraries")
         .to_return(status: 200, body: { "libraries" => [] }.to_json, headers: { "Content-Type" => "application/json" })
 
@@ -2106,11 +2571,10 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
-  test "bulk_update resets prowlarr connection when api key changes" do
+  test "bulk_update keeps the Prowlarr memo and the next request uses the saved api key" do
     SettingsService.set(:prowlarr_url, "http://localhost:9696")
     SettingsService.set(:prowlarr_api_key, "old-key")
 
-    # Prime the connection with old credentials
     ProwlarrClient.send(:connection)
     old_connection = ProwlarrClient.instance_variable_get(:@connection)
     assert_not_nil old_connection
@@ -2119,12 +2583,20 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
       settings: { prowlarr_api_key: "new-key" }
     }
 
-    # Connection should be reset - either nil or a different object
-    new_connection = ProwlarrClient.instance_variable_get(:@connection)
-    assert_nil new_connection, "Connection should be reset after prowlarr settings change"
+    assert_same old_connection, ProwlarrClient.instance_variable_get(:@connection)
+    assert_equal "new-key", SettingsService.get(:prowlarr_api_key)
+
+    VCR.turned_off do
+      corrected = stub_request(:get, %r{\Ahttp://localhost:9696/api/v1/search})
+        .with(headers: { "X-Api-Key" => "new-key" })
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      assert_empty ProwlarrClient.search("atomic habits")
+      assert_requested corrected, times: 1
+      assert_not_requested :get, %r{\Ahttp://localhost:9696/api/v1/search}, headers: { "X-Api-Key" => "old-key" }
+    end
   end
 
-  # Test connection tests for FlareSolverr
   test "test_flaresolverr fails when not configured" do
     SettingsService.set(:flaresolverr_url, "")
 
@@ -2471,7 +2943,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
   test "bulk_update resets flaresolverr connection when url changes" do
     SettingsService.set(:flaresolverr_url, "http://old.example.com:8191")
 
-    # Prime the connection with old url
     FlaresolverrClient.send(:connection)
     old_connection = FlaresolverrClient.instance_variable_get(:@connection)
     assert_not_nil old_connection
@@ -2480,7 +2951,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
       settings: { flaresolverr_url: "http://new.example.com:8191" }
     }
 
-    # Connection should be reset
     new_connection = FlaresolverrClient.instance_variable_get(:@connection)
     assert_nil new_connection, "Connection should be reset after flaresolverr settings change"
 
@@ -2488,16 +2958,13 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "index merges unavailable persisted library IDs into select options and preserves them on bulk_update" do
-    # Configure API details
     SettingsService.set(:audiobookshelf_url, "http://localhost:13378")
     SettingsService.set(:audiobookshelf_api_key, "test-api-key")
 
-    # Set persisted values containing library IDs that are NOT in the stubbed api response
     SettingsService.set(:audiobookshelf_audiobook_library_id, "lib-unavailable-delivery")
     SettingsService.set(:audiobookshelf_audiobook_scan_library_ids, "lib-audio,lib-unavailable-scan")
 
     VCR.turned_off do
-      # Mock the API response to return only "lib-audio"
       stub_request(:get, "http://localhost:13378/api/libraries")
         .with(headers: { "Authorization" => "Bearer test-api-key" })
         .to_return(
@@ -2513,7 +2980,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
       get admin_settings_url
       assert_response :success
 
-      # Verify both unavailable and available options are present and selected in the rendered HTML
       assert_select "select[name='settings[audiobookshelf_audiobook_library_id]']" do
         assert_select "option[value='lib-audio']", text: "Audiobooks (book)"
         assert_select "option[value='lib-unavailable-delivery'][selected]", text: "lib-unavailable-delivery (Unavailable)"
@@ -2524,8 +2990,6 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
         assert_select "option[value='lib-unavailable-scan'][selected]", text: "lib-unavailable-scan (Unavailable)"
       end
 
-      # Now simulate the autosave/bulk_update submission of the form.
-      # If we submit the values rendered in the select fields, they should be correctly saved back.
       patch bulk_update_admin_settings_url, params: {
         settings: {
           audiobookshelf_audiobook_library_id: "lib-unavailable-delivery",
@@ -2537,5 +3001,11 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
       assert_equal "lib-unavailable-delivery", SettingsService.get(:audiobookshelf_audiobook_library_id)
       assert_equal "lib-audio,lib-unavailable-scan", SettingsService.get(:audiobookshelf_audiobook_scan_library_ids)
     end
+  end
+
+  def setting_row_stamp(key)
+    row = Setting.find_by!(key: key.to_s)
+    row.update_columns(updated_at: Time.zone.parse("2020-01-01 00:00:00"))
+    row.reload.updated_at
   end
 end

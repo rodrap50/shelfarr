@@ -30,7 +30,8 @@ class DownloadJob < ApplicationJob
   DIRECT_DOWNLOAD_HEARTBEAT_INTERVAL = 30.seconds
   DIRECT_EBOOK_EXTENSIONS = %w[epub pdf mobi azw3].freeze
   DIRECT_AUDIOBOOK_ARCHIVE_EXTENSIONS = %w[zip].freeze
-  DIRECT_AUDIOBOOK_FILE_EXTENSIONS = %w[m4b mp3 m4a aac flac ogg opus].freeze
+  DIRECT_AUDIOBOOK_FILE_EXTENSIONS = AudiobookBundleImportPlanner::KNOWN_AUDIO_EXTENSIONS
+  DIRECT_AUDIOBOOK_PROBE_FORMATS = %w[aa aiff asf caf mov wav].freeze
   DIRECT_AUDIOBOOK_IMAGE_EXTENSIONS = %w[jpg jpeg png webp].freeze
   DIRECT_AUDIOBOOK_TEXT_EXTENSIONS = %w[txt].freeze
   DIRECT_AUDIOBOOK_ARCHIVE_FILE_EXTENSIONS = (
@@ -69,10 +70,9 @@ class DownloadJob < ApplicationJob
       return
     end
     download.update!(search_result: search_result) unless download.search_result_id
-    return unless claim_dispatch!(download, search_result)
+    return unless claim_dispatch!(download, search_result) == true
 
     begin
-      # Handle Anna's Archive downloads differently
       if search_result.from_anna_archive?
         handle_anna_archive_download(download, search_result)
       elsif search_result.from_zlibrary?
@@ -161,8 +161,8 @@ class DownloadJob < ApplicationJob
 
       yield
     end
-  rescue ActiveRecord::RecordNotFound
-    nil
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def handle_download_source_failure(download, error, message)
@@ -257,24 +257,20 @@ class DownloadJob < ApplicationJob
   end
 
   def handle_anna_archive_download(download, search_result)
-    # Fetch actual download URL from Anna's Archive API
     md5 = search_result.guid
     Rails.logger.info "[DownloadJob] Fetching download URL from Anna's Archive for MD5: #{md5}"
 
     download_url = AnnaArchiveClient.get_download_url(md5)
     Rails.logger.info "[DownloadJob] Received Anna's Archive download artifact"
 
-    # Check if it's a torrent/magnet link or direct download
     if torrent_download_url?(download_url)
       if download.request.book.audiobook?
         raise AnnaArchiveClient::Error,
           "Anna's Archive audiobook torrents require verified post-download archive processing and are not supported"
       end
 
-      # Send to torrent client
       send_to_torrent_client(download, search_result, download_url)
     else
-      # Direct HTTP download - download file directly
       Rails.logger.info "[DownloadJob] Anna's Archive returned direct link, downloading via HTTP"
       if download.request.book.audiobook?
         begin
@@ -512,7 +508,6 @@ class DownloadJob < ApplicationJob
     finalized = false
     book = download.request.book
 
-    # Build destination path similar to how PostProcessingJob does it
     base_path = SettingsService.get(:ebook_output_path, default: "/ebooks")
     destination_dir = PathTemplateService.build_destination(
       book,
@@ -521,7 +516,6 @@ class DownloadJob < ApplicationJob
       search_result: search_result
     )
 
-    # Infer filename from URL or search result
     filename = infer_filename_from_url(download_url, search_result)
     destination_path = File.join(destination_dir, filename)
 
@@ -563,10 +557,8 @@ class DownloadJob < ApplicationJob
     file_service.cleanup_after_run!
     return unless finalized
 
-    # Trigger library scan if configured
     trigger_library_scan(book) if LibraryPlatformClient.configured?
 
-    # Send notification
     NotificationService.request_completed(download.request)
     UserLibraryRoutingService.call(book: book, request: download.request)
     track_request_event(download.request, "completed", download: download, message: "Direct download completed")
@@ -582,7 +574,6 @@ class DownloadJob < ApplicationJob
   end
 
   def infer_filename_from_url(url, search_result)
-    # Try to get filename from URL path
     uri = URI.parse(url)
     filename_from_url = File.basename(uri.path)
 
@@ -605,7 +596,6 @@ class DownloadJob < ApplicationJob
   def infer_extension(url, search_result)
     normalized_url = url.to_s.downcase
 
-    # Check URL for extension hints
     return "epub" if normalized_url.include?("epub")
     return "pdf" if normalized_url.include?("pdf")
     if normalized_url.include?("mobi") || normalized_url.include?("kf8") || normalized_url.match?(/\.kindle(\.|[?#]|\z)/)
@@ -613,14 +603,12 @@ class DownloadJob < ApplicationJob
     end
     return "azw3" if normalized_url.include?("azw3")
 
-    # Check search result title
     title = search_result.title.to_s.downcase
     return "epub" if title.include?("epub")
     return "pdf" if title.include?("pdf")
     return "mobi" if title.include?("mobi")
     return "azw3" if title.include?("azw3")
 
-    # Default to epub
     "epub"
   end
 
@@ -634,6 +622,7 @@ class DownloadJob < ApplicationJob
 
   def title_format_hint?(title, extension)
     escaped = Regexp.escape(extension)
+    return title.match?(/(?:\[#{escaped}\]|\(#{escaped}\)|\.#{escaped}\b)/) if extension == "aa"
     return title.match?(/[\[\(.]#{escaped}[\]\)]?(\b|\z)/) if AMBIGUOUS_AUDIOBOOK_EXTENSIONS.include?(extension)
 
     title.match?(/\b#{escaped}\b/)
@@ -673,24 +662,24 @@ class DownloadJob < ApplicationJob
     return extension if allowed_extensions.include?(extension)
 
     nil
-  rescue URI::InvalidURIError
-    nil
+  rescue URI::InvalidURIError => error
+    RemoteResult::Failed.new(error)
   end
 
   def torrent_download_url?(url)
     return true if url.to_s.start_with?("magnet:")
 
     File.extname(URI.parse(url.to_s).path).casecmp?(".torrent")
-  rescue URI::InvalidURIError
-    false
+  rescue URI::InvalidURIError => error
+    RemoteResult::Failed.new(error)
   end
 
   def filename_from_url(url)
     uri = URI.parse(normalize_direct_download_url(url))
     filename = File.basename(uri.path)
     URI.decode_www_form_component(filename) if filename.present?
-  rescue URI::InvalidURIError
-    nil
+  rescue URI::InvalidURIError => error
+    RemoteResult::Failed.new(error)
   end
 
   def normalize_url_filename(filename, inferred_extension)
@@ -1103,8 +1092,8 @@ class DownloadJob < ApplicationJob
         max_duration: max_duration
       )
     end
-  rescue EOFError, Errno::ENOENT, Errno::EACCES
-    false
+  rescue EOFError, Errno::ENOENT, Errno::EACCES => error
+    RemoteResult::Failed.new(error)
   end
 
   def valid_audiobook_text?(path)
@@ -1115,16 +1104,16 @@ class DownloadJob < ApplicationJob
       content = file.read(size).to_s.force_encoding(Encoding::UTF_8)
       content.valid_encoding? && !content.include?("\0") && !content.match?(/[^\t\n\r[:print:]]/)
     end
-  rescue EOFError, Errno::ENOENT, Errno::EACCES
-    false
+  rescue EOFError, Errno::ENOENT, Errno::EACCES => error
+    RemoteResult::Failed.new(error)
   end
 
   def valid_audiobook_signature?(path)
     with_regular_download_io(path) do |file|
       valid_audiobook_io?(file, File.extname(path).delete(".").downcase)
     end
-  rescue EOFError, Errno::ENOENT, Errno::EACCES
-    false
+  rescue EOFError, Errno::ENOENT, Errno::EACCES => error
+    RemoteResult::Failed.new(error)
   end
 
   def valid_audiobook_io?(file, extension)
@@ -1144,9 +1133,13 @@ class DownloadJob < ApplicationJob
     when "ogg", "opus"
       valid_ogg_stream?(file, file_size)
     else
-      false
+      return false unless DIRECT_AUDIOBOOK_FILE_EXTENSIONS.include?(extension.to_s.downcase)
+
+      # Probe other planner formats as audio containers, never as playlists
+      # that only refer to audio stored somewhere else.
+      return AudiobookProbeService.valid?(file, format_whitelist: DIRECT_AUDIOBOOK_PROBE_FORMATS) == true
     end
-    structurally_valid && AudiobookProbeService.valid?(file.path)
+    structurally_valid && AudiobookProbeService.valid?(file) == true
   end
 
   def valid_mp3_stream?(file, head, file_size)
@@ -1363,13 +1356,11 @@ class DownloadJob < ApplicationJob
   end
 
   def send_to_torrent_client(download, search_result, download_url)
-    # Select torrent client
     client_record = DownloadClientSelector.for_torrent
     client = client_record.adapter
 
     Rails.logger.info "[DownloadJob] Using client '#{client_record.name}' for download ##{download.id}"
 
-    # add_torrent now returns the hash directly (or nil on failure)
     torrent_hash = client.add_torrent(download_url, torrent_client_options(search_result))
 
     if torrent_hash.present?
@@ -1400,7 +1391,9 @@ class DownloadJob < ApplicationJob
   end
 
   def send_to_usenet_client(download, search_result, nzb_url)
-    client_record = DownloadClient.usenet_clients.enabled.by_priority.find(&:test_connection)
+    client_record = DownloadClient.usenet_clients.enabled.by_priority.find { |client|
+      RemoteResult.succeeded?(client.test_connection)
+    }
     raise DownloadClientSelector::NoClientAvailableError, "No usenet client available (all failed connection test)" unless client_record
 
     client = client_record.adapter
@@ -1435,7 +1428,6 @@ class DownloadJob < ApplicationJob
     download_link = search_result.download_link
     validate_manual_nzb_dispatch_url!(download_link) if search_result.from_manual_nzb?
 
-    # Select best available client based on download type and priority
     client_record = DownloadClientSelector.for_download(search_result)
     client = client_record.adapter
     is_usenet = search_result.usenet?
@@ -1459,7 +1451,6 @@ class DownloadJob < ApplicationJob
       external_id = result.is_a?(Hash) ? result["nzo_ids"]&.first : nil
       success = external_id.present?
     else
-      # qBittorrent now returns the torrent hash directly
       external_id = client.add_torrent(download_link, torrent_client_options(search_result))
       success = external_id.present?
     end
@@ -1496,8 +1487,8 @@ class DownloadJob < ApplicationJob
     end
 
     claimed
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def finalize_standard_dispatch!(download, search_result, client, client_record, external_id, download_type:)
@@ -1560,8 +1551,8 @@ class DownloadJob < ApplicationJob
 
     Rails.logger.error "[DownloadJob] Failed to add download ##{download.id}" if failed
     failed
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def current_standard_dispatch?(download, search_result)
@@ -1589,8 +1580,8 @@ class DownloadJob < ApplicationJob
     end
 
     handled
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def remove_stale_client_dispatch(client, client_record, external_id, download_id)

@@ -21,7 +21,6 @@ class DownloadJobTest < ActiveJob::TestCase
     SettingsService.set(:gutenberg_url, "https://www.gutenberg.org")
     SettingsService.set(:auto_select_enabled, false)
 
-    # Create a qBittorrent client
     @client = DownloadClient.create!(
       name: "Test qBittorrent",
       client_type: "qbittorrent",
@@ -32,13 +31,11 @@ class DownloadJobTest < ActiveJob::TestCase
       enabled: true
     )
 
-    # Clear qBittorrent sessions
     Thread.current[:qbittorrent_sessions] = {}
     Thread.current[:transmission_protocols] = {}
     ZLibraryClient.reset_connection! if defined?(ZLibraryClient)
     GutenbergClient.reset_connection! if defined?(GutenbergClient)
 
-    # Create a queued download
     @download = @request.downloads.create!(
       name: @selected_result.title,
       size_bytes: @selected_result.size_bytes,
@@ -70,14 +67,12 @@ class DownloadJobTest < ActiveJob::TestCase
 
       assert @download.downloading?
       assert_equal @client.id.to_s, @download.download_client_id
-      # Hash is computed from the test torrent file
       assert @download.external_id.present?, "external_id should be set"
       assert_match(/^[a-f0-9]{40}$/, @download.external_id, "external_id should be a SHA1 hash")
     end
   end
 
   test "marks for attention when no search result selected" do
-    # Remove the selected result
     @download.update!(search_result: nil)
     @request.search_results.selected.destroy_all
 
@@ -492,7 +487,6 @@ class DownloadJobTest < ActiveJob::TestCase
     DownloadJob.perform_now(@download.id)
     @download.reload
 
-    # Status should not change
     assert @download.downloading?
   end
 
@@ -1113,15 +1107,12 @@ class DownloadJobTest < ActiveJob::TestCase
     end
   end
 
-  # Tests for filename handling (URL decoding and sanitization)
-
   test "sanitize_filename decodes URL-encoded characters" do
     job = DownloadJob.new
     url = "https://example.com/download/Moonshot%20%3A%20inside%20Pfizer%27s%20book.epub"
 
     filename = job.send(:infer_filename_from_url, url, @selected_result)
 
-    # Should decode %20 to space, %3A to colon, %27 to apostrophe
     assert_includes filename, "Moonshot"
     assert_not_includes filename, "%20"
     assert_not_includes filename, "%3A"
@@ -1132,7 +1123,6 @@ class DownloadJobTest < ActiveJob::TestCase
   test "sanitize_filename preserves extension when truncating long filenames" do
     job = DownloadJob.new
 
-    # Create a filename that's over 200 characters
     long_name = "A" * 250 + ".epub"
     result = job.send(:sanitize_filename, long_name)
 
@@ -1167,7 +1157,6 @@ class DownloadJobTest < ActiveJob::TestCase
 
     filename = job.send(:infer_filename_from_url, url, @selected_result)
 
-    # Should fall back to author - title format
     book = @selected_result.request.book
     assert_includes filename, book.author
     assert_includes filename, book.title
@@ -1469,6 +1458,29 @@ class DownloadJobTest < ActiveJob::TestCase
       assert File.exist?(@custom_provider_audiobook_download.download_path)
       assert_equal "custom-audiobook.m4b", File.basename(@custom_provider_audiobook_download.download_path)
       assert_equal File.dirname(@custom_provider_audiobook_download.download_path), @custom_provider_audiobook_request.book.file_path
+    end
+  end
+
+  test "custom provider direct WAV download reaches publication" do
+    skip "ffprobe not available" unless system("ffprobe", "-version", out: File::NULL, err: File::NULL)
+
+    AudiobookProbeService.reset_probe!
+    Dir.mktmpdir do |dir|
+      setup_custom_provider_audiobook_download(output_path: dir)
+
+      VCR.turned_off do
+        stub_request(:post, "http://provider.test/acquire")
+          .to_return(status: 200, headers: { "Content-Type" => "application/json" },
+            body: { download_type: "direct", direct_url: "https://files.test/book.wav" }.to_json)
+        stub_request(:get, "https://files.test/book.wav")
+          .to_return(status: 200, body: valid_wav_audio, headers: { "Content-Type" => "audio/wav" })
+
+        DownloadJob.perform_now(@custom_provider_audiobook_download.id)
+      end
+
+      assert @custom_provider_audiobook_download.reload.completed?
+      assert @custom_provider_audiobook_request.reload.completed?
+      assert_equal valid_wav_audio, File.binread(@custom_provider_audiobook_download.download_path)
     end
   end
 
@@ -1966,6 +1978,57 @@ class DownloadJobTest < ActiveJob::TestCase
     assert_equal "opus", job.send(:infer_audiobook_extension, "https://files.test/download", result.new("Book Title [OPUS]"))
     assert_equal "opus", job.send(:infer_audiobook_extension, "https://files.test/download", result.new("Book Title .opus"))
     assert_equal "mp3", job.send(:infer_audiobook_extension, "https://files.test/download", result.new("Book Title MP3 64kbps"))
+    assert_equal "wma", job.send(:infer_audiobook_extension, "https://files.test/download", result.new("Book Title WMA"))
+    assert_equal "mp3", job.send(:infer_audiobook_extension, "https://files.test/download", result.new("AA Milne - Winnie the Pooh [MP3]"))
+    assert_equal "mp3", job.send(:infer_audiobook_extension, "https://files.test/download", result.new("[AA Milne] - Winnie the Pooh [MP3]"))
+    assert_equal "mp3", job.send(:infer_audiobook_extension, "https://files.test/download", result.new("(AA Milne) - Winnie the Pooh [MP3]"))
+    assert_nil job.send(:infer_audiobook_extension, "https://files.test/download", result.new("AA Milne - Winnie the Pooh"))
+    assert_equal "aa", job.send(:infer_audiobook_extension, "https://files.test/download", result.new("Book Title [AA]"))
+  end
+
+  test "direct audiobook file extensions are the planner audio extensions" do
+    planner = AudiobookBundleImportPlanner::KNOWN_AUDIO_EXTENSIONS
+
+    assert_includes planner, "m4b"
+    assert_equal planner, DownloadJob::DIRECT_AUDIOBOOK_FILE_EXTENSIONS
+    assert_includes DownloadJob::DIRECT_AUDIOBOOK_FILE_EXTENSIONS, "m4b"
+  end
+
+  test "new audio formats still require a successful audio probe" do
+    Tempfile.create([ "audio-probe", ".wav" ]) do |file|
+      file.binmode
+      file.write(valid_wav_audio)
+      file.flush
+
+      [ false, RemoteResult::Failed.new(RuntimeError.new("probe failed")) ].each do |result|
+        AudiobookProbeService.probe = ->(_path) { result }
+        assert_not DownloadJob.new.send(:valid_audiobook_signature?, file.path)
+      end
+    end
+  end
+
+  test "new audio formats reject playlists that refer to another audio file" do
+    skip "ffprobe not available" unless system("ffprobe", "-version", out: File::NULL, err: File::NULL)
+
+    AudiobookProbeService.reset_probe!
+    Dir.mktmpdir do |directory|
+      audio = File.join(directory, "book.wav")
+      playlist = File.join(directory, "playlist.wav")
+      File.binwrite(audio, valid_wav_audio)
+      File.write(playlist, "ffconcat version 1.0\nfile book.wav\nduration 0.256\n" + ("# padding\n" * 256))
+
+      assert DownloadJob.new.send(:valid_audiobook_signature?, audio)
+      assert_not DownloadJob.new.send(:valid_audiobook_signature?, playlist)
+    end
+  end
+
+  test "a mixed archive can contain MP3 and newly supported WAV audio" do
+    Dir.mktmpdir do |directory|
+      File.binwrite(File.join(directory, "chapter.mp3"), valid_mp3_audio)
+      File.binwrite(File.join(directory, "chapter.wav"), valid_wav_audio)
+
+      assert_nothing_raised { DownloadJob.new.send(:verify_extracted_audiobook!, directory) }
+    end
   end
 
   test "rejects shallow ADIF AAC signatures as audiobook content" do
@@ -2830,6 +2893,13 @@ class DownloadJobTest < ActiveJob::TestCase
     id3_header + frames
   end
 
+  def valid_wav_audio
+    samples = "\0".b * 4_096
+    "RIFF".b + [ 36 + samples.bytesize ].pack("V") + "WAVEfmt " +
+      [ 16, 1, 1, 8_000, 16_000, 2, 16 ].pack("VvvVVvv") +
+      "data" + [ samples.bytesize ].pack("V") + samples
+  end
+
   def valid_png_image
     Base64.decode64(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
@@ -2941,7 +3011,6 @@ class DownloadJobTest < ActiveJob::TestCase
   end
 
   def stub_qbittorrent_success(torrent_url: "http://example.com/download/test.torrent")
-    # Create a valid torrent file for hash extraction
     info_dict = {
       "name" => "Test Torrent",
       "piece length" => 16384,
@@ -2949,11 +3018,9 @@ class DownloadJobTest < ActiveJob::TestCase
       "length" => 1000
     }
     torrent_data = { "info" => info_dict }.bencode
-    # The hash will be SHA1 of the bencoded info dict
-    # We use a fixed hash in the test since we control the torrent data
+    # The hash will be SHA1 of the bencoded info dict. We use a fixed hash in the test since we control the torrent data
     expected_hash = Digest::SHA1.hexdigest(info_dict.bencode).downcase
 
-    # Stub torrent file download (used for hash extraction)
     stub_request(:get, torrent_url)
       .to_return(
         status: 200,
@@ -2961,15 +3028,11 @@ class DownloadJobTest < ActiveJob::TestCase
         body: torrent_data
       )
 
-    # Stub authentication and version endpoint
     stub_qbittorrent_connection("http://localhost:8080")
 
-    # Stub add torrent
     stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
       .to_return(status: 200, body: "Ok.")
 
-    # Note: With pre-computed hash, we should NOT need to poll for torrent info
-    # But stub it anyway in case fallback is triggered
     stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
       .to_return(
         status: 200,

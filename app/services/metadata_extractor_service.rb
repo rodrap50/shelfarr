@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-# Extracts metadata from uploaded files (audiobooks and ebooks)
-# Reads embedded metadata like ID3 tags, EPUB OPF, PDF info, etc.
 class MetadataExtractorService
   MP4_ATOM_HEADER_SIZE = 8
   MP4_EXTENDED_ATOM_HEADER_SIZE = 16
@@ -29,7 +27,6 @@ class MetadataExtractorService
     "\xA9wrt".b => :narrator
   }.freeze
 
-  # Result of metadata extraction
   Result = Data.define(:title, :author, :year, :description, :narrator, :success) do
     def self.empty
       new(title: nil, author: nil, year: nil, description: nil, narrator: nil, success: false)
@@ -41,8 +38,6 @@ class MetadataExtractorService
   end
 
   class << self
-    # Extract metadata from a file
-    # Returns a Result with extracted metadata
     def extract(file_path)
       return Result.empty if file_path.blank?
 
@@ -93,7 +88,6 @@ class MetadataExtractorService
 
     private
 
-    # Extract metadata from MP3 files using ID3 tags
     def extract_mp3(file_path)
       File.open(file_path, File::RDONLY | File::NOFOLLOW | File::NONBLOCK) do |file|
         extract_mp3_io(file)
@@ -115,7 +109,6 @@ class MetadataExtractorService
         cleaned_title = clean_string(title)
         cleaned_author = clean_string(author)
 
-        # Try to get year from various ID3 frames
         year = parse_year(tag.year) || parse_year(tag.get_frame(:TDRC)&.content)
 
         Result.new(
@@ -132,8 +125,6 @@ class MetadataExtractorService
       Result.empty
     end
 
-    # Extract metadata from M4B/M4A files (AAC audiobooks)
-    # M4B files are MP4 containers - we parse the atoms manually
     def extract_m4b(file_path)
       File.open(file_path, File::RDONLY | File::NOFOLLOW | File::NONBLOCK) do |file|
         extract_m4b_io(file)
@@ -158,8 +149,6 @@ class MetadataExtractorService
       Result.empty
     end
 
-    # Extract metadata from EPUB files
-    # EPUB is a ZIP archive with OPF metadata file
     def extract_epub(file_path)
       File.open(file_path, File::RDONLY | File::NOFOLLOW | File::NONBLOCK) do |file|
         extract_epub_io(file)
@@ -180,7 +169,6 @@ class MetadataExtractorService
       Zip::File.open_buffer(file) do |zip|
         return Result.empty if zip.entries.length > MAX_EPUB_ENTRIES
 
-        # Find the OPF file from container.xml
         container = zip.find_entry("META-INF/container.xml")
         return Result.empty unless container
 
@@ -189,14 +177,12 @@ class MetadataExtractorService
         return Result.empty unless opf_path
         return Result.empty if opf_path.bytesize > MAX_EPUB_METADATA_PATH_BYTES
 
-        # Read the OPF file
         opf_entry = zip.find_entry(opf_path)
         return Result.empty unless opf_entry
 
         opf_doc = Nokogiri::XML(read_zip_entry_capped(opf_entry)) { |config| config.nonet }
         opf_doc.remove_namespaces!
 
-        # Extract metadata from OPF
         title = opf_doc.at_xpath("//metadata/title")&.text
         author = opf_doc.at_xpath("//metadata/creator")&.text
         description = opf_doc.at_xpath("//metadata/description")&.text
@@ -228,7 +214,6 @@ class MetadataExtractorService
       value
     end
 
-    # Extract metadata from PDF files
     def extract_pdf(file_path)
       File.open(file_path, File::RDONLY | File::NOFOLLOW | File::NONBLOCK) do |file|
         extract_pdf_io(file)
@@ -250,8 +235,6 @@ class MetadataExtractorService
       Result.empty
     end
 
-    # Parse MP4/M4B atoms to extract metadata
-    # MP4 files use a tree of "atoms" (boxes) to store data
     def parse_mp4_atoms(file)
       metadata = {}
       budget = { atoms: 0, metadata_bytes: 0 }
@@ -305,7 +288,7 @@ class MetadataExtractorService
     def parse_mp4_meta_atom(file, atom, metadata, budget)
       return if atom[:payload_size] < 4
 
-      file.seek(4, IO::SEEK_CUR) # version and flags
+      file.seek(4, IO::SEEK_CUR)
       parse_mp4_atom_range(file, atom[:end], metadata, budget, context: :meta)
     end
 
@@ -351,7 +334,6 @@ class MetadataExtractorService
       }
     end
 
-    # Read a data atom value from MP4 file
     def read_mp4_data_atom(file, size, budget: nil)
       return nil if size.negative?
 
@@ -382,17 +364,14 @@ class MetadataExtractorService
       end
     end
 
-    # Parse year from various date formats
     def parse_year(value)
       str = clean_string(value, max_bytes: MAX_METADATA_YEAR_BYTES)
       return nil if str.blank?
 
-      # Match 4-digit year (1900-2099)
       match = str.match(/\b(19\d{2}|20\d{2})\b/)
       match ? match[1].to_i : nil
     end
 
-    # Clean up extracted string values
     def clean_string(value, max_bytes: MAX_METADATA_NAME_BYTES)
       max_bytes = Integer(max_bytes)
       return nil unless max_bytes.positive?
@@ -411,8 +390,8 @@ class MetadataExtractorService
         cleaned << component.byteslice(0, remaining).to_s.scrub("")
       end
       cleaned.strip.presence
-    rescue RangeError, TypeError, ArgumentError
-      nil
+    rescue RangeError, TypeError, ArgumentError => error
+      RemoteResult::Failed.new(error)
     end
 
     def clean_metadata_component(value, max_bytes)

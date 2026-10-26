@@ -110,11 +110,9 @@ class ProfilesController < ApplicationController
     redirect_to profile_path, notice: "API token revoked."
   end
 
-  # Two-factor authentication setup
   def two_factor
     @user = Current.user
 
-    # Generate a new secret if not already set up
     unless @user.otp_enabled?
       @user.generate_otp_secret! unless @user.otp_secret.present?
       @provisioning_uri = @user.otp_provisioning_uri
@@ -130,7 +128,6 @@ class ProfilesController < ApplicationController
       return
     end
 
-    # Verify the code before enabling
     if @user.verify_otp(params[:otp_code])
       @backup_codes = @user.enable_otp!
       render :backup_codes
@@ -150,7 +147,6 @@ class ProfilesController < ApplicationController
       return
     end
 
-    # Require password confirmation
     unless @user.authenticate(params[:password])
       redirect_to two_factor_profile_path, alert: "Invalid password."
       return

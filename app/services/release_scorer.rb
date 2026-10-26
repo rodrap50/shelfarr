@@ -1,36 +1,16 @@
 # frozen_string_literal: true
 
-# Scores search results based on how well they match a request.
-# Returns a confidence score (0-100) with a detailed breakdown.
 class ReleaseScorer
   COMIC_ISSUE_EXACT_BONUS = 15
   COMIC_ISSUE_UNKNOWN_MAX_SCORE = 49
   COMIC_ISSUE_VALUE_PATTERN = '\d+(?:\.\d+)?(?:[a-z]|-[a-z])?'
 
-  ROMAN_NUMBER_TOKENS = {
-    "II" => "2",
-    "III" => "3",
-    "IV" => "4",
-    "V" => "5",
-    "VI" => "6",
-    "VII" => "7",
-    "VIII" => "8",
-    "IX" => "9",
-    "X" => "10",
-    "XI" => "11",
-    "XII" => "12",
-    "XIII" => "13",
-    "XIV" => "14",
-    "XV" => "15"
-  }.freeze
-
-  # Weight configuration for each scoring factor
   WEIGHTS = {
     title: 40,      # How well does the release title match the book title?
     author: 20,     # Is the author name present in the release title?
     language: 25,   # Does it match the requested language?
     format: 10,     # Does the format (audiobook/ebook) match?
-    health: 5       # Seeders/availability (for torrents)
+    health: 5
   }.freeze
 
   Result = Data.define(:total, :breakdown, :detected_languages, :detected_format) do
@@ -56,8 +36,6 @@ class ReleaseScorer
     @comic_issue_match = classify_comic_issue_match
   end
 
-  # Calculate the confidence score
-  # @return [Result] Score result with total, breakdown, and detected metadata
   def score
     issue_status = @comic_issue_match&.fetch(:status, nil)
     format_score = calculate_format_score
@@ -87,7 +65,6 @@ class ReleaseScorer
       )
     end
 
-    # Calculate weighted total
     base_total = WEIGHTS.sum do |key, weight|
       (breakdown[key] * weight) / 100.0
     end.round
@@ -105,10 +82,6 @@ class ReleaseScorer
   end
 
   class << self
-    # Score a search result against a request
-    # @param search_result [SearchResult] The search result to score
-    # @param request [Request] The request to match against
-    # @return [Result] Score result
     def score(search_result, request)
       new(search_result, request).score
     end
@@ -116,67 +89,73 @@ class ReleaseScorer
 
   private
 
-  # Title matching score (0-100)
-  # Uses trigram similarity like BookMatcherService
   def calculate_title_score
     return 100 if @comic_issue_match&.fetch(:status, nil) == :exact
 
-    release_title = normalize_for_matching(@search_result.title)
-    book_titles = SearchTitleVariantService.call(@book.title)
-      .map { |title| normalize_for_matching(title) }
+    release_key = TitleKey.new(@search_result.title)
+    title_variants = SearchTitleVariantService.call(@book.title)
+    book_titles = title_variants
+      .map { |title| TitleKey.new(title).canonical }
       .reject(&:blank?)
 
-    return 0 if release_title.blank? || book_titles.empty?
+    return 0 if release_key.canonical.blank? || book_titles.empty?
 
     # Localized/original title aliases are equivalent only as complete phrases.
     # Very short inferred titles are too collision-prone unless they lead the
     # release name (for example, "It" must not match "The Institute").
-    if book_titles.any? { |title| exact_title_phrase_match?(release_title, title) }
+    if title_variants.any? { |title| exact_normalized_title_match?(title) }
       100
     else
-      book_titles.map { |title| trigram_similarity(release_title, title) }.max
+      book_titles.map { |title| trigram_similarity(release_key.canonical, title) }.max
     end
   end
 
-  def exact_title_phrase_match?(release_title, book_title)
+  def exact_title_phrase_match?(release_title, book_title, short_title:)
     phrase = /(?:\A|\s)#{Regexp.escape(book_title)}(?:\z|\s)/
     return false unless release_title.match?(phrase)
-    return true if book_title.length >= 4
+    return true unless short_title
 
     release_title == book_title || release_title.start_with?("#{book_title} ")
+  end
+
+  def exact_normalized_title_match?(book_title)
+    book_key = TitleKey.new(book_title)
+    release_key = TitleKey.new(@search_result.title)
+    book_key.forms.any? do |title|
+      release_key.forms.any? do |release_title|
+        exact_title_phrase_match?(release_title, title, short_title: book_key.short?)
+      end
+    end
   end
 
   def ambiguous_title_alias_match?
     variants = SearchTitleVariantService.call(@book.title)
     return false if variants.length < 3
 
-    release_title = normalize_for_matching(@search_result.title)
-    full_title = normalize_for_matching(@book.title)
-    !exact_title_phrase_match?(release_title, full_title)
+    !exact_normalized_title_match?(@book.title)
   end
 
-  # Author matching score (0-100)
-  # Checks if author name appears in release title
   def calculate_author_score
     return 50 if @comic_issue_match&.fetch(:status, nil) == :exact
     return 50 if @book.author.blank?  # Neutral if no author to match
 
-    release_title = normalize_for_matching(@search_result.title)
-    author = normalize_for_matching(@book.author)
+    release_key = TitleKey.new(@search_result.title)
+    author_key = TitleKey.new(@book.author)
+    release_title = release_key.canonical
+    author = author_key.canonical
 
-    return 0 if release_title.blank?
+    return 0 if release_title.blank? || author.blank?
 
-    # Check for full author name
-    return 100 if release_title.include?(author)
+    return 100 if release_key.substring_forms.any? do |title|
+      author_key.substring_forms.any? { |name| title.include?(name) }
+    end
 
-    # Check for last name (common pattern)
     author_parts = author.split
     if author_parts.length > 1
       last_name = author_parts.last
       return 80 if release_title.include?(last_name) && last_name.length > 3
     end
 
-    # Check for first name (less reliable)
     first_name = author_parts.first
     return 40 if release_title.include?(first_name) && first_name.length > 3
 
@@ -195,23 +174,17 @@ class ReleaseScorer
     # No language detected - treat as neutral (might match, might not)
     return 50 if detected.empty?
 
-    # Check if requested language is in detected languages
     return 100 if detected.include?(requested_language)
 
-    # Wrong language detected
     0
   end
 
-  # Format matching score (0-100)
-  # Checks if release format matches book type
   def calculate_format_score
     detected = @parsed[:format]
     requested = @book.book_type&.to_sym
 
-    # No format detected - neutral
     return 50 if detected.nil?
 
-    # Match check
     case requested
     when :audiobook
       detected == :audiobook ? 100 : 0
@@ -220,7 +193,7 @@ class ReleaseScorer
     when :comicbook
       detected == :comicbook ? 100 : 0
     else
-      50  # Unknown book type
+      50
     end
   end
 
@@ -411,25 +384,6 @@ class ReleaseScorer
     value.to_s.match?(/\A\d+\z/)
   end
 
-  # Normalize text for matching
-  def normalize_for_matching(text)
-    return "" if text.blank?
-
-    normalized = text
-      .downcase
-      .gsub(/[^a-z0-9\s]/, "")  # Remove special characters
-      .gsub(/\s+/, " ")         # Collapse whitespace
-      .strip
-
-    normalize_number_tokens(normalized)
-  end
-
-  def normalize_number_tokens(text)
-    tokens = text.split
-    tokens.map { |token| ROMAN_NUMBER_TOKENS.fetch(token.upcase, token) }.join(" ")
-  end
-
-  # Trigram-based similarity score (0-100)
   def trigram_similarity(str1, str2)
     return 100 if str1 == str2
     return 0 if str1.blank? || str2.blank?

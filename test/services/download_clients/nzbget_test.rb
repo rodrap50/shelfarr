@@ -257,7 +257,6 @@ class DownloadClients::NzbgetTest < ActiveSupport::TestCase
 
   test "list_torrents returns queue and history items" do
     VCR.turned_off do
-      # Stub listgroups (queue)
       stub_request(:post, "http://localhost:6789/jsonrpc")
         .with(
           body: hash_including("method" => "listgroups"),
@@ -280,7 +279,6 @@ class DownloadClients::NzbgetTest < ActiveSupport::TestCase
           }.to_json
         )
 
-      # Stub history
       stub_request(:post, "http://localhost:6789/jsonrpc")
         .with(
           body: hash_including("method" => "history"),
@@ -368,7 +366,7 @@ class DownloadClients::NzbgetTest < ActiveSupport::TestCase
         .with(basic_auth: [ "nzbget", "tegbzn6789" ])
         .to_return(status: 401)
 
-      assert_not @client.test_connection
+      assert RemoteResult.failed?(@client.test_connection)
     end
   end
 
@@ -378,7 +376,7 @@ class DownloadClients::NzbgetTest < ActiveSupport::TestCase
         .with(basic_auth: [ "nzbget", "tegbzn6789" ])
         .to_timeout
 
-      assert_not @client.test_connection
+      assert RemoteResult.failed?(@client.test_connection)
     end
   end
 
@@ -418,7 +416,6 @@ class DownloadClients::NzbgetTest < ActiveSupport::TestCase
 
   test "torrent_info returns item from history when not in queue" do
     VCR.turned_off do
-      # Queue returns empty
       stub_request(:post, "http://localhost:6789/jsonrpc")
         .with(
           body: hash_including("method" => "listgroups"),
@@ -430,7 +427,6 @@ class DownloadClients::NzbgetTest < ActiveSupport::TestCase
           body: { "result" => [] }.to_json
         )
 
-      # History returns the item
       stub_request(:post, "http://localhost:6789/jsonrpc")
         .with(
           body: hash_including("method" => "history"),
@@ -522,7 +518,7 @@ class DownloadClients::NzbgetTest < ActiveSupport::TestCase
       assert_equal :downloading, torrents.find { |t| t.hash == "1" }.state
       assert_equal :paused, torrents.find { |t| t.hash == "2" }.state
       assert_equal :queued, torrents.find { |t| t.hash == "3" }.state
-      assert_equal :queued, torrents.find { |t| t.hash == "4" }.state  # post-processing is queued
+      assert_equal :queued, torrents.find { |t| t.hash == "4" }.state
     end
   end
 

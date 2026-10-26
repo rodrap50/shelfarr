@@ -29,7 +29,7 @@ class Request < ApplicationRecord
     direct_content_manifest
   ].freeze
 
-  CREATED_VIA_VALUES = %w[web api telegram].freeze
+  CREATED_VIA_VALUES = %w[web api telegram hardcover].freeze
   REQUEST_SCOPE_VALUES = %w[single collection].freeze
   MANUAL_MAGNET_GUID_PREFIX = "manual-magnet"
   MANUAL_NZB_GUID_PREFIX = "manual-nzb"
@@ -125,8 +125,6 @@ class Request < ApplicationRecord
     ActivityTracker.track("request.completed", trackable: self, user: user)
   end
 
-  # Schedule retry with exponential backoff
-  # Formula: min(base_delay * 2^retry_count, max_delay)
   def schedule_retry!
     max_retries = SettingsService.get(:max_retries)
 
@@ -156,7 +154,6 @@ class Request < ApplicationRecord
     true
   end
 
-  # Re-queue a not_found request back to pending
   def requeue!
     with_search_transition_lock do
       queue_fresh_search_under_lock!(next_retry_at: nil)
@@ -277,16 +274,7 @@ class Request < ApplicationRecord
     download.update!(status: :failed) unless download.failed?
 
     blocklisted = blocklist_result!(download.search_result, reason: reason, download: download)
-
-    unless auto_select_enabled?
-      manual_message = if blocklisted
-        "Download failed: #{reason}. The failed release was blocklisted. Select another release manually."
-      else
-        "Download failed: #{reason}. Select another release manually."
-      end
-      mark_for_attention_after_idle_failure!(manual_message)
-      return :manual_review
-    end
+    return manual_review_after_release_failure!(reason, blocklisted:) unless auto_select_enabled?
 
     attempt_next_candidate!(failure_reason: reason)
   end
@@ -295,19 +283,20 @@ class Request < ApplicationRecord
     target = search_result || search_results.selected.first
     return :no_selected_result unless target
 
+    blocklisted = false
     ActiveRecord::Base.transaction do
       downloads.where(status: [ :queued, :downloading, :paused ]).find_each do |download|
         cancel_download(download)
       end
 
-      blocklist_result!(target, reason: reason)
+      blocklisted = blocklist_result!(target, reason: reason)
     end
+
+    return manual_review_after_release_failure!(reason, blocklisted:) unless auto_select_enabled?
 
     attempt_next_candidate!(failure_reason: reason)
   end
 
-  # Cancel/fail request permanently
-  # Also cancels any active downloads and removes them from download clients
   def cancel!(allow_direct_recovery: false)
     cancelled_download_ids = with_acquisition_transition_lock do
       raise CancellationBlockedError, upload_cancellation_blocked_message if upload_cancellation_blocked?
@@ -407,7 +396,6 @@ class Request < ApplicationRecord
     end
   end
 
-  # Cancel a specific download and remove from download client
   def cancel_download(download)
     return unless download.queued? || download.downloading? || download.paused?
 
@@ -416,7 +404,6 @@ class Request < ApplicationRecord
   end
 
   def remove_download_from_client(download)
-    # Try to remove from download client if we have an external_id
     if download.external_id.present? && download.download_client.present?
       begin
         client = download.download_client.client_instance
@@ -434,25 +421,38 @@ class Request < ApplicationRecord
     end
   end
 
-  # Check if request can be retried
-  # Allow retry if already in retryable state OR if attention is needed
   def can_retry?
     return false if completed?
     pending? || awaiting_purchase? || not_found? || failed? || attention_needed?
   end
 
-  # Check if request needs manual selection of search results
   def needs_manual_selection?
     searching? && search_results.pending.any?
   end
 
-  # Check if request can be cancelled/deleted
-  # Allow cancellation for any request that isn't already completed
   def can_be_cancelled?
     !completed? &&
       !upload_cancellation_blocked? &&
       !post_processing_recovery_pending? &&
       !direct_acquisition_recovery_pending?
+  end
+
+  def can_delete_completed_history?
+    completed? && completed_history_removal_blocked_message.nil?
+  end
+
+  # Completed requests are history, not acquisition admission. Keep the Book
+  # and its files while deleting history under the same recovery lock as imports.
+  def destroy_completed_history!
+    with_acquisition_transition_lock do
+      message = completed_history_removal_blocked_message
+      raise CancellationBlockedError, message if message
+
+      LibraryDownloadRoots.new(book.reload).preserve_legacy_reference_roots!
+      destroy!
+    end
+  rescue LibraryDownloadRoots::UnavailableRootError => error
+    raise CancellationBlockedError, error.message
   end
 
   def search_refresh_allowed?
@@ -516,7 +516,6 @@ class Request < ApplicationRecord
       "Wait for recovery to finish before deleting the request."
   end
 
-  # Check if retry is due
   def retry_due?
     not_found? && next_retry_at.present? && next_retry_at <= Time.current
   end
@@ -528,8 +527,6 @@ class Request < ApplicationRecord
   alias_method :manual_magnet_allowed?, :manual_download_allowed?
   alias_method :manual_nzb_allowed?, :manual_download_allowed?
 
-  # Select a search result and initiate download
-  # Returns the created Download record
   def select_result!(search_result)
     raise ArgumentError, "Result not downloadable" unless search_result.downloadable?
     raise ArgumentError, "Result does not belong to this request" unless search_result.request_id == id
@@ -657,6 +654,17 @@ class Request < ApplicationRecord
     throw :abort
   end
 
+  def completed_history_removal_blocked_message
+    return "Only completed request history can be deleted" unless completed?
+    return upload_cancellation_blocked_message if upload_cancellation_blocked?
+    return post_processing_recovery_message if post_processing_recovery_pending?
+    return direct_acquisition_recovery_message if direct_acquisition_recovery_pending?
+    return "This request still has an active download. Wait for it to finish before deleting its history." if
+      downloads.where(status: [ :queued, :downloading, :paused ]).exists?
+
+    nil
+  end
+
   def serialize_acquisition_transition!
     locked = self.class.where(id: id).update_all(updated_at: Time.current)
     raise ActiveRecord::RecordNotFound, "Request is no longer available" unless locked == 1
@@ -724,6 +732,16 @@ class Request < ApplicationRecord
 
   def broadcast_show_refresh_later_if_needed
     broadcast_show_refresh_later if (previous_changes.keys & SHOW_PAGE_BROADCAST_ATTRIBUTES).any?
+  end
+
+  def manual_review_after_release_failure!(reason, blocklisted:)
+    manual_message = if blocklisted
+      "Download failed: #{reason}. The failed release was blocklisted. Select another release manually."
+    else
+      "Download failed: #{reason}. Select another release manually."
+    end
+    mark_for_attention_after_idle_failure!(manual_message)
+    :manual_review
   end
 
   def attempt_next_candidate!(failure_reason:, mark_exhausted: true)

@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-# Matches parsed filename data against existing books in the library
-# Uses fuzzy string matching to find potential matches
 class BookMatcherService
   Result = Data.define(:book, :score, :match_type) do
     def exact?
@@ -17,7 +15,6 @@ class BookMatcherService
     end
   end
 
-  # Minimum score to consider a fuzzy match
   FUZZY_THRESHOLD = 70
 
   # Minimum title-only similarity required before author similarity can contribute to score
@@ -37,8 +34,6 @@ class BookMatcherService
   ].freeze
 
   class << self
-    # Find best matching book for the given title/author and book type
-    # Returns Result with matched book (or nil), score, and match type
     def match(title:, author:, book_type:)
       return no_match_result if title.blank?
 
@@ -72,8 +67,6 @@ class BookMatcherService
       end
     end
 
-    # Find or create a book based on parsed data
-    # If match found, returns existing book; otherwise creates new one
     def find_or_create_book(title:, author:, book_type:)
       result = match(title: title, author: author, book_type: book_type)
 
@@ -120,7 +113,6 @@ class BookMatcherService
         return title_score
       end
 
-      # Weight: 60% title, 40% author
       (title_score * 0.6 + author_score * 0.4).round
     end
 
@@ -194,20 +186,16 @@ class BookMatcherService
     def normalize(text)
       return "" if text.blank?
 
-      text
-        .downcase
-        .gsub("&", " and ")
-        .gsub(/[^a-z0-9\s]/, "")  # Remove special characters
+      TitleKey.new(text.to_s.gsub("&", " and ")).collapsed
         .gsub(SEQUENCE_MARKER_PATTERN) do
           marker = normalize_sequence_marker(Regexp.last_match(1))
           number = normalize_sequence_number(Regexp.last_match(2))
           "#{marker} #{number}"
         end
-        .gsub(/\s+/, " ")         # Collapse whitespace
+        .gsub(/\s+/, " ")
         .strip
     end
 
-    # Trigram-based similarity score (0-100)
     def string_similarity(str1, str2)
       return 100 if str1 == str2
       return 0 if str1.blank? || str2.blank?

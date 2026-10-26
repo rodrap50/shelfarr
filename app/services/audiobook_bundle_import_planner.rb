@@ -1,8 +1,5 @@
 # frozen_string_literal: true
 
-# Builds a conservative, filesystem-only import plan for audiobook releases
-# that contain one self-contained audio file per book. Chaptered and multipart
-# releases deliberately fall back to the normal single-directory import.
 class AudiobookBundleImportPlanner
   KNOWN_AUDIO_EXTENSIONS = %w[
     aa aac aax aaxc aiff alac flac m4a m4b mp3 ogg opus wav wma
@@ -232,8 +229,8 @@ class AudiobookBundleImportPlanner
       Marcel::MimeType.for(file, name: File.basename(path))
     end
     mime_type.to_s.start_with?("audio/")
-  rescue Errno::ENOENT, Errno::EACCES, IOError
-    false
+  rescue Errno::ENOENT, Errno::EACCES, IOError => error
+    RemoteResult::Failed.new(error)
   end
 
   def self_contained_book_file?(path)
@@ -292,8 +289,7 @@ class AudiobookBundleImportPlanner
     path.to_s.unicode_normalize(:nfkc).downcase(:fold)
   end
 
-  # Resolve symlinks in the existing portion of a path while retaining any
-  # not-yet-created destination segments.
+  # Resolve symlinks in the existing portion of a path while retaining any not-yet-created destination segments.
   def canonical_path(path)
     expanded_path = File.expand_path(path)
     existing_path = expanded_path
