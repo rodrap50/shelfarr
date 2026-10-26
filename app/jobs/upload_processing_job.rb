@@ -1,11 +1,5 @@
 # frozen_string_literal: true
 
-# Processes uploaded files:
-# 1. Extracts metadata from file (ID3 tags, EPUB OPF, etc.)
-# 2. Falls back to filename parsing if extraction fails
-# 3. Searches metadata sources (Hardcover/Google Books/OpenLibrary) for enrichment
-# 4. Creates book with proper metadata
-# 5. Renames file and moves to library location
 class UploadProcessingJob < ApplicationJob
   MAX_AUDIOBOOK_ZIP_EXTRACTED_BYTES = 2.gigabytes
   MAX_AUDIOBOOK_ZIP_FILES = 10_000
@@ -77,14 +71,12 @@ class UploadProcessingJob < ApplicationJob
         upload.file_path
       end
 
-      # Step 1: Extract metadata from the actual file
       extracted = MetadataExtractorService.extract(processing_path)
 
       if extracted.present?
         Rails.logger.info "[UploadProcessingJob] Upload #{upload.id} contained usable embedded metadata"
       end
 
-      # Step 2: Parse filename as fallback
       parsed = FilenameParserService.parse(upload.original_filename)
       Rails.logger.info "[UploadProcessingJob] Parsed fallback metadata for upload #{upload.id}"
 
@@ -98,12 +90,11 @@ class UploadProcessingJob < ApplicationJob
         match_confidence: extracted.present? ? 90 : parsed.confidence
       )
 
-      # Step 3: Determine book type from explicit request or file extension
       book_type = target_request&.book&.book_type || upload.infer_book_type
       upload.update!(book_type: book_type)
 
-      # Step 4: Search metadata sources for enrichment
       metadata = target_request || upload.manual_match? ? nil : fetch_metadata(title, author)
+      metadata = nil if RemoteResult.failed?(metadata)
 
       if metadata
         Rails.logger.info "[UploadProcessingJob] Matched external metadata for upload ##{upload.id}"
@@ -227,7 +218,6 @@ class UploadProcessingJob < ApplicationJob
             move_to_library(upload, book, language: target_language)
           end
 
-          # Step 7: Update book with file path
           if ordinary_file_service || zip_file_service
             claim_book_file_path!(book, destination, upload)
           else
@@ -281,7 +271,6 @@ class UploadProcessingJob < ApplicationJob
 
       cleanup_completed_upload_source(ordinary_file_service || zip_file_service)
 
-      # Step 8: Trigger library platform scan if configured (outside transaction)
       trigger_library_scan(book) if book && LibraryPlatformClient.configured?
       NotificationService.request_completed(completed_request) if completed_request
 
@@ -345,7 +334,7 @@ class UploadProcessingJob < ApplicationJob
     else
       UploadImportFileService.restore_and_clear!(upload)
     end
-    return true if restored || upload.destination_path.blank?
+    return true if restored == true || upload.destination_path.blank?
 
     Rails.logger.error(
       "[UploadProcessingJob] Reserved destination for upload #{upload.id} requires manual reconciliation"
@@ -549,7 +538,7 @@ class UploadProcessingJob < ApplicationJob
     Rails.logger.error(
       "[UploadProcessingJob] Could not release Book reservation for upload ##{upload.id}: #{error.class}"
     )
-    false
+    RemoteResult::Failed.new(error)
   end
 
   def preassociate_owned_media_book(
@@ -696,17 +685,14 @@ class UploadProcessingJob < ApplicationJob
     )
   end
 
-  # Search metadata sources and return the best matching result
   def fetch_metadata(title, author)
     return nil if title.blank?
 
-    # Build search query - include author if available for better results
     query = author.present? ? "#{title} #{author}" : title
 
     results = MetadataService.search(query, limit: 5)
     return nil if results.empty?
 
-    # Score results and pick the best match
     best_match = results.max_by { |r| score_result(r, title, author) }
 
     # Only return if score is reasonable
@@ -714,20 +700,17 @@ class UploadProcessingJob < ApplicationJob
     score >= 30 ? best_match : nil
   rescue HardcoverClient::Error, GoogleBooksClient::Error, OpenLibraryClient::Error, MetadataService::Error => e
     Rails.logger.warn "[UploadProcessingJob] Metadata search failed (#{e.class})"
-    nil
+    RemoteResult::Failed.new(e)
   end
 
-  # Score how well a search result matches the parsed title/author
   def score_result(result, query_title, query_author)
     score = 0
 
-    # Title similarity (max 60 points)
     if result.title.present? && query_title.present?
       title_sim = string_similarity(result.title.downcase, query_title.downcase)
       score += (title_sim * 0.6).round
     end
 
-    # Author similarity (max 40 points)
     if result.author.present? && query_author.present?
       author_sim = string_similarity(result.author.downcase, query_author.downcase)
       score += (author_sim * 0.4).round
@@ -743,7 +726,6 @@ class UploadProcessingJob < ApplicationJob
     return 100 if str1 == str2
     return 0 if str1.blank? || str2.blank?
 
-    # Simple trigram similarity
     trigrams1 = to_trigrams(str1)
     trigrams2 = to_trigrams(str2)
     return 0 if trigrams1.empty? || trigrams2.empty?
@@ -796,7 +778,6 @@ class UploadProcessingJob < ApplicationJob
       content_kind: content_kind
     }.compact
 
-    # Check for existing book with same work_id and type
     if work_id.present? && !force_new
       existing = Book.find_by_work_id(work_id, book_type: book_type)
       if existing
@@ -805,7 +786,6 @@ class UploadProcessingJob < ApplicationJob
       end
     end
 
-    # Try to match against existing books
     unless force_new
       result = BookMatcherService.match(title: title, author: author, book_type: book_type)
       if result.exact? || result.fuzzy?
@@ -814,7 +794,6 @@ class UploadProcessingJob < ApplicationJob
       end
     end
 
-    # Create new book with metadata
     if work_id.present? && !force_new
       source, _source_id = Book.parse_work_id(work_id)
       book = Book.find_or_initialize_by_work_id(work_id, book_type: book_type)

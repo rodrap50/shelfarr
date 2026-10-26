@@ -15,8 +15,6 @@ module Admin
       sign_in_as(@admin)
     end
 
-    # === Authorization ===
-
     test "index requires admin" do
       sign_out
       sign_in_as(@user)
@@ -40,8 +38,6 @@ module Admin
       post refresh_admin_request_search_results_path(@request_record)
       assert_redirected_to root_path
     end
-
-    # === Index ===
 
     test "index shows search results" do
       get admin_request_search_results_path(@request_record)
@@ -104,8 +100,6 @@ module Admin
       end
     end
 
-    # === Select ===
-
     test "select creates download and updates statuses" do
       assert_difference -> { Download.count }, 1 do
         post select_admin_request_search_result_path(@request_record, @pending_result),
@@ -149,12 +143,9 @@ module Admin
     test "select marks other results as rejected" do
       post select_admin_request_search_result_path(@request_record, @pending_result)
 
-      # Reload all results
       @selected_result.reload
       @no_link_result.reload
 
-      # The previously selected result should be changed to rejected
-      # Note: selected_result was already :selected in fixture, so it becomes :rejected
       assert @selected_result.rejected?
     end
 
@@ -165,7 +156,7 @@ module Admin
       assert_match /cannot be downloaded/, flash[:alert]
 
       @no_link_result.reload
-      assert @no_link_result.pending? # Status unchanged
+      assert @no_link_result.pending?
     end
 
     test "select enqueues download job" do
@@ -173,8 +164,6 @@ module Admin
         post select_admin_request_search_result_path(@request_record, @pending_result)
       end
     end
-
-    # === Refresh ===
 
     test "refresh clears results and requeues search" do
       assert @request_record.search_results.any?

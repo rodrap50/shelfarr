@@ -16,13 +16,11 @@ class CleanupTempFilesJobTest < ActiveJob::TestCase
   end
 
   test "cleanup_old_activity_logs deletes old logs" do
-    # Create an old activity log
     old_log = ActivityLog.create!(
       action: "test.action",
       created_at: 100.days.ago
     )
 
-    # Create a recent log
     recent_log = ActivityLog.create!(
       action: "test.action",
       created_at: 1.day.ago
@@ -63,7 +61,6 @@ class CleanupTempFilesJobTest < ActiveJob::TestCase
 end
 
 class CleanupTempFilesJobIsolatedTest < ActiveJob::TestCase
-  # These tests run in isolation with their own temp directories
   setup do
     @test_id = "#{Process.pid}_#{SecureRandom.hex(4)}"
     @temp_base = Rails.root.join("tmp", "cleanup_test_#{@test_id}")
@@ -459,11 +456,9 @@ class CleanupTempFilesJobIsolatedTest < ActiveJob::TestCase
   def perform_cleanup_for(downloads_dir, uploads_dir)
     job = CleanupTempFilesJob.new
 
-    # Stub the directories for this test
     job.instance_variable_set(:@test_downloads_dir, downloads_dir)
     job.instance_variable_set(:@test_uploads_dir, uploads_dir)
 
-    # Define test-specific cleanup methods
     job.define_singleton_method(:cleanup_download_temps) do
       dir = @test_downloads_dir
       return unless File.directory?(dir)

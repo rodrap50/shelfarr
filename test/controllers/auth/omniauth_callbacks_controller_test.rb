@@ -7,7 +7,6 @@ class Auth::OmniauthCallbacksControllerTest < ActionDispatch::IntegrationTest
     OmniAuth.config.test_mode = true
     OmniAuth.config.silence_get_warning = true
 
-    # Enable OIDC settings
     SettingsService.set(:oidc_enabled, true)
     SettingsService.set(:oidc_issuer, "https://auth.example.com")
     SettingsService.set(:oidc_client_id, "test-client")
@@ -247,16 +246,13 @@ class Auth::OmniauthCallbacksControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "OIDC callback without auth hash redirects with error" do
-    # Clear any mock auth to simulate missing data
     OmniAuth.config.mock_auth[:oidc] = :invalid_credentials
 
     get "/auth/oidc/callback"
 
-    # OmniAuth will redirect to failure endpoint first
     assert_response :redirect
     follow_redirect!
 
-    # Then our failure handler redirects to login
     assert_redirected_to new_session_path
   end
 

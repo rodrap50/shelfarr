@@ -4,7 +4,6 @@ require "base64"
 require "bencode"
 
 module DownloadClients
-  # Transmission RPC client
   class Transmission < Base
     class LegacyProtocolRequired < StandardError; end
 
@@ -13,6 +12,7 @@ module DownloadClients
       name
       hash_string
       percent_done
+      left_until_done
       status
       total_size
       download_dir
@@ -25,6 +25,7 @@ module DownloadClients
       name
       hashString
       percentDone
+      leftUntilDone
       status
       totalSize
       downloadDir
@@ -88,7 +89,7 @@ module DownloadClients
       true
     rescue Base::Error, Base::AuthenticationError, Faraday::Error => e
       Rails.logger.warn "[Transmission] Connection test failed: #{e.message}"
-      false
+      RemoteResult::Failed.new(e)
     end
 
     def remove_torrent(hash, delete_files: false)
@@ -330,7 +331,7 @@ module DownloadClients
       else
         resolve_torrent_source(url)
       end
-      if source.blank?
+      if RemoteResult.failed?(source) || source.blank?
         raise Base::Error, "Could not safely fetch torrent source" if validate_source_url
 
         return { url: url }
@@ -340,7 +341,7 @@ module DownloadClients
       return { url: resolved_url } if resolved_url.start_with?("magnet:")
 
       torrent_data = source[:torrent_data]
-      unless valid_torrent_data?(torrent_data)
+      unless valid_torrent_data?(torrent_data) == true
         raise Base::Error, "Torrent source did not return a valid torrent file" if validate_source_url
 
         return { url: resolved_url }
@@ -351,7 +352,7 @@ module DownloadClients
 
     def resolve_torrent_source(raw_url)
       normalized_url = normalized_torrent_url(raw_url)
-      return nil unless normalized_url
+      return nil if RemoteResult.failed?(normalized_url) || normalized_url.blank?
 
       current_url = normalized_url
       max_redirects = 10
@@ -364,7 +365,7 @@ module DownloadClients
         location = response.headers["location"]
         if response.status.between?(300, 399) && location.present?
           redirected_url = absolutize_redirect_url(current_url, location)
-          return { url: current_url } if redirected_url.blank?
+          return { url: current_url } if RemoteResult.failed?(redirected_url) || redirected_url.blank?
           return { url: redirected_url } if redirected_url.start_with?("magnet:")
 
           current_url = redirected_url
@@ -382,10 +383,10 @@ module DownloadClients
       { url: current_url }
     rescue URI::InvalidURIError => e
       Rails.logger.warn "[Transmission] Invalid torrent URL: #{e.message}"
-      nil
+      RemoteResult::Failed.new(e)
     rescue Faraday::Error => e
       Rails.logger.warn "[Transmission] Failed to download torrent file for direct upload: #{e.message}"
-      nil
+      RemoteResult::Failed.new(e)
     end
 
     def valid_torrent_data?(torrent_data)
@@ -393,8 +394,8 @@ module DownloadClients
 
       parsed = BEncode.load(torrent_data.dup)
       parsed.is_a?(Hash) && parsed["info"].is_a?(Hash)
-    rescue BEncode::DecodeError
-      false
+    rescue BEncode::DecodeError => error
+      RemoteResult::Failed.new(error)
     end
 
     def normalized_torrent_url(raw_url)
@@ -406,7 +407,7 @@ module DownloadClients
       uri.to_s
     rescue URI::InvalidURIError => e
       Rails.logger.warn "[Transmission] Invalid torrent URL: #{e.message}"
-      nil
+      RemoteResult::Failed.new(e)
     end
 
     def torrent_download_connection
@@ -427,8 +428,8 @@ module DownloadClients
       return nil unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
 
       resolved
-    rescue URI::InvalidURIError
-      nil
+    rescue URI::InvalidURIError => error
+      RemoteResult::Failed.new(error)
     end
 
     def extract_magnet_from_body(body)
@@ -447,11 +448,21 @@ module DownloadClients
       # import the entire download root instead of just this torrent.
       content_path = name.present? && download_dir.present? ? File.join(download_dir, name) : download_dir
 
+      raw_progress = transmission_value(data, "percent_done", "percentDone")
       Base::TorrentInfo.new(
         hash: transmission_value(data, "hash_string", "hashString"),
         name: name,
-        progress: normalize_progress(transmission_value(data, "percent_done", "percentDone")),
-        state: normalize_state(data["status"], error: data["error"]),
+        progress: normalize_progress(raw_progress),
+        state: download_state(
+          unit: :fraction,
+          progress: raw_progress,
+          state: {
+            transmission: data["status"],
+            error: data["error"],
+            left_until_done: transmission_value(data, "left_until_done", "leftUntilDone")
+          },
+          path: content_path
+        ),
         size_bytes: transmission_value(data, "total_size", "totalSize"),
         download_path: content_path
       )
@@ -471,27 +482,6 @@ module DownloadClients
     def normalize_progress(progress)
       return 0 if progress.blank?
       (progress.to_f * 100).round
-    end
-
-    def normalize_state(status, error: nil)
-      return :failed if error.to_i == 3
-
-      case status.to_i
-      when 0
-        :paused
-      when 1, 2
-        :queued
-      when 3
-        :queued
-      when 4
-        :downloading
-      when 5
-        :queued
-      when 6
-        :completed
-      else
-        :downloading
-      end
     end
 
     def connection

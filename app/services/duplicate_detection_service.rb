@@ -1,11 +1,8 @@
 # frozen_string_literal: true
 
-# Service for detecting duplicate books and requests
-# Returns status and existing records to help users make informed decisions
 class DuplicateDetectionService
-  # Result status types
-  ALLOW = :allow           # No duplicates, proceed
-  WARN = :warn             # Similar exists, user can still proceed
+  ALLOW = :allow
+  WARN = :warn
   BLOCK = :block           # Exact duplicate, cannot create
 
   Result = Data.define(:status, :message, :existing_book, :existing_request) do
@@ -23,13 +20,10 @@ class DuplicateDetectionService
   end
 
   class << self
-    # Check if a book can be requested
-    # Returns a Result with status, message, and any existing records
     def check(work_id:, edition_id: nil, book_type:, source_work_ids: nil, existing_books_lookup: nil)
       book_type = book_type.to_s
       work_ids = [ work_id, *Array(source_work_ids) ].compact_blank.uniq
 
-      # Check 1: Same edition already acquired (most specific)
       if edition_id.present?
         existing = Book.find_by(open_library_edition_id: edition_id, book_type: book_type)
         if existing&.acquired?
@@ -42,7 +36,6 @@ class DuplicateDetectionService
         end
       end
 
-      # Check 2: Same work + type already acquired
       existing_book = find_existing_book(work_ids, book_type: book_type, existing_books_lookup: existing_books_lookup)
       if existing_book&.acquired?
         return Result.new(
@@ -53,7 +46,6 @@ class DuplicateDetectionService
         )
       end
 
-      # Check 3: Same work + type has pending/active request
       if existing_book
         active_request = existing_book.requests.open.first
         if active_request
@@ -94,7 +86,6 @@ class DuplicateDetectionService
         end
       end
 
-      # No duplicates found
       Result.new(
         status: ALLOW,
         message: nil,
@@ -103,7 +94,6 @@ class DuplicateDetectionService
       )
     end
 
-    # Quick check - just returns true/false for whether request is allowed
     def can_request?(work_id:, edition_id: nil, book_type:, source_work_ids: nil, existing_books_lookup: nil)
       result = check(
         work_id: work_id,

@@ -5,6 +5,7 @@ require "minitest/mock"
 require "mutant/minitest/coverage"
 require_relative "test_helpers/session_test_helper"
 require_relative "test_helpers/synthetic_library_modes_test_helper"
+require_relative "test_helpers/hardcover_test_helper"
 require_relative "support/vcr_setup"
 
 # Resolve hostnames to a fixed public test address instead of doing real DNS
@@ -13,16 +14,12 @@ OutboundUrlGuard.resolver = ->(host) { [ "203.0.113.10" ] }
 
 module ActiveSupport
   class TestCase
-    # Run tests in parallel with specified workers
     parallelize(workers: :number_of_processors) unless ENV["COVERAGE"]
 
-    # Setup all fixtures in test/fixtures/*.yml for all tests in alphabetical order.
     fixtures :all
 
-    # Include VCR helper for all tests
     include VCRHelper
 
-    # Helper to stub qBittorrent connection (auth + version + category + diagnostics)
     def stub_qbittorrent_connection(url, session_id: "test_session_id")
       stub_request(:post, "#{url}/api/v2/auth/login")
         .to_return(
@@ -78,7 +75,5 @@ module ActiveSupport
       @settings_env_backup.each { |key, value| ENV[key] = value }
       @settings_env_backup = nil
     end
-
-    # Add more helper methods to be used by all tests here...
   end
 end

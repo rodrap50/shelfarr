@@ -1,9 +1,7 @@
 # frozen_string_literal: true
 
-# Service for parsing release titles to extract metadata like language, format, and quality.
 # Based on patterns from Radarr/Sonarr LanguageParser and rank-torrent-name (RTN).
 class ReleaseParserService
-  # Supported languages with their ISO 639-1 codes and display names
   LANGUAGES = {
     "en" => { name: "English", flag: "GB" },
     "nl" => { name: "Dutch", flag: "NL" },
@@ -37,82 +35,72 @@ class ReleaseParserService
   }.freeze
 
   # Language detection patterns - order matters for specificity
-  # More specific patterns should come before generic ones
+  # More specific patterns should come before generic ones.
+  # Case-sensitive two-letter codes reject letters of either case as neighbors,
+  # so EN does not match inside an all-caps word such as FRENCH.
   LANGUAGE_PATTERNS = [
-    # English
     { code: "en", pattern: /\benglish\b/i },
     { code: "en", pattern: /(?<![a-z])eng(?![a-z])/i },
-    { code: "en", pattern: /(?<![a-z])EN(?![a-z])/ },
+    { code: "en", pattern: /(?<![A-Za-z])EN(?![A-Za-z])/ },
 
-    # Dutch/Flemish
     { code: "nl", pattern: /\bdutch\b/i },
     { code: "nl", pattern: /\bflemish\b/i },
-    { code: "nl", pattern: /(?<![a-z])NL(?![a-z])/ },
+    { code: "nl", pattern: /(?<![A-Za-z])NL(?![A-Za-z])/ },
     { code: "nl", pattern: /\.NL\./i },
     { code: "nl", pattern: /\[Dutch\]/i },
     { code: "nl", pattern: /\(Dutch\)/i },
 
-    # German (including Swiss German)
     { code: "de", pattern: /\bgerman\b/i },
     { code: "de", pattern: /\bswissgerman\b/i },
     { code: "de", pattern: /\bger\.dub\b/i },
     { code: "de", pattern: /\bvideomann\b/i },
     { code: "de", pattern: /(?<![a-z])ger(?![a-z])/i },
-    { code: "de", pattern: /(?<![a-z])DE(?![a-z])/ },
+    { code: "de", pattern: /(?<![A-Za-z])DE(?![A-Za-z])/ },
     { code: "de", pattern: /\.DE\./i },
 
-    # French
     { code: "fr", pattern: /\bfrench\b/i },
     { code: "fr", pattern: /\btruefrench\b/i },
     { code: "fr", pattern: /(?<![a-z])VF(?![a-z])/i },
     { code: "fr", pattern: /(?<![a-z])VFF(?![a-z])/i },
     { code: "fr", pattern: /(?<![a-z])VFQ(?![a-z])/i },
     { code: "fr", pattern: /(?<![a-z])VFI(?![a-z])/i },
-    { code: "fr", pattern: /(?<![a-z])FR(?![a-z])/ },
+    { code: "fr", pattern: /(?<![A-Za-z])FR(?![A-Za-z])/ },
     { code: "fr", pattern: /\.FR\./i },
 
-    # Spanish
     { code: "es", pattern: /\bspanish\b/i },
     { code: "es", pattern: /\bespañol\b/i },
     { code: "es", pattern: /\bcastellano\b/i },
-    { code: "es", pattern: /(?<![a-z])ES(?![a-z])/ },
+    { code: "es", pattern: /(?<![A-Za-z])ES(?![A-Za-z])/ },
     { code: "es", pattern: /\.ES\./i },
     { code: "es", pattern: /\blatino\b/i },
 
-    # Italian
     { code: "it", pattern: /\bitalian\b/i },
     { code: "it", pattern: /(?<![a-z])ita(?![a-z])/i },
-    { code: "it", pattern: /(?<![a-z])IT(?![a-z])/ },
+    { code: "it", pattern: /(?<![A-Za-z])IT(?![A-Za-z])/ },
     { code: "it", pattern: /\.IT\./i },
 
-    # Portuguese
     { code: "pt", pattern: /\bportuguese\b/i },
     { code: "pt", pattern: /(?<![a-z])por(?![a-z])/i },
-    { code: "pt", pattern: /(?<![a-z])PT(?![a-z])/ },
+    { code: "pt", pattern: /(?<![A-Za-z])PT(?![A-Za-z])/ },
     { code: "pt", pattern: /\.PT\./i },
 
-    # Portuguese (Brazil)
     { code: "pt-BR", pattern: /\bbrazilian\b/i },
     { code: "pt-BR", pattern: /\bdublado\b/i },
     { code: "pt-BR", pattern: /\bpt-br\b/i },
     { code: "pt-BR", pattern: /\.BR\./i },
 
-    # Russian
     { code: "ru", pattern: /\brussian\b/i },
     { code: "ru", pattern: /(?<![a-z])rus(?![a-z])/i },
-    { code: "ru", pattern: /(?<![a-z])RU(?![a-z])/ },
+    { code: "ru", pattern: /(?<![A-Za-z])RU(?![A-Za-z])/ },
 
-    # Japanese
     { code: "ja", pattern: /\bjapanese\b/i },
     { code: "ja", pattern: /(?<![a-z])jap(?![a-z])/i },
     { code: "ja", pattern: /(?<![a-z])jpn(?![a-z])/i },
     { code: "ja", pattern: /\(JA\)/i },
 
-    # Korean
     { code: "ko", pattern: /\bkorean\b/i },
     { code: "ko", pattern: /(?<![a-z])kor(?![a-z])/i },
 
-    # Chinese
     { code: "zh", pattern: /\bchinese\b/i },
     { code: "zh", pattern: /\bmandarin\b/i },
     { code: "zh", pattern: /\bcantonese\b/i },
@@ -121,72 +109,55 @@ class ReleaseParserService
     { code: "zh", pattern: /\[BIG5\]/i },
     { code: "zh", pattern: /\[GB\]/i },
 
-    # Polish
     { code: "pl", pattern: /\bpolish\b/i },
-    { code: "pl", pattern: /(?<![a-z])PL(?![a-z])/ },
+    { code: "pl", pattern: /(?<![A-Za-z])PL(?![A-Za-z])/ },
     { code: "pl", pattern: /\bpl\.dub\b/i },
     { code: "pl", pattern: /\bdub\.pl\b/i },
 
-    # Swedish
     { code: "sv", pattern: /\bswedish\b/i },
     { code: "sv", pattern: /(?<![a-z])swe(?![a-z])/i },
 
-    # Danish
     { code: "da", pattern: /\bdanish\b/i },
     { code: "da", pattern: /(?<![a-z])dan(?![a-z])/i },
 
-    # Norwegian
     { code: "no", pattern: /\bnorwegian\b/i },
     { code: "no", pattern: /(?<![a-z])nor(?![a-z])/i },
 
-    # Finnish
     { code: "fi", pattern: /\bfinnish\b/i },
     { code: "fi", pattern: /(?<![a-z])fin(?![a-z])/i },
 
-    # Turkish
     { code: "tr", pattern: /\bturkish\b/i },
     { code: "tr", pattern: /(?<![a-z])tur(?![a-z])/i },
 
-    # Arabic
     { code: "ar", pattern: /\barabic\b/i },
 
-    # Hebrew
     { code: "he", pattern: /\bhebrew\b/i },
     { code: "he", pattern: /\bhebdub\b/i },
 
-    # Hindi
     { code: "hi", pattern: /\bhindi\b/i },
 
-    # Thai
     { code: "th", pattern: /\bthai\b/i },
 
-    # Vietnamese
     { code: "vi", pattern: /\bvietnamese\b/i },
     { code: "vi", pattern: /(?<![a-z])VIE(?![a-z])/i },
 
-    # Czech
     { code: "cs", pattern: /\bczech\b/i },
-    { code: "cs", pattern: /(?<![a-z])CZ(?![a-z])/ },
+    { code: "cs", pattern: /(?<![A-Za-z])CZ(?![A-Za-z])/ },
 
-    # Hungarian
     { code: "hu", pattern: /\bhungarian\b/i },
     { code: "hu", pattern: /\bhundub\b/i },
     { code: "hu", pattern: /(?<![a-z])HUN(?![a-z])/i },
 
-    # Romanian
     { code: "ro", pattern: /\bromanian\b/i },
     { code: "ro", pattern: /\brodubbed\b/i },
 
-    # Bulgarian
     { code: "bg", pattern: /\bbulgarian\b/i },
     { code: "bg", pattern: /\bbgaudio\b/i },
-    { code: "bg", pattern: /(?<![a-z])BG(?![a-z])/ },
+    { code: "bg", pattern: /(?<![A-Za-z])BG(?![A-Za-z])/ },
 
-    # Ukrainian
     { code: "uk", pattern: /\bukrainian\b/i },
     { code: "uk", pattern: /(?<![a-z])ukr(?![a-z])/i },
 
-    # Greek
     { code: "el", pattern: /\bgreek\b/i }
   ].freeze
 
@@ -198,11 +169,9 @@ class ReleaseParserService
     /\bquad[\.\s]audio\b/i,
     # German dual-language tag (DL but not WEB-DL)
     /(?<!WEB)(?<!WEB-)(?<!WEB\.)(?<!WEB_)\bDL\b/,
-    # German multi-language tag
     /\bML\b/
   ].freeze
 
-  # Audiobook format indicators
   AUDIOBOOK_PATTERNS = [
     /\baudiobook\b/i,
     /\bm4b\b/i,
@@ -214,7 +183,6 @@ class ReleaseParserService
     /\bmp3\b.*\b(?:audiobook|book)\b/i
   ].freeze
 
-  # Ebook format indicators
   EBOOK_PATTERNS = [
     /\bebook\b/i,
     /\bepub\b/i,
@@ -278,9 +246,6 @@ class ReleaseParserService
   ].freeze
 
   class << self
-    # Parse a release title and extract metadata
-    # @param title [String] The release title to parse
-    # @return [Hash] Parsed metadata including languages, format, etc.
     def parse(title)
       return empty_result if title.blank?
 
@@ -296,9 +261,6 @@ class ReleaseParserService
       }
     end
 
-    # Detect all languages present in a release title
-    # @param title [String] The release title
-    # @return [Array<String>] Array of detected ISO 639-1 language codes
     def detect_languages(title)
       return [] if title.blank?
 
@@ -314,18 +276,12 @@ class ReleaseParserService
       detected.to_a
     end
 
-    # Check if a release is marked as multi-language
-    # @param title [String] The release title
-    # @return [Boolean]
     def multi_language?(title)
       return false if title.blank?
 
       MULTI_LANGUAGE_PATTERNS.any? { |pattern| title.match?(pattern) }
     end
 
-    # Detect the format (audiobook, ebook, comicbook, or unknown) from the title
-    # @param title [String] The release title
-    # @return [Symbol, nil] :audiobook, :ebook, or nil if unknown
     def detect_format(title)
       return nil if title.blank?
 
@@ -388,21 +344,14 @@ class ReleaseParserService
       nil
     end
 
-    # Get display info for a language code
-    # @param code [String] ISO 639-1 language code
-    # @return [Hash, nil] Hash with :name and :flag, or nil if unknown
     def language_info(code)
       LANGUAGES[code]
     end
 
-    # Get all supported language codes
-    # @return [Array<String>]
     def supported_language_codes
       LANGUAGES.keys
     end
 
-    # Get languages formatted for select options
-    # @return [Array<Array>] Array of [display_name, code] pairs
     def language_options
       LANGUAGES.map { |code, info| [ info[:name], code ] }.sort_by(&:first)
     end

@@ -9,6 +9,7 @@ class SearchJob < ApplicationJob
     exact_title: 0,
     title_author: 5,
     short_title: 6,
+    tail_title: 7,
     author_title: 8,
     normalized_title: 10,
     number_variant: 12
@@ -53,11 +54,10 @@ class SearchJob < ApplicationJob
     request = Request.find_by(id: request_id)
     return unless request
     search_generation = claim_search!(request)
-    return unless search_generation
+    return if RemoteResult.failed?(search_generation) || !search_generation
 
     Rails.logger.info "[SearchJob] Starting search for request ##{request.id}"
 
-    # Check if any search sources are configured
     indexer_available = IndexerClient.configured?
     anna_available = AnnaArchiveClient.configured? && (request.book.ebook? || request.book.audiobook?)
     zlibrary_available = ZLibraryClient.configured? && request.book.ebook?
@@ -75,71 +75,101 @@ class SearchJob < ApplicationJob
     all_results = []
     all_store_offers = []
     indexer_error = nil
+    @source_failures = []
+    @saw_successful_source = false
 
     if indexer_available
       indexer_results, indexer_error = search_indexer_safely(request)
       return unless heartbeat_search!(request, search_generation)
 
       all_results.concat(indexer_results)
+      @saw_successful_source = true
       Rails.logger.info "[SearchJob] Found #{indexer_results.count} #{IndexerClient.display_name} results"
     end
 
-    # Search Anna's Archive for ebooks and audiobooks if configured
     if anna_available
       anna_results = search_anna_archive(request, search_generation)
       return unless heartbeat_search!(request, search_generation)
 
-      all_results.concat(anna_results)
-      Rails.logger.info "[SearchJob] Found #{anna_results.count} Anna's Archive results"
+      collect_source_results(all_results, anna_results, "Anna's Archive")
     end
 
     if zlibrary_available
       zlibrary_results = search_zlibrary(request, search_generation)
       return unless heartbeat_search!(request, search_generation)
 
-      all_results.concat(zlibrary_results)
-      Rails.logger.info "[SearchJob] Found #{zlibrary_results.count} Z-Library results"
+      collect_source_results(all_results, zlibrary_results, "Z-Library")
     end
 
     if gutenberg_available
       gutenberg_results = search_gutenberg(request)
       return unless heartbeat_search!(request, search_generation)
 
-      all_results.concat(gutenberg_results)
-      Rails.logger.info "[SearchJob] Found #{gutenberg_results.count} Project Gutenberg results"
+      collect_source_results(all_results, gutenberg_results, "Project Gutenberg")
     end
 
     if librivox_available
       librivox_results = search_librivox(request)
       return unless heartbeat_search!(request, search_generation)
 
-      all_results.concat(librivox_results)
-      Rails.logger.info "[SearchJob] Found #{librivox_results.count} LibriVox results"
+      collect_source_results(all_results, librivox_results, "LibriVox")
     end
 
     custom_providers.each do |provider|
       provider_results = search_custom_provider(request, provider)
       return unless heartbeat_search!(request, search_generation)
 
-      all_results.concat(provider_results)
-      Rails.logger.info "[SearchJob] Found #{provider_results.count} custom provider results from #{provider.name}"
+      collect_source_results(all_results, provider_results, "custom provider results from #{provider.name}")
     end
 
     store_providers.each do |provider|
       provider_offers = search_store_provider(request, provider)
       return unless heartbeat_search!(request, search_generation)
 
-      all_store_offers.concat(provider_offers)
-      Rails.logger.info "[SearchJob] Found #{provider_offers.count} DRM-free store offers from #{provider.name}"
+      collect_source_results(all_store_offers, provider_offers, "DRM-free store offers from #{provider.name}")
     end
 
-    complete_search(
-      request,
-      search_generation,
-      results: all_results,
-      store_offers: all_store_offers,
-      indexer_error: indexer_error
-    )
+    if !@saw_successful_source && @source_failures.any?
+      fail_search_without_results(request, search_generation)
+    else
+      complete_search(
+        request,
+        search_generation,
+        results: all_results,
+        store_offers: all_store_offers,
+        indexer_error: indexer_error
+      )
+    end
+  end
+
+  def collect_source_results(bucket, results, label)
+    if RemoteResult.failed?(results)
+      @source_failures << results
+      return
+    end
+
+    @saw_successful_source = true
+    bucket.concat(results)
+    Rails.logger.info "[SearchJob] Found #{results.count} #{label}"
+  end
+
+  def fail_search_without_results(request, search_generation)
+    request.with_search_transition_lock do
+      unless owns_search_attempt?(request, search_generation)
+        log_stale_search(request)
+        next false
+      end
+
+      if @anna_archive_bot_protection_error
+        request.mark_for_attention!(@anna_archive_bot_protection_error)
+      else
+        request.mark_for_attention!("Search failed before any source returned results.")
+      end
+      clear_search_claim!(request)
+      true
+    end
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def claim_search!(request)
@@ -162,8 +192,8 @@ class SearchJob < ApplicationJob
     end
     request.broadcast_show_refresh_later if generation
     generation
-  rescue ActiveRecord::RecordNotFound
-    nil
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def handle_no_search_sources(request, search_generation)
@@ -178,8 +208,8 @@ class SearchJob < ApplicationJob
       clear_search_claim!(request)
       true
     end
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def complete_search(request, search_generation, results:, store_offers:, indexer_error:)
@@ -211,8 +241,8 @@ class SearchJob < ApplicationJob
       clear_search_claim!(request)
       true
     end
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def owns_search_attempt?(request, search_generation)
@@ -321,16 +351,18 @@ class SearchJob < ApplicationJob
     )
 
     results = structured_results
+    generic_attempts = generic_indexer_attempts(request)
+    tail_pending = generic_attempts.any? { |attempt| attempt.name == :tail_title }
 
     if structured_results.empty?
       Rails.logger.info "[SearchJob] #{IndexerClient.display_name} book search returned no results for request ##{request.id}; retrying with a generic query"
-      results = merge_indexer_results(results, search_generic_indexer_attempts(request, categories: categories, starting_results: results))
+      results = merge_indexer_results(results, search_generic_indexer_attempts(request, categories: categories, starting_results: results, attempts: generic_attempts))
     elsif book.ebook?
       Rails.logger.info "[SearchJob] #{IndexerClient.display_name} ebook search found #{structured_results.count} structured results for request ##{request.id}; supplementing with a generic query"
-      results = merge_indexer_results(results, search_generic_indexer_attempts(request, categories: categories, starting_results: results))
-    elsif !strong_indexer_match?(results, request)
+      results = merge_indexer_results(results, search_generic_indexer_attempts(request, categories: categories, starting_results: results, attempts: generic_attempts))
+    elsif !strong_indexer_match?(results, request, require_complete_title: tail_pending)
       Rails.logger.info "[SearchJob] #{IndexerClient.display_name} book search found no strong match for request ##{request.id}; supplementing with a generic query"
-      results = merge_indexer_results(results, search_generic_indexer_attempts(request, categories: categories, starting_results: results))
+      results = merge_indexer_results(results, search_generic_indexer_attempts(request, categories: categories, starting_results: results, attempts: generic_attempts))
     end
 
     finalize_indexer_results(request, results)
@@ -383,7 +415,6 @@ class SearchJob < ApplicationJob
       )
     end
 
-    # Tag results with source
     results.map do |r|
       { result: r, source: SearchResult::SOURCE_ANNA_ARCHIVE }
     end
@@ -391,12 +422,12 @@ class SearchJob < ApplicationJob
     Rails.logger.warn "[SearchJob] Anna's Archive bot protection for request ##{request.id} (#{e.class})"
     # Store the error message to show user if no other results
     @anna_archive_bot_protection_error = e.message
-    []
-  rescue AnnaArchiveClient::SearchCancelled
-    []
+    RemoteResult::Failed.new(e)
+  rescue AnnaArchiveClient::SearchCancelled => error
+    RemoteResult::Failed.new(error)
   rescue AnnaArchiveClient::Error => e
     Rails.logger.warn "[SearchJob] Anna's Archive search failed for request ##{request.id} (#{e.class})"
-    []
+    RemoteResult::Failed.new(e)
   end
 
   def search_zlibrary(request, search_generation)
@@ -413,11 +444,11 @@ class SearchJob < ApplicationJob
     end.map do |result|
       { result: result, source: SearchResult::SOURCE_ZLIBRARY }
     end
-  rescue ZLibraryClient::SearchCancelled
-    []
+  rescue ZLibraryClient::SearchCancelled => error
+    RemoteResult::Failed.new(error)
   rescue ZLibraryClient::Error => e
     Rails.logger.warn "[SearchJob] Z-Library search failed for request ##{request.id} (#{e.class})"
-    []
+    RemoteResult::Failed.new(e)
   end
 
   def search_librivox(request)
@@ -432,7 +463,7 @@ class SearchJob < ApplicationJob
     end
   rescue LibrivoxClient::Error => e
     Rails.logger.warn "[SearchJob] LibriVox search failed for request ##{request.id} (#{e.class})"
-    []
+    RemoteResult::Failed.new(e)
   end
 
   def search_gutenberg(request)
@@ -447,7 +478,7 @@ class SearchJob < ApplicationJob
     end
   rescue GutenbergClient::Error => e
     Rails.logger.warn "[SearchJob] Project Gutenberg search failed for request ##{request.id} (#{e.class})"
-    []
+    RemoteResult::Failed.new(e)
   end
 
   def search_custom_provider(request, provider)
@@ -456,7 +487,7 @@ class SearchJob < ApplicationJob
     end
   rescue CustomAcquisitionProviderClient::Error => e
     Rails.logger.warn "[SearchJob] Custom provider #{provider.name} search failed for request ##{request.id} (#{e.class})"
-    []
+    RemoteResult::Failed.new(e)
   end
 
   def search_store_provider(request, provider)
@@ -473,7 +504,7 @@ class SearchJob < ApplicationJob
     end
   rescue StoreProviderError => e
     Rails.logger.warn "[SearchJob] Store provider #{provider.name} search failed for request ##{request.id} (#{e.class})"
-    []
+    RemoteResult::Failed.new(e)
   end
 
   def currently_eligible_store_offers(request, tagged_offers)
@@ -595,7 +626,6 @@ class SearchJob < ApplicationJob
   end
 
   def save_anna_archive_result(request, result)
-    # Convert file size string to bytes for sorting
     size_bytes = parse_size_to_bytes(result.file_size)
 
     # Use find_or_create_by to handle duplicate MD5s in Anna's Archive results
@@ -757,8 +787,6 @@ class SearchJob < ApplicationJob
     end
   end
 
-  # Check if we should add language to the search query
-  # Only add for non-English languages that we have a name for
   def should_add_language_to_search?(request)
     language = request.effective_language
     return false if language.blank? || language == "en"
@@ -819,7 +847,7 @@ class SearchJob < ApplicationJob
     SettingsService.indexer_category_ids_for(request.book.book_type)
   end
 
-  def strong_indexer_match?(results, request)
+  def strong_indexer_match?(results, request, require_complete_title: false)
     threshold = SettingsService.get(:min_match_confidence)
 
     Array(results).any? do |tagged_result|
@@ -828,17 +856,19 @@ class SearchJob < ApplicationJob
       next false if SettingsService.unrestricted_indexer_search_scope? &&
         !compatible_result_categories?(result, request.book.book_type)
 
-      penalized_indexer_score(tagged_result, request) >= threshold
+      score = ReleaseScorer.score(search_result_for_scoring(result), request)
+      tail_result = tagged_result.is_a?(Hash) && tagged_result[:search_attempt] == "tail_title"
+      # Generic subtitles ("A Novel") can find another book by the same
+      # author. Keep those candidates, but do not let them stop later queries.
+      next false if (require_complete_title || tail_result) && score.breakdown[:title] != 100
+
+      penalized_indexer_score(tagged_result, request, raw_score: score) >= threshold
     end
   end
 
-  # Scores a result the same way save_results will persist it: the raw
-  # ReleaseScorer total minus the search attempt penalty. Keeping threshold
-  # checks on the penalized score prevents broadened attempts from stopping
-  # the search with a result that ends up stored below the confidence threshold.
-  def penalized_indexer_score(tagged_result, request)
+  def penalized_indexer_score(tagged_result, request, raw_score: nil)
     result = indexer_result_from(tagged_result)
-    score = ReleaseScorer.score(search_result_for_scoring(result), request).total
+    score = (raw_score || ReleaseScorer.score(search_result_for_scoring(result), request)).total
     penalty = tagged_result.is_a?(Hash) ? tagged_result[:score_penalty].to_i : 0
     [ score - penalty, 0 ].max
   end
@@ -906,6 +936,7 @@ class SearchJob < ApplicationJob
     attempts ||= generic_indexer_attempts(request)
     results = []
     last_error = nil
+    tail_pending = attempts.any? { |attempt| attempt.name == :tail_title }
 
     attempts.each do |attempt|
       Rails.logger.debug "[SearchJob] Searching #{IndexerClient.display_name} for request ##{request.id} (attempt: #{attempt.name})"
@@ -924,7 +955,8 @@ class SearchJob < ApplicationJob
         last_error = e
       end
 
-      break if strong_indexer_match?(merge_indexer_results(starting_results, results), request)
+      tail_pending = false if attempt.name == :tail_title
+      break if strong_indexer_match?(merge_indexer_results(starting_results, results), request, require_complete_title: tail_pending)
     end
 
     # If nothing was found anywhere and at least one attempt errored, propagate
@@ -970,6 +1002,11 @@ class SearchJob < ApplicationJob
       short_title = short_search_title(preferred_title)
       if short_title.present?
         attempts << build_search_attempt(:short_title, [ short_title, book.author, language_hint ])
+      end
+
+      tail_title = tail_search_title(preferred_title)
+      if tail_title.present? && !tail_title.casecmp?(book.author.to_s.squish)
+        attempts << build_search_attempt(:tail_title, [ tail_title, book.author, language_hint ])
       end
 
       attempts << build_search_attempt(:author_title, [ book.author, preferred_title, language_hint ])
@@ -1085,13 +1122,24 @@ class SearchJob < ApplicationJob
     short
   end
 
+  # Collection and series prefixes are the inverse of a subtitle: the head is
+  # the edition label and the tail is the title indexers actually carry
+  # ("The Works of A. Conan Doyle: The hound of the Baskervilles").
+  # Returns the text after the first subtitle separator, or nil when the
+  # title has no suffix or the remainder is too short to search safely.
+  def tail_search_title(title)
+    tail = title.to_s.split(/\s*(?::|;|–|—|\s-\s)\s*/, 2).last.to_s.squish
+    return nil if tail.blank? || tail.casecmp?(title.to_s.squish)
+    return nil if tail.length < 4
+
+    tail
+  end
+
   def normalized_search_title(title)
-    title.to_s
+    prepared = title.to_s
       .gsub(/\([^)]*\)|\[[^\]]*\]/, " ")
       .gsub(/\b(?:volume|vol\.?|book|part)\s+(\d+)\b/i, "\\1")
-      .gsub(/['’]/, "")
-      .gsub(/[[:punct:]]+/, " ")
-      .squish
+    TitleKey.new(prepared).spaced
   end
 
   def numeric_title_variants(title)

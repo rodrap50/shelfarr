@@ -10,6 +10,9 @@ class User < ApplicationRecord
   has_many :notifications, dependent: :destroy
   has_many :activity_logs, dependent: :destroy
   has_many :user_book_paths, dependent: :destroy
+  has_one :hardcover_connection, dependent: :destroy
+  has_many :hardcover_subscriptions, dependent: :destroy
+  has_one :hardcover_request_budget, dependent: :delete
 
   scope :active, -> { where(deleted_at: nil) }
 
@@ -42,12 +45,10 @@ class User < ApplicationRecord
 
   before_create :set_admin_if_first_user
 
-  # Check if the account is currently locked
   def locked?
     locked_until.present? && locked_until > Time.current
   end
 
-  # Record a failed login attempt
   def record_failed_login!(ip_address)
     increment!(:failed_login_count)
     update!(
@@ -55,7 +56,6 @@ class User < ApplicationRecord
       last_failed_login_ip: ip_address
     )
 
-    # Lock account if threshold exceeded
     threshold = SettingsService.get(:login_lockout_threshold, default: 5)
     if failed_login_count >= threshold
       lockout_minutes = SettingsService.get(:login_lockout_duration_minutes, default: 15)
@@ -64,7 +64,6 @@ class User < ApplicationRecord
     end
   end
 
-  # Reset failed login count on successful login
   def reset_failed_logins!
     update!(
       failed_login_count: 0,
@@ -74,7 +73,6 @@ class User < ApplicationRecord
     )
   end
 
-  # Time remaining until unlock
   def unlock_in_words
     return nil unless locked?
 
@@ -86,7 +84,6 @@ class User < ApplicationRecord
     end
   end
 
-  # 2FA methods
   def otp_enabled?
     otp_required? && otp_secret.present?
   end
@@ -120,12 +117,10 @@ class User < ApplicationRecord
     update!(otp_required: false, otp_secret: nil, backup_codes: nil)
   end
 
-  # Backup codes for 2FA recovery
   BACKUP_CODE_COUNT = 8
 
   def generate_backup_codes!
     codes = BACKUP_CODE_COUNT.times.map { SecureRandom.hex(4).upcase }
-    # Store hashed codes
     hashed_codes = codes.map { |code| Digest::SHA256.hexdigest(code) }
     update!(backup_codes: hashed_codes.join(","))
     codes
@@ -138,7 +133,6 @@ class User < ApplicationRecord
     remaining_codes = backup_codes.split(",")
 
     if remaining_codes.include?(hashed_input)
-      # Remove used code (one-time use)
       remaining_codes.delete(hashed_input)
       update!(backup_codes: remaining_codes.any? ? remaining_codes.join(",") : nil)
       Rails.logger.info "[Security] Backup code used for user '#{username}'"
@@ -153,14 +147,25 @@ class User < ApplicationRecord
     backup_codes.split(",").count
   end
 
-  # Soft delete
   def soft_delete!
+    hardcover_token = nil
     transaction do
       sessions.destroy_all
       now = Time.current
       api_tokens.where(revoked_at: nil).update_all(revoked_at: now, updated_at: now)
+      hardcover_subscriptions.where(status: %w[draft active]).update_all(
+        status: "paused", pause_reason: "Account deleted", updated_at: now
+      )
+      # Read the newest tokens and delete the row whatever its version, so a
+      # refresh finishing meanwhile cannot keep the connection alive.
+      if (connection = HardcoverConnection.find_by(user_id: id))
+        hardcover_token = Hardcover::ConnectionManager.revocable_token(connection)
+        HardcoverConnection.where(id: connection.id).delete_all
+      end
+      association(:hardcover_connection).reset
       update!(deleted_at: Time.current)
     end
+    Hardcover::Oauth.revoke(hardcover_token) if hardcover_token.present?
   end
 
   def deleted?
@@ -179,7 +184,6 @@ class User < ApplicationRecord
     routing_layout.to_s == "nested"
   end
 
-  # OIDC/SSO methods
   def oidc_user?
     oidc_uid.present? && oidc_provider.present?
   end
@@ -209,16 +213,13 @@ class User < ApplicationRecord
     user = active.find_by(oidc_provider: provider, oidc_uid: uid)
     return user if user
 
-    # Optionally link an existing unlinked local account by username
     if SettingsService.get(:oidc_link_existing_users, default: false)
       user = find_linkable_user_for_oidc(info, provider:, uid:)
       return user if user
     end
 
-    # Auto-create user if enabled
     return nil unless SettingsService.get(:oidc_auto_create_users, default: false)
 
-    # Generate username from email or name
     email = info["email"].to_s.strip.downcase
     base_username = if email.present?
       email.split("@").first.gsub(/[^a-z0-9_]/, "_").downcase
@@ -226,7 +227,6 @@ class User < ApplicationRecord
       (info["name"] || info["preferred_username"] || "user").gsub(/[^a-z0-9_]/i, "_").downcase
     end
 
-    # Ensure username is unique
     username = base_username
     counter = 1
     while active.exists?(username: username)
@@ -234,10 +234,8 @@ class User < ApplicationRecord
       counter += 1
     end
 
-    # Get name from OIDC claims
     name = info["name"].presence || info["preferred_username"].presence || username
 
-    # Determine role
     default_role = SettingsService.get(:oidc_default_role, default: "user")
     role = default_role == "admin" ? :admin : :user
 

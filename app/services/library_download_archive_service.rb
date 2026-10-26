@@ -17,18 +17,16 @@ class LibraryDownloadArchiveService
   # Deflate can expand incompressible media slightly and ZIP metadata also
   # consumes space, so output receives a separate bounded allowance.
   MAX_ARCHIVE_OUTPUT_BYTES = MAX_ARCHIVE_SOURCE_BYTES + (128 * 1024 * 1024)
-  # 50,000 legal entries can otherwise consume unbounded memory and central
-  # directory space through long path names.
+  # 50,000 legal entries can otherwise consume unbounded memory and central directory space through long path names.
   MAX_ARCHIVE_NAME_BYTES = 32 * 1024 * 1024
-  # Large network-backed libraries need room to complete, but a request must
-  # never occupy a worker indefinitely.
+  # Large network-backed libraries need room to complete, but a request must never occupy a worker indefinitely.
   MAX_ARCHIVE_RUNTIME_SECONDS = 30 * 60
   MAX_ARCHIVE_COORDINATION_WAIT_SECONDS = 2
   MAX_ARCHIVE_ADMISSION_WAIT_SECONDS = 2
   ARCHIVE_ADMISSION_RETRY_SECONDS = 0.05
   ARCHIVE_BUILD_SLOTS = 2
   ARCHIVE_LOCK_SHARDS = 256
-  CACHE_FORMAT_VERSION = 2
+  CACHE_FORMAT_VERSION = 4
   CACHE_DIRECTORY = Rails.root.join("tmp", "downloads").freeze
   ZIP_EOCD_SIGNATURE = "PK\x05\x06".b.freeze
   ZIP_LOCAL_SIGNATURE = "PK\x03\x04".b.freeze
@@ -82,7 +80,7 @@ class LibraryDownloadArchiveService
         validate_snapshot!(source_root, canonical_root)
         cache_path = cache_path_for(source_root)
 
-        unless cache_file_valid?(cache_path, source_root: source_root)
+        unless cache_file_valid?(cache_path, source_root: source_root) == true
           repair_invalid_cache!(cache_path)
           build_and_publish!(source_root, canonical_root, cache_path)
         end
@@ -188,6 +186,7 @@ class LibraryDownloadArchiveService
           path_contained?(snapshot_path.join(relative_path).cleanpath, snapshot_path)
         raise UnsafePathError, "library archive snapshot contains an unsafe entry"
       end
+      next if manifest[2] == :file && LibraryDestinationOccupancy.foreign_media?(relative, @book)
 
       source_bytes += Integer(manifest[3]) if manifest[2] == :file
       name_bytes += safe_entry_name(relative, directory: manifest[2] == :directory).bytesize
@@ -214,6 +213,7 @@ class LibraryDownloadArchiveService
     enforce_runtime_budget!
     fingerprint_payload = [
       CACHE_FORMAT_VERSION,
+      (@book.book_type if @book.respond_to?(:book_type)),
       source_root.canonical_path.to_s,
       source_root.device,
       source_root.inode,
@@ -261,7 +261,7 @@ class LibraryDownloadArchiveService
     enforce_runtime_budget!
     archive = Zip::OutputStream.new(output, stream: true)
     begin
-      source_root.entries.sort_by { |relative, _manifest| relative }.each do |relative, manifest|
+      archive_entries(source_root).sort_by { |relative, _manifest| relative }.each do |relative, manifest|
         enforce_runtime_budget!
         entry_name = safe_entry_name(relative, directory: manifest[2] == :directory)
         @written_name_bytes += entry_name.bytesize
@@ -272,7 +272,9 @@ class LibraryDownloadArchiveService
         raise UnsafePathError, "library paths collide in a portable ZIP archive" if used_names[collision_key]
 
         used_names[collision_key] = true
-        archive.put_next_entry(entry_name)
+        entry = Zip::Entry.new("", entry_name)
+        entry.gp_flags |= Zip::Entry::EFS
+        archive.put_next_entry(entry)
         enforce_output_budget!(output)
         next if manifest[2] == :directory
         raise UnsafePathError, "library tree contains a non-regular entry" unless manifest[2] == :file
@@ -359,7 +361,7 @@ class LibraryDownloadArchiveService
       mode: 0o600
     )
   rescue Errno::EEXIST
-    unless cache_file_valid?(cache_path, source_root: source_root)
+    unless cache_file_valid?(cache_path, source_root: source_root) == true
       raise UnsafePathError, "archive cache path is not a trusted ZIP"
     end
   end
@@ -372,13 +374,13 @@ class LibraryDownloadArchiveService
       cache_path,
       root: CACHE_DIRECTORY.to_s
     )
-    raise SourceChangedError, "archive cache changed before repair" unless removed
-  rescue Errno::ENOENT
-    nil
+    raise SourceChangedError, "archive cache changed before repair" unless removed == true
+  rescue Errno::ENOENT => error
+    RemoteResult::Failed.new(error)
   end
 
   def validated_cache_path(cache_path, source_root:)
-    unless cache_file_valid?(cache_path, source_root: source_root)
+    unless cache_file_valid?(cache_path, source_root: source_root) == true
       raise UnsafePathError, "archive cache is not a trusted ZIP"
     end
 
@@ -414,12 +416,12 @@ class LibraryDownloadArchiveService
 
       zip_matches_snapshot?(file, source_root)
     end
-  rescue Errno::ENOENT, Zip::Error, EncodingError, ArgumentError, EOFError, IOError
-    false
+  rescue Errno::ENOENT, Zip::Error, EncodingError, ArgumentError, EOFError, IOError => error
+    RemoteResult::Failed.new(error)
   end
 
   def zip_matches_snapshot?(file, source_root)
-    expected = source_root.entries.map do |relative, manifest|
+    expected = archive_entries(source_root).map do |relative, manifest|
       name = comparable_zip_name(safe_entry_name(relative, directory: manifest[2] == :directory))
       return false unless name
 
@@ -442,6 +444,12 @@ class LibraryDownloadArchiveService
       matches = actual == expected
     end
     matches
+  end
+
+  def archive_entries(source_root)
+    source_root.entries.reject do |relative, manifest|
+      manifest[2] == :file && LibraryDestinationOccupancy.foreign_media?(relative, @book)
+    end
   end
 
   # Rubyzip tags entry names as ASCII-8BIT. Dir/FileCopyService names are

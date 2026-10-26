@@ -1,5 +1,50 @@
-# Omakase Ruby styling for Rails
 inherit_gem: { rubocop-rails-omakase: rubocop.yml }
+
+require:
+  - ./lib/rubocop/cop/shelfarr/skipped_test.rb
+  - ./lib/rubocop/cop/shelfarr/root_relative_path.rb
+  - ./lib/rubocop/cop/shelfarr/short_concurrency_lease.rb
+  - ./lib/rubocop/cop/shelfarr/rescue_to_empty.rb
+  - ./lib/rubocop/cop/shelfarr/unkeyed_faraday_memo.rb
+
+Shelfarr/SkippedTest:
+  Enabled: true
+  Severity: warning
+  Include:
+    - "test/**/*_test.rb"
+
+Shelfarr/RootRelativePath:
+  Enabled: true
+  Severity: warning
+  Include:
+    - "app/views/**/*.erb"
+    - "app/javascript/**/*.js"
+    - "app/controllers/**/*.rb"
+
+Shelfarr/ShortConcurrencyLease:
+  Enabled: true
+  Severity: warning
+
+Shelfarr/RescueToEmpty:
+  Enabled: true
+  Severity: warning
+  Include:
+    - "app/services/**/*.rb"
+    - "app/jobs/**/*.rb"
+
+Shelfarr/UnkeyedFaradayMemo:
+  Enabled: true
+  Severity: warning
+  Include:
+    - "app/services/indexer_clients/**/*.rb"
+
+AllCops:
+  inherit_mode:
+    merge:
+      - Include
+  Include:
+    - "app/views/**/*.erb"
+    - "app/javascript/**/*.js"
 
 # Overwrite or add rules to create your own house style
 #

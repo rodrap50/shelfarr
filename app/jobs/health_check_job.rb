@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 
-# Recurring job that monitors system health by checking all configured services
 class HealthCheckJob < ApplicationJob
   queue_as :default
 
@@ -84,7 +83,7 @@ class HealthCheckJob < ApplicationJob
       return
     end
 
-    if IndexerClient.test_connection
+    if RemoteResult.succeeded?(IndexerClient.test_connection)
       health.check_succeeded!(message: "Connection successful")
     else
       health.check_failed!(message: "Failed to connect to #{IndexerClient.display_name}")
@@ -108,13 +107,13 @@ class HealthCheckJob < ApplicationJob
     end
 
     results = clients.map do |client|
-      success = begin
-        client.test_connection
+      begin
+        connected = client.test_connection
+        { client: client, success: RemoteResult.succeeded?(connected), reason: nil }
       rescue => e
-        Rails.logger.error "[HealthCheckJob] Download client #{client.name} check failed: #{e.message}"
-        false
+        Rails.logger.error "[HealthCheckJob] Download client #{client.name} check failed: #{ConnectionErrorClassifier.describe(e)}"
+        { client: client, success: false, reason: ConnectionErrorClassifier.describe(e) }
       end
-      { client: client, success: success }
     end
 
     successful = results.count { |r| r[:success] }
@@ -123,12 +122,10 @@ class HealthCheckJob < ApplicationJob
     if failed == 0
       health.check_succeeded!(message: "All #{successful} clients connected")
     elsif successful == 0
-      names = results.reject { |r| r[:success] }.map { |r| r[:client].name }.join(", ")
-      health.check_failed!(message: "All clients failed: #{names}")
+      health.check_failed!(message: "All clients failed: #{download_client_failure_labels(results)}")
     else
-      names = results.reject { |r| r[:success] }.map { |r| r[:client].name }.join(", ")
       health.check_failed!(
-        message: "#{successful}/#{clients.size} working. Failed: #{names}",
+        message: "#{successful}/#{clients.size} working. Failed: #{download_client_failure_labels(results)}",
         degraded: true
       )
     end
@@ -145,45 +142,34 @@ class HealthCheckJob < ApplicationJob
 
     issues = []
     local_path = SettingsService.get(:download_local_path, default: "/downloads")
+    local_visibility = visible_download_directory(local_path)
 
-    unless Dir.exist?(local_path)
+    case local_visibility[:status]
+    when :blank
+      issues << "Base download path not configured"
+    when :error
+      issues << "Base download path '#{local_path}' could not be checked: #{local_visibility[:error].message}"
+    when :missing
       issues << "Base download path '#{local_path}' does not exist in container"
     end
 
     clients.each do |client|
-      # Check client-specific download_path if set
       if client.download_path.present?
-        if !Dir.exist?(client.download_path)
+        visibility = visible_download_directory(client.download_path, infer_client_prefix: true)
+        case visibility[:status]
+        when :error
+          issues << "#{client.name}: configured download path '#{client.download_path}' " \
+                    "could not be checked: #{visibility[:error].message}"
+        when :missing
           issues << "#{client.name}: configured download path '#{client.download_path}' does not exist"
-        end
-      else
-        # No client-specific download_path set, try the default pattern that qbittorrent will set
-        # Check category subfolder only for qBittorrent-compatible clients
-        if client.qbittorrent_compatible? && client.category.present?
-          base = client.download_path.presence || local_path
-          if Dir.exist?(base)
-            category_path = File.join(base, client.category)
-            unless Dir.exist?(category_path)
-              issues << "#{client.name}: category folder '#{category_path}' not found — " \
-                        "ensure your Docker mount includes the '#{client.category}' subfolder"
-            end
-          end
         end
       end
 
-      # Query qBittorrent-compatible clients for save path info (diagnostics only)
-      if client.qbittorrent_compatible?
-        begin
-          diagnostics = client.adapter.connection_diagnostics
-          if diagnostics
-            save_path = diagnostics[:save_path]
-            cat_path = diagnostics[:category_save_path]
-            Rails.logger.info "[HealthCheckJob] #{client.name}: qBit save_path=#{save_path}, " \
-                              "category_save_path=#{cat_path.presence || '(default)'}"
-          end
-        rescue => e
-          Rails.logger.warn "[HealthCheckJob] Path diagnostics for #{client.name} failed: #{e.message}"
-        end
+      path_issues = qbittorrent_save_path_issues(client, local_path)
+      if RemoteResult.failed?(path_issues)
+        issues << "#{client.name}: save path could not be checked: #{path_issues.error.class}"
+      else
+        issues.concat(path_issues)
       end
     end
 
@@ -192,9 +178,120 @@ class HealthCheckJob < ApplicationJob
     else
       health.check_failed!(
         message: issues.join("; ").truncate(500),
-        degraded: issues.none? { |i| i.include?("does not exist in container") }
+        degraded: issues.none? { |issue| hard_download_path_failure?(issue) }
       )
     end
+  rescue StandardError => e
+    SystemHealth.for_service("download_paths").check_failed!(
+      message: "Download paths could not be checked: #{e.message}".truncate(500)
+    )
+    Rails.logger.error "[HealthCheckJob] Download paths check failed: #{e.message}"
+  end
+
+  def download_client_failure_labels(results)
+    results.reject { |result| result[:success] }.map do |result|
+      reason = result[:reason]
+      reason.present? ? "#{result[:client].name} (#{reason})" : result[:client].name
+    end.join(", ")
+  end
+
+  def qbittorrent_save_path_issues(client, local_path)
+    return [] unless client.qbittorrent_compatible?
+    # Import remaps the client's own download path; that path is checked above.
+    return [] if client.download_path.present?
+
+    diagnostics = client.adapter.connection_diagnostics
+    return [] if diagnostics.blank?
+
+    save_path = diagnostics[:save_path]
+    category_save_path = diagnostics[:category_save_path]
+    Rails.logger.info "[HealthCheckJob] #{client.name}: qBit save_path=#{save_path}, " \
+                      "category_save_path=#{category_save_path.presence || '(default)'}"
+    warning = LibraryPathCheck.qbittorrent_message(
+      save_path: save_path,
+      category_save_path: category_save_path,
+      category: client.category,
+      local_path: local_path,
+      remote_path: SettingsService.get(:download_remote_path)
+    )
+    warning.present? ? [ "#{client.name}: #{warning}" ] : []
+  rescue StandardError => e
+    Rails.logger.warn "[HealthCheckJob] Path diagnostics for #{client.name} failed: #{e.message}"
+    RemoteResult::Failed.new(e)
+  end
+
+  def audiobookshelf_path_messages
+    return [] unless LibraryPlatformClient.active_platform == "audiobookshelf"
+
+    LibraryPathCheck.audiobookshelf_messages(
+      libraries: LibraryPlatformClient.libraries,
+      audiobook_library_id: SettingsService.get(:audiobookshelf_audiobook_library_id),
+      ebook_library_id: SettingsService.get(:audiobookshelf_ebook_library_id),
+      audiobook_output_path: SettingsService.get(:audiobook_output_path),
+      ebook_output_path: SettingsService.get(:ebook_output_path)
+    )
+  rescue LibraryPlatformClient::Error => e
+    Rails.logger.warn "[HealthCheckJob] Audiobookshelf path check failed: #{e.message}"
+    RemoteResult::Failed.new(e)
+  end
+
+  def hard_download_path_failure?(issue)
+    issue.include?("does not exist in container") || issue.include?("could not be checked") ||
+      issue.include?("not configured")
+  end
+
+  def visible_download_directory(path, infer_client_prefix: false)
+    inspection = inspect_download_directory(path)
+    return inspection if inspection[:status] == :ok || inspection[:status] == :blank
+
+    remapped = remap_download_directory_to_local(path)
+    if remapped.blank? && infer_client_prefix && inspection[:status] == :missing &&
+        SettingsService.get(:download_remote_path).blank?
+      local_path = normalize_download_path_separators(SettingsService.get(:download_local_path, default: "/downloads"))
+      remapped = local_path unless local_path.blank? || download_path_prefix_match?(inspection[:path], local_path)
+    end
+    return inspection if remapped.blank? || remapped == path
+
+    remapped_inspection = inspect_download_directory(remapped)
+    remapped_inspection[:status] == :ok ? remapped_inspection : inspection
+  end
+
+  def inspect_download_directory(path)
+    normalized = normalize_download_path_separators(path)
+    return { status: :blank } if normalized.blank?
+
+    begin
+      return { status: :ok, path: normalized } if Dir.exist?(normalized)
+    rescue SystemCallError => error
+      return { status: :error, path: normalized, error: error }
+    end
+
+    { status: :missing, path: normalized }
+  end
+
+  def remap_download_directory_to_local(path)
+    normalized = normalize_download_path_separators(path)
+    remote_path = normalize_download_path_separators(SettingsService.get(:download_remote_path))
+    local_path = normalize_download_path_separators(SettingsService.get(:download_local_path, default: "/downloads"))
+    return if normalized.blank? || local_path.blank?
+    return unless remote_path.present? && download_path_prefix_match?(normalized, remote_path)
+
+    replace_download_path_prefix(normalized, remote_path, local_path)
+  end
+
+  def normalize_download_path_separators(path)
+    path.to_s.tr("\\", "/") if path.present?
+  end
+
+  def download_path_prefix_match?(path, prefix)
+    return false unless path.start_with?(prefix)
+
+    path.length == prefix.length || prefix.end_with?("/") || path[prefix.length] == "/"
+  end
+
+  def replace_download_path_prefix(path, remote_path, local_path)
+    suffix = path.delete_prefix(remote_path).sub(%r{\A/+}, "")
+    suffix.present? ? File.join(local_path, suffix) : local_path
   end
 
   def check_output_paths
@@ -228,7 +325,9 @@ class HealthCheckJob < ApplicationJob
 
     # Leave leftover-staging diagnostics intact; they already carry their own inspect failures.
     legacy_diagnostic = DirectDownloadFileService.legacy_staging_diagnostic(root: path)
-    return { severity: :legacy, message: "#{name} #{legacy_diagnostic}" } if legacy_diagnostic
+    if legacy_diagnostic.is_a?(String)
+      return { severity: :legacy, message: "#{name} #{legacy_diagnostic}" }
+    end
 
     nil
   end
@@ -241,8 +340,18 @@ class HealthCheckJob < ApplicationJob
       return
     end
 
-    if LibraryPlatformClient.test_connection
-      health.check_succeeded!(message: "Connection successful")
+    if RemoteResult.succeeded?(LibraryPlatformClient.test_connection)
+      messages = audiobookshelf_path_messages
+      if RemoteResult.failed?(messages)
+        health.check_failed!(
+          message: "#{LibraryPlatformClient.display_name} paths could not be checked: #{messages.error.class}",
+          degraded: true
+        )
+      elsif messages.any?
+        health.check_failed!(message: messages.join("; ").truncate(500), degraded: true)
+      else
+        health.check_succeeded!(message: "Connection successful")
+      end
     else
       health.check_failed!(message: "Failed to connect to #{LibraryPlatformClient.display_name}")
     end
@@ -263,7 +372,7 @@ class HealthCheckJob < ApplicationJob
       return
     end
 
-    if HardcoverClient.test_connection
+    if RemoteResult.succeeded?(HardcoverClient.test_connection)
       MetadataProviderStatus.for_provider("hardcover").record_success!
       health.check_succeeded!(message: "Connection successful")
     else

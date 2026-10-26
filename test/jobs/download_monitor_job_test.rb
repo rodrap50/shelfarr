@@ -3,7 +3,7 @@
 require "test_helper"
 
 class DownloadMonitorJobTest < ActiveJob::TestCase
-  CLIENT_THREAD_LOCALS = %i[qbittorrent_sessions transmission_sessions transmission_protocols].freeze
+  CLIENT_THREAD_LOCALS = %i[qbittorrent_sessions deluge_sessions transmission_sessions transmission_protocols].freeze
 
   def run
     Request.suppressing_turbo_broadcasts { super }
@@ -16,7 +16,6 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     DownloadClient.destroy_all
     @request = requests(:pending_request)
 
-    # Create a qBittorrent client
     @qbittorrent = DownloadClient.create!(
       name: "Test qBittorrent",
       client_type: "qbittorrent",
@@ -27,13 +26,11 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
       enabled: true
     )
 
-    # Clear qBittorrent sessions
     @original_client_thread_locals = CLIENT_THREAD_LOCALS.to_h do |key|
       [ key, Thread.current.key?(key) ? Thread.current[key] : :unset ]
     end
     CLIENT_THREAD_LOCALS.each { |key| Thread.current[key] = {} }
 
-    # Create an active download associated with the client
     @download = @request.downloads.create!(
       name: "Test Audiobook",
       size_bytes: 1073741824,
@@ -189,6 +186,36 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     end
   end
 
+  test "handles Deluge torrents paused or stopped at 100% as completed and triggers post-processing" do
+    deluge = DownloadClient.create!(
+      name: "Monitor Deluge",
+      client_type: "deluge",
+      url: "http://localhost:8112",
+      password: "adminadmin",
+      priority: 0,
+      enabled: true
+    )
+    @download.update!(download_client: deluge)
+
+    %w[Paused Stopped].each do |state|
+      @download.update!(status: :downloading, progress: 50, download_path: nil)
+
+      VCR.turned_off do
+        Thread.current[:deluge_sessions] = {}
+        stub_deluge_login
+        stub_deluge_torrent_info(progress: 100, state: state)
+
+        assert_enqueued_with(job: PostProcessingJob, args: [ @download.id ]) do
+          DownloadMonitorJob.perform_now
+        end
+      end
+
+      @download.reload
+      assert @download.completed?, "Deluge #{state} at 100% should complete the download"
+      assert_equal 100, @download.progress
+    end
+  end
+
   test "does not immediately fail download on first not-found" do
     VCR.turned_off do
       stub_qbittorrent_auth
@@ -199,6 +226,37 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
 
       assert @download.downloading?
       assert_equal 1, @download.not_found_count
+    end
+  end
+
+  test "does not post-process incomplete paused Deluge torrents rounded to 100 percent" do
+    deluge = DownloadClient.create!(
+      name: "Incomplete Deluge",
+      client_type: "deluge",
+      url: "http://localhost:8112",
+      password: "adminadmin",
+      priority: 0,
+      enabled: true
+    )
+    @download.update!(download_client: deluge)
+
+    %w[Paused PausedDownload PausedUpload Stopped].each do |state|
+      [ 1.0, 99.5, 99.99 ].each do |progress|
+        @download.update!(status: :downloading, progress: 0, download_path: nil)
+
+        VCR.turned_off do
+          Thread.current[:deluge_sessions] = {}
+          stub_deluge_login
+          stub_deluge_torrent_info(progress: progress, state: state)
+
+          assert_no_enqueued_jobs(only: PostProcessingJob) do
+            DownloadMonitorJob.perform_now
+          end
+        end
+
+        assert @download.reload.downloading?, "Deluge #{state} at #{progress}% is incomplete"
+        assert_equal progress.round, @download.progress
+      end
     end
   end
 
@@ -349,7 +407,7 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
             body["method"] == "torrent_get" &&
             body["params"] == {
               "ids" => [ "transmission-hash" ],
-              "fields" => %w[id name hash_string percent_done status total_size download_dir error error_string]
+              "fields" => DownloadClients::Transmission::JSONRPC_TORRENT_FIELDS
             } &&
             body["id"] == 1
         end
@@ -386,8 +444,73 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     end
   end
 
+  test "completes a stopped Transmission torrent at 100 percent and enqueues post-processing" do
+    transmission = DownloadClient.create!(
+      name: "Stopped Transmission",
+      client_type: "transmission",
+      url: "http://localhost:9091",
+      username: "admin",
+      password: "adminadmin",
+      priority: 0,
+      enabled: true
+    )
+    @download.update!(
+      external_id: "transmission-hash",
+      download_client: transmission
+    )
+
+    # 0 is stopped after a seed or idle limit of 0. 5 is queued to seed.
+    [ 0, 5 ].each do |status|
+      @download.update!(status: :downloading, progress: 50, download_path: nil)
+      Thread.current[:transmission_sessions] = {}
+      Thread.current[:transmission_protocols] = {}
+
+      VCR.turned_off do
+        stub_transmission_monitor_torrent(percent_done: 1.0, status: status, left_until_done: 0)
+
+        assert_enqueued_with(job: PostProcessingJob, args: [ @download.id ]) do
+          DownloadMonitorJob.perform_now
+        end
+      end
+
+      @download.reload
+      assert @download.completed?, "Transmission status #{status} at percentDone 1.0 should complete the download"
+      assert_equal 100, @download.progress
+      assert_equal "/downloads/complete/Test Audiobook", @download.download_path
+    end
+  end
+
+  test "does not complete a stopped Transmission torrent that is still short of 100 percent" do
+    transmission = DownloadClient.create!(
+      name: "Incomplete Transmission",
+      client_type: "transmission",
+      url: "http://localhost:9091",
+      username: "admin",
+      password: "adminadmin",
+      priority: 0,
+      enabled: true
+    )
+    @download.update!(
+      external_id: "transmission-hash",
+      download_client: transmission,
+      progress: 50
+    )
+
+    VCR.turned_off do
+      stub_transmission_monitor_torrent(percent_done: 0.995, status: 0, left_until_done: 1024)
+
+      assert_no_enqueued_jobs(only: PostProcessingJob) do
+        DownloadMonitorJob.perform_now
+      end
+    end
+
+    @download.reload
+    assert @download.downloading?
+    # 0.995 rounds to a displayed 100 and must still stay in progress.
+    assert_equal 100, @download.progress
+  end
+
   test "uses SABnzbd for usenet downloads" do
-    # Create SABnzbd client
     sabnzbd = DownloadClient.create!(
       name: "Test SABnzbd",
       client_type: "sabnzbd",
@@ -745,11 +868,9 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     VCR.turned_off do
       stub_qbittorrent_auth
 
-      # Should not make any torrent info requests
       DownloadMonitorJob.perform_now
       @download.reload
 
-      # Status should remain unchanged
       assert @download.downloading?
       assert_equal 50, @download.progress
     end
@@ -788,7 +909,6 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
       DownloadMonitorJob.perform_now
       @download.reload
 
-      # Status should remain unchanged
       assert @download.downloading?
       assert_equal 50, @download.progress
     end
@@ -974,6 +1094,63 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     SolidQueue::Record.establish_connection(original_config)
   end
 
+  def stub_transmission_monitor_torrent(percent_done:, status:, left_until_done: 0, error: 0)
+    stub_request(:post, "http://localhost:9091/transmission/rpc")
+      .with do |request|
+        body = JSON.parse(request.body)
+        body["jsonrpc"] == "2.0" &&
+          body["method"] == "session_get" &&
+          body["params"] == {} &&
+          body["id"] == 1
+      end
+      .to_return(
+        {
+          status: 409,
+          headers: { "x-transmission-session-id" => "session-id" },
+          body: { "result" => "session", "arguments" => {} }.to_json
+        },
+        {
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { "jsonrpc" => "2.0", "result" => { "version" => "4.1.1" }, "id" => 1 }.to_json
+        }
+      )
+    stub_request(:post, "http://localhost:9091/transmission/rpc")
+      .with do |request|
+        body = JSON.parse(request.body)
+        body["jsonrpc"] == "2.0" &&
+          body["method"] == "torrent_get" &&
+          body["params"] == {
+            "ids" => [ "transmission-hash" ],
+            "fields" => DownloadClients::Transmission::JSONRPC_TORRENT_FIELDS
+          } &&
+          body["id"] == 1
+      end
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: {
+          "jsonrpc" => "2.0",
+          "result" => {
+            "torrents" => [
+              {
+                "hash_string" => "transmission-hash",
+                "name" => "Test Audiobook",
+                "percent_done" => percent_done,
+                "left_until_done" => left_until_done,
+                "status" => status,
+                "error" => error,
+                "error_string" => "",
+                "total_size" => 1_073_741_824,
+                "download_dir" => "/downloads/complete"
+              }
+            ]
+          },
+          "id" => 1
+        }.to_json
+      )
+  end
+
   def stub_qbittorrent_auth
     stub_request(:post, "http://localhost:8080/api/v2/auth/login")
       .to_return(
@@ -998,6 +1175,39 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
             "content_path" => "/downloads/complete/Test Audiobook"
           }
         ].to_json
+      )
+  end
+
+  def stub_deluge_login
+    stub_request(:post, "http://localhost:8112/json")
+      .with(body: /"auth.login"/)
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json", "Set-Cookie" => "sessionid=test_session_id; Path=/" },
+        body: { result: true, error: nil, id: 1 }.to_json
+      )
+  end
+
+  def stub_deluge_torrent_info(progress:, state:)
+    stub_request(:post, "http://localhost:8112/json")
+      .with(body: /"core.get_torrents_status"/)
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: {
+          result: {
+            "abc123def456" => {
+              "name" => "Test Audiobook",
+              "progress" => progress,
+              "state" => state,
+              "total_size" => 1_073_741_824,
+              "download_location" => "/downloads/complete",
+              "save_path" => "/downloads/complete"
+            }
+          },
+          error: nil,
+          id: 1
+        }.to_json
       )
   end
 

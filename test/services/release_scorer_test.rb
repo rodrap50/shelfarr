@@ -275,6 +275,218 @@ class ReleaseScorerTest < ActiveSupport::TestCase
     assert_equal 100, result.breakdown[:title]
   end
 
+  test "scores dotted scene-style release titles the same as spaced exact matches" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+
+    book = Book.create!(
+      title: "Vielleicht bin ich nicht Gott. Chroniken einer Katze",
+      author: "Stefania Gander",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "de")
+
+    spaced = ReleaseScorer.score(
+      SearchResult.new(title: "Stefania Gander - Vielleicht bin ich nicht Gott - Chroniken einer Katze", seeders: 50),
+      request
+    )
+    dotted_with_separators = ReleaseScorer.score(
+      SearchResult.new(title: "Stefania.Gander.-.Vielleicht.bin.ich.nicht.Gott.-.Chroniken.einer.Katze", seeders: 50),
+      request
+    )
+    dotted = ReleaseScorer.score(
+      SearchResult.new(title: "Stefania.Gander.Vielleicht.bin.ich.nicht.Gott.Chroniken.einer.Katze", seeders: 50),
+      request
+    )
+
+    assert_equal 100, spaced.breakdown[:title]
+    assert_equal 100, dotted_with_separators.breakdown[:title]
+    assert_equal 100, dotted.breakdown[:title]
+    assert_equal spaced.breakdown[:title], dotted_with_separators.breakdown[:title]
+    assert_equal spaced.breakdown[:title], dotted.breakdown[:title]
+  end
+
+  test "transliterates non-ASCII title letters instead of deleting them" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+
+    book = Book.create!(
+      title: "Spaß in der Küche",
+      author: "Jürgen Weiß",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "de")
+
+    native = ReleaseScorer.score(
+      SearchResult.new(title: "Spaß in der Küche - Jürgen Weiß", seeders: 50),
+      request
+    )
+    ascii = ReleaseScorer.score(
+      SearchResult.new(title: "Spass in der Kuche - Jurgen Weiss", seeders: 50),
+      request
+    )
+
+    assert_equal 100, native.breakdown[:title]
+    assert_equal 100, ascii.breakdown[:title]
+    assert_equal native.breakdown[:title], ascii.breakdown[:title]
+  end
+
+  test "preserves exact title and author matches with curly apostrophes" do
+    [ "'", "’", "‘" ].each do |apostrophe|
+      @book.update!(title: "Ender#{apostrophe}s Game", author: "O#{apostrophe}Connor")
+      release = @request.search_results.new(
+        title: "Enders Game OConnor English Audiobook M4B",
+        seeders: 50
+      )
+
+      score = ReleaseScorer.score(release, @request)
+
+      assert_equal 100, score.breakdown[:title]
+      assert_equal 100, score.breakdown[:author]
+      assert score.high_confidence?
+      assert score.breakdown[:auto_select_allowed]
+    end
+  end
+
+  test "scores elided apostrophe titles as exact matches against dotted scene releases" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    SettingsService.set(:auto_select_confidence_threshold, 90)
+    @request.update!(language: "fr")
+    threshold = SettingsService.get(:auto_select_confidence_threshold, default: 90)
+
+    [ "'", "’", "‘" ].each do |apostrophe|
+      [
+        [ "C#{apostrophe}est Random Title", "Some Author", "C.est.Random.Title.Some.Author.2026.Fr.[ePub]" ],
+        [ "D#{apostrophe}Artagnan", "Alexandre Dumas", "D.Artagnan.Alexandre.Dumas.2026.Fr.[ePub]" ],
+        [ "L#{apostrophe}Étranger", "Albert Camus", "L.Etranger.Albert.Camus.2026.Fr.[ePub]" ],
+        [ "J#{apostrophe}irai cracher sur vos tombes", "Boris Vian", "J.irai.cracher.sur.vos.tombes.Boris.Vian.2026.Fr.[ePub]" ],
+        [ "N#{apostrophe}importe quoi", "Some Author", "N.importe.quoi.Some.Author.2026.Fr.[ePub]" ],
+        [ "S#{apostrophe}il vous plait", "Some Author", "S.il.vous.plait.Some.Author.2026.Fr.[ePub]" ],
+        [ "Qu#{apostrophe}est-ce que c#{apostrophe}est", "Some Author", "Qu.est.ce.que.c.est.Some.Author.2026.Fr.[ePub]" ]
+      ].each do |title, author, release_title|
+        @book.update!(title: title, author: author, book_type: :ebook)
+        score = ReleaseScorer.score(
+          @request.search_results.new(title: release_title, seeders: 50),
+          @request
+        )
+
+        assert_equal 100, score.breakdown[:title], "#{title} => #{score.breakdown.inspect}"
+        assert_operator score.total, :>=, threshold, "#{title} total #{score.total} is below auto-select confidence"
+        assert score.high_confidence?, "#{title} total #{score.total}"
+        assert score.breakdown[:auto_select_allowed], title
+      end
+    end
+  end
+
+  test "keeps exact matches for English contractions" do
+    @book.update!(title: "Ender's Game", author: "Orson Scott Card")
+    [
+      "Ender's Game Orson Scott Card English Audiobook M4B",
+      "Enders Game Orson Scott Card English Audiobook M4B",
+      "Enders.Game.Orson.Scott.Card.English.Audiobook.M4B"
+    ].each do |release_title|
+      score = ReleaseScorer.score(
+        @request.search_results.new(title: release_title, seeders: 50),
+        @request
+      )
+
+      assert_equal 100, score.breakdown[:title], release_title
+      assert_equal 100, score.breakdown[:author], release_title
+      assert score.high_confidence?, "#{release_title} total #{score.total}"
+      assert score.breakdown[:auto_select_allowed], release_title
+    end
+  end
+
+  test "matches canonically decomposed accents in titles and authors" do
+    @book.update!(
+      title: "Die Bücherdiebin".unicode_normalize(:nfd),
+      author: "Jürgen Weiß".unicode_normalize(:nfd)
+    )
+
+    [ "Die Bucherdiebin Jurgen Weiss", "Die Bücherdiebin Jürgen Weiß".unicode_normalize(:nfd) ].each do |name|
+      release = @request.search_results.new(title: "#{name} English Audiobook M4B", seeders: 50)
+      score = ReleaseScorer.score(release, @request)
+
+      assert_equal 100, score.breakdown[:title]
+      assert_equal 100, score.breakdown[:author]
+      assert score.high_confidence?
+    end
+  end
+
+  test "preserves punctuationless title and author matches" do
+    [
+      [ "Catch-22", "Joseph Heller", "Catch22 Joseph Heller" ],
+      [ "Catch22", "Joseph Heller", "Catch-22 Joseph Heller" ],
+      [ "R.U.R.", "Karel Capek", "RUR Karel Capek" ],
+      [ "The Hobbit", "J.R.R. Tolkien", "The Hobbit JRR Tolkien" ]
+    ].each do |title, author, release_title|
+      @book.update!(title: title, author: author)
+      release = @request.search_results.new(title: "#{release_title} English Audiobook M4B", seeders: 50)
+      score = ReleaseScorer.score(release, @request)
+
+      assert_equal 100, score.breakdown[:title], title
+      assert_equal 100, score.breakdown[:author], author
+      assert score.high_confidence?
+      assert score.breakdown[:auto_select_allowed]
+    end
+  end
+
+  test "does not crash or award an author match when transliteration has no matching letters" do
+    @book.update!(title: "The Three Body Problem", author: "刘慈欣")
+    release = @request.search_results.new(title: "The Three Body Problem English Audiobook M4B", seeders: 50)
+    score = ReleaseScorer.score(release, @request)
+
+    assert_equal 100, score.breakdown[:title]
+    assert_equal 0, score.breakdown[:author]
+    assert_not score.high_confidence?
+  end
+
+  test "does not treat R.U.R. as a short title" do
+    key = TitleKey.new("R.U.R.")
+
+    assert_equal "r u r", key.canonical
+    assert_includes key.forms, "rur"
+    assert_not key.short?
+    assert TitleKey.new("RUR").short?
+
+    @book.update!(title: "R.U.R.", author: "Karel Capek")
+    [
+      "RUR Karel Capek",
+      "Collected RUR Karel Capek",
+      "Collected R.U.R. Karel Capek"
+    ].each do |release_title|
+      score = ReleaseScorer.score(@request.search_results.new(title: release_title), @request)
+
+      assert_equal 100, score.breakdown[:title], release_title
+    end
+  end
+
+  test "punctuationless title matching preserves phrase and short alias boundaries" do
+    [
+      [ "Catch-22", "Catch220 Joseph Heller" ],
+      [ "Catch-22", "Scatch22 Joseph Heller" ],
+      [ "RUR", "Collected R.U.R. Karel Capek" ]
+    ].each do |title, release_title|
+      @book.update!(title: title)
+      score = ReleaseScorer.score(@request.search_results.new(title: release_title), @request)
+
+      assert_operator score.breakdown[:title], :<, 100, release_title
+    end
+
+    @book.update!(title: "Catch-22 / R.U.R.")
+    partial = ReleaseScorer.score(@request.search_results.new(title: "Catch22 English Audiobook M4B"), @request)
+    full = ReleaseScorer.score(@request.search_results.new(title: "Catch22 RUR English Audiobook M4B"), @request)
+
+    assert_equal 100, partial.breakdown[:title]
+    assert_not partial.breakdown[:auto_select_allowed]
+    assert_equal 100, full.breakdown[:title]
+    assert full.breakdown[:auto_select_allowed]
+  end
+
   test "rewards an exact comic issue and rejects a conflicting issue" do
     book = Book.create!(
       title: "Saga",

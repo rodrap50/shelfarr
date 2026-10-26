@@ -2,8 +2,7 @@
 
 require "uri"
 
-# Client for interacting with FlareSolverr to bypass DDoS protection
-# https://github.com/FlareSolverr/FlareSolverr
+# Client for interacting with FlareSolverr to bypass DDoS protection https://github.com/FlareSolverr/FlareSolverr
 class FlaresolverrClient
   class Error < StandardError; end
   class ConnectionError < Error; end
@@ -18,8 +17,6 @@ class FlaresolverrClient
       SettingsService.flaresolverr_configured?
     end
 
-    # Perform a GET request through FlareSolverr
-    # Returns the HTML content of the page
     def get(url, timeout: 60000)
       ensure_configured!
 
@@ -92,7 +89,6 @@ class FlaresolverrClient
       endpoint = URI.parse(base_url)
       Rails.logger.info "[FlaresolverrClient] Testing connection to #{endpoint.scheme}://#{endpoint.host}"
 
-      # Test by fetching a simple page
       response = capped_post(
         cmd: "request.get",
         url: "https://example.com",
@@ -109,10 +105,9 @@ class FlaresolverrClient
       success
     rescue Error, Faraday::Error, JSON::ParserError, URI::Error => e
       Rails.logger.error "[FlaresolverrClient] Test connection error: #{e.class} - #{e.message}"
-      false
+      RemoteResult::Failed.new(e)
     end
 
-    # Reset connection (useful when settings change)
     def reset_connection!
       @connection = nil
     end
@@ -157,7 +152,6 @@ class FlaresolverrClient
 
     def base_url
       url = SettingsService.get(:flaresolverr_url).to_s.strip
-      # Remove trailing slash and /v1 suffix if present (we add /v1 in requests)
       url = url.chomp("/")
       url = url.chomp("/v1")
       url

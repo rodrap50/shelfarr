@@ -4,8 +4,7 @@ module IndexerClients
   class Prowlarr < Base
     Result = IndexerClients::Result
 
-    # Prowlarr's own default when a definition carries no priority, so
-    # de-duplication always has something to order by.
+    # Prowlarr's own default when a definition carries no priority, so de-duplication always has something to order by.
     DEFAULT_INDEXER_PRIORITY = 25
 
     class << self
@@ -15,15 +14,20 @@ module IndexerClients
         cats = categories || categories_for_type(book_type)
 
         if search_type_for(title: title, author: author) == "search"
-          items = execute_search(query, type: "search", categories: cats, limit: limit, indexer_ids: filtered_indexer_ids)
+          indexer_ids = filtered_indexer_ids
+          raise indexer_ids.error if RemoteResult.failed?(indexer_ids)
+
+          items = execute_search(query, type: "search", categories: cats, limit: limit, indexer_ids: indexer_ids)
           return items.map { |item| parse_result(item) }
         end
 
         # Resolve the configured tag scope once and carry it through. Reading it
         # a second time while planning lets a transient /api/v1/tag failure read
         # as "no tags configured" and widen the search past the user's scope.
-        tags = indexer_filter_tags
+        tags = tag_scope_ids(indexer_filter_tags)
         scoped = scoped_indexers(tags: tags)
+        raise scoped.error if RemoteResult.failed?(scoped)
+
         plans = book_search_plans(query, title: title, author: author, tags: tags, indexers: scoped)
         items = execute_book_search_plans(plans, categories: cats, limit: limit)
 
@@ -60,21 +64,29 @@ module IndexerClients
       # or only the tagged subset when prowlarr_tags is set. Returns nil when
       # Prowlarr's indexer list cannot be read.
       def scoped_indexers(tags: indexer_filter_tags)
+        tags = tag_scope_ids(tags)
         normalized_tags = tags.map(&:to_s).map(&:downcase)
         all = indexers
         return all if normalized_tags.empty?
 
         all.select { |indexer| (normalized_indexer_tags(indexer["tags"]) & normalized_tags).any? }
       rescue IndexerClients::Base::Error => e
+        raise e if tags.is_a?(RemoteResult::Failed)
+
         Rails.logger.warn "[IndexerClients::Prowlarr] Failed to fetch indexers: #{e.message}"
-        nil
+        RemoteResult::Failed.new(e)
       end
 
       def filtered_indexer_ids
         tags = indexer_filter_tags
+        return nil if tags.is_a?(RemoteResult::Empty)
+        tags = tag_scope_ids(tags)
         return nil if tags.empty?
 
-        scoped_indexers(tags: tags)&.map { |indexer| indexer["id"] }
+        indexers = scoped_indexers(tags: tags)
+        return indexers if RemoteResult.failed?(indexers)
+
+        indexers&.map { |indexer| indexer["id"] }
       end
 
       def configured_tags
@@ -94,20 +106,35 @@ module IndexerClients
       end
 
       def indexer_filter_tags
-        configured_tags.concat(configured_tag_ids_for_names(configured_tag_names)).uniq
+        numeric = configured_tags
+        resolved = configured_tag_ids_for_names(configured_tag_names)
+        case resolved
+        when RemoteResult::Failed
+          resolved
+        when RemoteResult::Ok
+          numeric.concat(resolved.value).uniq
+        when RemoteResult::Empty
+          numeric.empty? ? resolved : numeric
+        else
+          numeric.concat(resolved).uniq
+        end
       end
 
       def configured?
         SettingsService.prowlarr_configured?
       end
 
-      def test_connection
-        ensure_configured!
-
-        response = request(idempotent: true) { connection.get("api/v1/indexer") }
-        response.status == 200
-      rescue IndexerClients::Base::Error
-        false
+      def test_connection(url: nil, api_key: nil)
+        response = request(idempotent: true) do
+          probe_connection(url, api_key).get("api/v1/indexer")
+        end
+        handle_response(response) { true }
+      rescue IndexerClients::Base::Error => e
+        ConnectionErrorClassifier.reraise!(
+          e,
+          connection_error: IndexerClients::Base::ConnectionError,
+          authentication_error: IndexerClients::Base::AuthenticationError
+        )
       end
 
       def display_name
@@ -133,11 +160,23 @@ module IndexerClients
             tag_lookup[label.to_s.strip.downcase] = tag_id.to_i
           end
 
-          tag_names.filter_map { |name| tag_lookup[name.to_s.downcase] }
+          ids = tag_names.filter_map { |name| tag_lookup[name.to_s.downcase] }
+          ids.empty? ? RemoteResult::Empty.new : RemoteResult::Ok.new(ids)
         end
       rescue IndexerClients::Base::Error => e
         Rails.logger.warn "[IndexerClients::Prowlarr] Failed to resolve tag names for filtering: #{e.message}"
-        []
+        RemoteResult::Failed.new(e)
+      end
+
+      def tag_scope_ids(tags)
+        case tags
+        when RemoteResult::Failed
+          raise tags.error
+        when RemoteResult::Empty
+          []
+        else
+          tags
+        end
       end
 
       def normalized_indexer_tags(tags)
@@ -151,15 +190,44 @@ module IndexerClients
         end.compact.map(&:to_s).map(&:downcase)
       end
 
-      def connection
-        @connection ||= Faraday.new(url: base_url) do |f|
+      def connection_settings_key
+        [ SettingsService.get(:prowlarr_url).to_s, SettingsService.get(:prowlarr_api_key).to_s ]
+      end
+
+      def build_connection
+        Faraday.new(url: base_url) do |f|
           f.options.params_encoder = Faraday::FlatParamsEncoder
           f.request :url_encoded
           f.response :json, parser_options: { symbolize_names: false }
-          f.adapter Faraday.default_adapter
           f.headers["X-Api-Key"] = api_key
           f.options.timeout = 30
           f.options.open_timeout = 10
+          ReachableNetHttp.install(f, base_url, open_timeout: f.options.open_timeout)
+        end
+      end
+
+      # A probe must not replace the memoized client searches keep using.
+      def probe_connection(url, api_key_override)
+        if url.nil? && api_key_override.nil?
+          ensure_configured!
+          return connection
+        end
+
+        key = api_key_override.nil? ? api_key : api_key_override
+        raise Base::NotConfiguredError, "#{display_name} is not configured" if url.blank? || key.blank?
+
+        open_connection(normalize_base_url(url), key)
+      end
+
+      def open_connection(normalized_url, key)
+        Faraday.new(url: normalized_url) do |f|
+          f.options.params_encoder = Faraday::FlatParamsEncoder
+          f.request :url_encoded
+          f.response :json, parser_options: { symbolize_names: false }
+          f.headers["X-Api-Key"] = key
+          f.options.timeout = 30
+          f.options.open_timeout = 10
+          ReachableNetHttp.install(f, normalized_url, open_timeout: f.options.open_timeout)
         end
       end
 
@@ -196,7 +264,7 @@ module IndexerClients
           download_url: extract_download_url(item),
           magnet_url: extract_magnet_url(item),
           info_url: item["infoUrl"],
-          published_at: parse_date(item["publishDate"]),
+          published_at: published_at_for(item["publishDate"]),
           category_ids: extract_category_ids(item)
         )
       end
@@ -249,12 +317,19 @@ module IndexerClients
         url if url.present? && url.start_with?("magnet:")
       end
 
+      def published_at_for(date_string)
+        parsed = parse_date(date_string)
+        return if RemoteResult.failed?(parsed)
+
+        parsed
+      end
+
       def parse_date(date_string)
         return nil if date_string.blank?
 
         Time.parse(date_string)
-      rescue ArgumentError
-        nil
+      rescue ArgumentError => error
+        RemoteResult::Failed.new(error)
       end
 
       def execute_search(query, type:, categories:, limit:, indexer_ids:)
@@ -338,13 +413,14 @@ module IndexerClients
       # Group the indexers we are about to search by what they can actually
       # accept and give each group the richest query it supports. A token is
       # only ever emitted when the indexer is known to support it; everything
-      # else falls back to free text, which every indexer accepts.
       def book_search_plans(query, title:, author:, tags: indexer_filter_tags, indexers: scoped_indexers(tags: tags))
         free_text_query = build_free_text_query(query, title: title, author: author)
 
         # Indexer list unavailable, or nothing matched the configured tags: keep
         # letting Prowlarr pick the indexers, with the query shape none of them
         # can reject.
+        raise indexers.error if RemoteResult.failed?(indexers)
+
         return [ search_plan(free_text_query, nil) ] if indexers.blank?
 
         available = indexers.select { |indexer| searchable?(indexer) }

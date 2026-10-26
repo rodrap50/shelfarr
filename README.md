@@ -37,6 +37,7 @@ Think Jellyseerr, but for books. Your users request ebooks and audiobooks; Shelf
 ## Features
 
 - **Book Discovery** — Search millions of titles via Hardcover, Google Books and Open Library
+- **Hardcover Discover, Reading Lists & Authors** — Browse trending books, releases, genres, public lists, and author catalogs; preview your Hardcover Want to Read shelf or lists and request what you choose; follow authors for new releases. Nothing is requested until you confirm a preview. See [Hardcover discovery, reading lists, and authors](docs/hardcover.md)
 - **Smart Acquisition** — Search Prowlarr, Jackett or Newznab/NZBHydra2 indexers; download via qBittorrent, Decypharr, Deluge, Transmission, SABnzbd or NZBGet
 - **Direct Downloads** — Ebooks and audiobooks from Anna's Archive, ebooks from Z-Library, and public-domain audiobooks from LibriVox — no torrent client needed
 - **Auto-Selection & Format Preferences** — Pick the best release automatically, scored by your preferred formats, bitrate and language
@@ -205,6 +206,7 @@ Shelfarr supports OpenID Connect for single sign-on with identity providers like
 | Service | Purpose |
 |---------|---------|
 | **Open Library** / **Google Books** / **Hardcover** | Book metadata and search |
+| **Hardcover** | Discovery, Want to Read and list sync, author monitoring ([guide](docs/hardcover.md)) |
 | **Prowlarr** / **Jackett** / **NZBHydra2** | Indexer management |
 | **qBittorrent**, **Decypharr**, **Deluge**, **Transmission** | Torrent downloads |
 | **SABnzbd**, **NZBGet** | Usenet downloads |
@@ -234,9 +236,9 @@ Grimmory support uses Grimmory's `/api/v1` endpoints for library listing, invent
 ## Development
 
 ```bash
-# Install Ruby 3.3.6 via rbenv and the image validation dependency
+# Install Ruby 3.3.13 via rbenv and the image validation dependency
 brew install rbenv ruby-build vips
-rbenv install 3.3.6
+rbenv install 3.3.13
 
 # Clone and setup
 git clone https://github.com/Pedro-Revez-Silva/shelfarr.git

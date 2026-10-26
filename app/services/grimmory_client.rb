@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 
-# Client for Grimmory's documented /api/v1 endpoints.
 class GrimmoryClient
   class Error < StandardError; end
   class ConnectionError < Error; end
@@ -24,6 +23,10 @@ class GrimmoryClient
       paths
     end
   end
+
+  AUDIOBOOK_FORMATS = (
+    AudiobookBundleImportPlanner::KNOWN_AUDIO_EXTENSIONS + %w[audiobook]
+  ).freeze
 
   class << self
     def libraries
@@ -69,8 +72,8 @@ class GrimmoryClient
     def test_connection
       ensure_configured!
       libraries.any?
-    rescue Error
-      false
+    rescue Error => error
+      RemoteResult::Failed.new(error)
     end
 
     def reset_connection!
@@ -174,10 +177,8 @@ class GrimmoryClient
       return "grimmory" if formats.empty?
 
       ebook_formats = %w[azw azw3 cbx cbz cbr epub fb2 lit lrf mobi pdf txt]
-      audiobook_formats = %w[aac aiff alac audiobook flac m4a m4b mp3 ogg opus wav wma]
-
       has_ebooks = formats.any? { |format| ebook_formats.include?(format) }
-      has_audiobooks = formats.any? { |format| audiobook_formats.include?(format) }
+      has_audiobooks = formats.any? { |format| AUDIOBOOK_FORMATS.include?(format) }
 
       return "audiobook" if has_audiobooks && !has_ebooks
       return "ebook" if has_ebooks && !has_audiobooks

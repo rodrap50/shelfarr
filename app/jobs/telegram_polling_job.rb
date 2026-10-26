@@ -15,8 +15,7 @@ class TelegramPollingJob < ApplicationJob
       return unless Integrations::Telegram::Configuration.polling?
       return if polling_job_pending?
 
-      next_run_at = Rails.cache.read(SCHEDULE_CACHE_KEY).to_i
-      return if next_run_at > Time.current.to_i
+      return if schedule_reserved?
 
       reserve_schedule!
       Rails.logger.info "[TelegramPollingJob] Scheduling polling chain"
@@ -33,16 +32,22 @@ class TelegramPollingJob < ApplicationJob
       scope = SolidQueue::Job.where(class_name: name, finished_at: nil)
       scope = scope.where.not(active_job_id: excluding_active_job_id) if excluding_active_job_id.present?
       scope.exists?
-    rescue ActiveRecord::StatementInvalid, NameError
-      false
+    rescue ActiveRecord::StatementInvalid, NameError => error
+      RemoteResult::Failed.new(error)
     end
 
     private
 
+    def schedule_reserved?
+      # to_i truncates both sides, so a one-second reservation expires at the
+      # next unix second and can last only a few milliseconds.
+      Rails.cache.read(SCHEDULE_CACHE_KEY).to_f > Time.current.to_f
+    end
+
     def reserve_schedule!
       Rails.cache.write(
         SCHEDULE_CACHE_KEY,
-        POLL_INTERVAL_SECONDS.seconds.from_now.to_i,
+        POLL_INTERVAL_SECONDS.seconds.from_now.to_f,
         expires_in: [ POLL_TIMEOUT_SECONDS + 30, 60 ].max.seconds
       )
     end

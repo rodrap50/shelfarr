@@ -17,13 +17,11 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
     )
     @client = @client_record.adapter
 
-    # Clear session between tests
     Thread.current[:qbittorrent_sessions] = {}
   end
 
   test "add_torrent authenticates and adds torrent with magnet link" do
     VCR.turned_off do
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -31,11 +29,9 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification - torrent info returns the added torrent
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
         .to_return(
           status: 200,
@@ -43,7 +39,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: [ { "hash" => "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", "name" => "Test", "progress" => 0, "state" => "downloading", "size" => 100, "content_path" => "/downloads" } ].to_json
         )
 
-      # Use valid hex hash in magnet link
       result = @client.add_torrent("magnet:?xt=urn:btih:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
       assert_equal "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", result
     end
@@ -357,7 +352,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   test "add_torrent falls back to polling when torrent file cannot be downloaded" do
     VCR.turned_off do
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -365,11 +359,9 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub torrent file download - connection fails (simulates network issue)
       stub_request(:get, "http://example.com/file.torrent")
         .to_timeout
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
@@ -388,7 +380,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   test "add_torrent skips hash pre-computation for relative torrent URLs and falls back to polling" do
     VCR.turned_off do
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -405,7 +396,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           { status: 200, headers: { "Content-Type" => "application/json" }, body: [ { "hash" => "relative123" } ].to_json }
         )
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
@@ -416,7 +406,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   test "list_torrents returns array of TorrentInfo" do
     VCR.turned_off do
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -424,7 +413,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub list torrents
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info")
         .to_return(
           status: 200,
@@ -540,7 +528,11 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
         .with(headers: { "Authorization" => "Bearer #{QBITTORRENT_API_KEY}" })
         .to_return(status: 403, body: "Forbidden")
 
-      assert_not @client.test_connection
+      error = assert_raises(DownloadClients::Base::AuthenticationError) do
+        @client.test_connection
+      end
+
+      assert_equal "Unauthorized", error.message
       assert_not_requested(:post, "http://localhost:8080/api/v2/auth/login")
     end
   end
@@ -584,16 +576,85 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
     end
   end
 
-  test "test_connection returns false on authentication failure" do
+  test "test_connection raises unauthorized when login is rejected" do
     VCR.turned_off do
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(status: 401, body: "Fails.")
 
-      assert_not @client.test_connection
+      error = assert_raises(DownloadClients::Base::AuthenticationError) do
+        @client.test_connection
+      end
+
+      assert_equal "Unauthorized", error.message
     end
   end
 
-  test "test_connection returns false when API endpoint returns 404" do
+  test "test_connection raises connection refused" do
+    VCR.turned_off do
+      stub_request(:post, "http://localhost:8080/api/v2/auth/login")
+        .to_raise(Errno::ECONNREFUSED.new("Connection refused - connect(2)"))
+
+      error = assert_raises(DownloadClients::Base::ConnectionError) do
+        @client.test_connection
+      end
+
+      assert_equal "Connection refused", error.message
+    end
+  end
+
+  test "test_connection raises a timeout" do
+    VCR.turned_off do
+      stub_request(:post, "http://localhost:8080/api/v2/auth/login").to_timeout
+
+      error = assert_raises(DownloadClients::Base::ConnectionError) do
+        @client.test_connection
+      end
+
+      assert_equal "Connection timed out", error.message
+    end
+  end
+
+  test "test_connection raises DNS failures" do
+    VCR.turned_off do
+      stub_request(:post, "http://localhost:8080/api/v2/auth/login").to_raise(
+        SocketError.new("Failed to open TCP connection to localhost:8080 (getaddrinfo: Name or service not known)")
+      )
+
+      error = assert_raises(DownloadClients::Base::ConnectionError) do
+        @client.test_connection
+      end
+
+      assert_equal "Could not resolve host", error.message
+    end
+  end
+
+  test "test_connection raises TLS failures" do
+    VCR.turned_off do
+      stub_request(:post, "http://localhost:8080/api/v2/auth/login")
+        .to_raise(Faraday::SSLError.new("SSL certificate verify failed"))
+
+      error = assert_raises(DownloadClients::Base::ConnectionError) do
+        @client.test_connection
+      end
+
+      assert_equal "TLS connection failed", error.message
+    end
+  end
+
+  test "test_connection reports an authentication failure" do
+    VCR.turned_off do
+      stub_request(:post, "http://localhost:8080/api/v2/auth/login")
+        .to_return(status: 401, body: "Fails.")
+
+      error = assert_raises(DownloadClients::Base::AuthenticationError) do
+        @client.test_connection
+      end
+
+      assert_equal "Unauthorized", error.message
+    end
+  end
+
+  test "test_connection raises when the API endpoint returns 404" do
     VCR.turned_off do
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
@@ -606,7 +667,12 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       stub_request(:get, "http://localhost:8080/api/v2/app/version")
         .to_return(status: 404, body: "<html><head><title>404 Not Found</title></head></html>")
 
-      assert_not @client.test_connection
+      error = assert_raises(DownloadClients::Base::Error) do
+        @client.test_connection
+      end
+
+      assert_equal DownloadClients::Base::Error, error.class
+      assert_equal "qBittorrent API error: 404", error.message
     end
   end
 
@@ -636,7 +702,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   test "parse_torrent falls back to save_path + name when content_path is missing" do
     VCR.turned_off do
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -644,7 +709,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub torrent info without content_path (older qBittorrent versions)
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info")
         .to_return(
           status: 200,
@@ -665,7 +729,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
       assert_equal 1, torrents.size
       torrent = torrents.first
-      # Should fall back to save_path + name
       assert_equal "/downloads/category/Test Torrent", torrent.download_path
     end
   end
@@ -674,7 +737,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   test "add_torrent extracts hash from downloaded torrent file" do
     VCR.turned_off do
-      # Create a valid bencoded torrent file
       info_dict = {
         "name" => "Test Book.epub",
         "piece length" => 16384,
@@ -686,7 +748,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       # Calculate expected hash (SHA1 of bencoded info dict)
       expected_hash = Digest::SHA1.hexdigest(info_dict.bencode).downcase
 
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -694,7 +755,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub torrent file download - this should be called BEFORE adding to qBittorrent
       stub_request(:get, "http://tracker.example.com/download/123.torrent")
         .to_return(
           status: 200,
@@ -702,11 +762,9 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: torrent_data
         )
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification - torrent info returns the added torrent
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=#{expected_hash}")
         .to_return(
           status: 200,
@@ -717,24 +775,21 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       result = @client.add_torrent("http://tracker.example.com/download/123.torrent")
 
       assert_equal expected_hash, result
-      # Verify torrent file was downloaded
       assert_requested(:get, "http://tracker.example.com/download/123.torrent")
     end
   end
 
   test "add_torrent extracts hash from torrent URL with query parameters" do
     VCR.turned_off do
-      # Create a valid bencoded torrent file
       info_dict = {
         "name" => "Another Book.epub",
         "piece length" => 16384,
-        "pieces" => "abcdefghijklmnopqrst", # 20 bytes
+        "pieces" => "abcdefghijklmnopqrst",
         "length" => 2048
       }
       torrent_data = { "info" => info_dict }.bencode
       expected_hash = Digest::SHA1.hexdigest(info_dict.bencode).downcase
 
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -742,7 +797,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub torrent file download with query params (common for private trackers)
       stub_request(:get, "http://tracker.example.com/download.php?id=456&passkey=abc123")
         .to_return(
           status: 200,
@@ -750,11 +804,9 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: torrent_data
         )
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification - torrent info returns the added torrent
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=#{expected_hash}")
         .to_return(
           status: 200,
@@ -770,7 +822,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   test "add_torrent falls back to polling when torrent download fails" do
     VCR.turned_off do
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -778,7 +829,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub torrent file download - fails with 404
       stub_request(:get, "http://tracker.example.com/download/missing.torrent")
         .to_return(status: 404, body: "Not Found")
 
@@ -791,20 +841,17 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           { status: 200, headers: { "Content-Type" => "application/json" }, body: [ { "hash" => "fallback123" } ].to_json }
         )
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
       result = @client.add_torrent("http://tracker.example.com/download/missing.torrent")
 
-      # Should fall back to polling and find the hash
       assert_equal "fallback123", result
     end
   end
 
   test "add_torrent falls back to polling when torrent file is invalid" do
     VCR.turned_off do
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -812,7 +859,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub torrent file download - returns invalid data (not bencode)
       stub_request(:get, "http://tracker.example.com/download/invalid.torrent")
         .to_return(
           status: 200,
@@ -820,14 +866,12 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "<html>Login required</html>"
         )
 
-      # Should fall back to polling
       stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
         .to_return(
           { status: 200, headers: { "Content-Type" => "application/json" }, body: [].to_json },
           { status: 200, headers: { "Content-Type" => "application/json" }, body: [ { "hash" => "polled456" } ].to_json }
         )
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
@@ -839,10 +883,8 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   test "add_torrent handles torrent file without info dict" do
     VCR.turned_off do
-      # Create an invalid torrent file (missing info dict)
       torrent_data = { "announce" => "http://tracker.example.com/announce" }.bencode
 
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -850,7 +892,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub torrent file download
       stub_request(:get, "http://tracker.example.com/download/noinfo.torrent")
         .to_return(
           status: 200,
@@ -858,14 +899,12 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: torrent_data
         )
 
-      # Should fall back to polling
       stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
         .to_return(
           { status: 200, headers: { "Content-Type" => "application/json" }, body: [].to_json },
           { status: 200, headers: { "Content-Type" => "application/json" }, body: [ { "hash" => "noinfo789" } ].to_json }
         )
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
@@ -877,12 +916,10 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   test "add_torrent verifies torrent exists after adding with pre-computed hash" do
     VCR.turned_off do
-      # Create a valid torrent file
       info_dict = { "name" => "Book.epub", "piece length" => 16384, "pieces" => "x" * 20, "length" => 100 }
       torrent_data = { "info" => info_dict }.bencode
       expected_hash = Digest::SHA1.hexdigest(info_dict.bencode).downcase
 
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -890,15 +927,12 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub torrent download
       stub_request(:get, "http://tracker.example.com/file.torrent")
         .to_return(status: 200, body: torrent_data)
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification - torrent info is called to verify the torrent exists
       info_stub = stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=#{expected_hash}")
         .to_return(
           status: 200,
@@ -909,14 +943,12 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       result = @client.add_torrent("http://tracker.example.com/file.torrent")
 
       assert_equal expected_hash, result
-      # Verify that torrent info was called to verify the torrent exists
       assert_requested(info_stub, times: 1)
     end
   end
 
   test "concurrent add_torrent calls get different hashes when pre-computed" do
     VCR.turned_off do
-      # Create two different torrent files
       info_dict_a = { "name" => "Book A.epub", "piece length" => 16384, "pieces" => "a" * 20, "length" => 100 }
       info_dict_b = { "name" => "Book B.epub", "piece length" => 16384, "pieces" => "b" * 20, "length" => 200 }
       torrent_data_a = { "info" => info_dict_a }.bencode
@@ -924,10 +956,8 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       expected_hash_a = Digest::SHA1.hexdigest(info_dict_a.bencode).downcase
       expected_hash_b = Digest::SHA1.hexdigest(info_dict_b.bencode).downcase
 
-      # Sanity check - hashes should be different
       assert_not_equal expected_hash_a, expected_hash_b
 
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -935,17 +965,14 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub torrent downloads
       stub_request(:get, "http://tracker.example.com/book_a.torrent")
         .to_return(status: 200, body: torrent_data_a)
       stub_request(:get, "http://tracker.example.com/book_b.torrent")
         .to_return(status: 200, body: torrent_data_b)
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification for both torrents
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=#{expected_hash_a}")
         .to_return(
           status: 200,
@@ -959,7 +986,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: [ { "hash" => expected_hash_b, "name" => "Book B.epub", "progress" => 0, "state" => "downloading", "size" => 200, "content_path" => "/downloads" } ].to_json
         )
 
-      # Simulate concurrent calls - each should get its own correct hash
       result_a = @client.add_torrent("http://tracker.example.com/book_a.torrent")
       result_b = @client.add_torrent("http://tracker.example.com/book_b.torrent")
 
@@ -975,7 +1001,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       torrent_data = { "info" => info_dict }.bencode
       expected_hash = Digest::SHA1.hexdigest(info_dict.bencode).downcase
 
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -983,17 +1008,14 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub redirect chain
       stub_request(:get, "http://tracker.example.com/download/redirect.torrent")
         .to_return(status: 302, headers: { "Location" => "http://cdn.example.com/actual.torrent" })
       stub_request(:get, "http://cdn.example.com/actual.torrent")
         .to_return(status: 200, body: torrent_data)
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=#{expected_hash}")
         .to_return(
           status: 200,
@@ -1011,7 +1033,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
     VCR.turned_off do
       magnet_url = "magnet:?xt=urn:btih:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -1019,16 +1040,13 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # URL resolves to magnet link via redirect
       stub_request(:get, "http://tracker.example.com/download/redirect")
         .to_return(status: 302, headers: { "Location" => magnet_url })
 
-      # qBittorrent should receive the magnet URL, not the original redirect URL
       add_stub = stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .with(body: hash_including("urls" => magnet_url))
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
         .to_return(
           status: 200,
@@ -1055,7 +1073,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       torrent_data = { "info" => info_dict }.bencode
       expected_hash = Digest::SHA1.hexdigest(info_dict.bencode).downcase
 
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -1063,7 +1080,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Shelfarr downloads the torrent from indexer/proxy
       stub_request(:get, "http://prowlarr:9696/api/v1/indexer/download/123")
         .to_return(
           status: 200,
@@ -1079,7 +1095,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
         end
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=#{expected_hash}")
         .to_return(
           status: 200,
@@ -1141,11 +1156,9 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
     end
   end
 
-  # === Verification Tests (Issue #114 Fix) ===
 
   test "add_torrent returns nil when verification fails (torrent rejected by qBittorrent)" do
     VCR.turned_off do
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -1157,7 +1170,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification - torrent not found (qBittorrent rejected it)
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
         .to_return(
           status: 200,
@@ -1244,9 +1256,8 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
     assert_equal "qBittorrent API error: 400", error.message
   end
 
-  # === Category Auto-Creation Tests ===
 
-  test "test_connection creates category after successful connection" do
+  test "test_connection does not create a category" do
     VCR.turned_off do
       @client_record.update!(category: "shelfarr")
 
@@ -1260,34 +1271,8 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       stub_request(:get, "http://localhost:8080/api/v2/app/version")
         .to_return(status: 200, body: "v4.6.0")
 
-      category_stub = stub_request(:post, "http://localhost:8080/api/v2/torrents/createCategory")
-        .with(body: { "category" => "shelfarr" })
-        .to_return(status: 200)
-
       assert @client.test_connection
-      assert_requested(category_stub)
-    end
-  end
-
-  test "test_connection handles existing category gracefully" do
-    VCR.turned_off do
-      @client_record.update!(category: "shelfarr")
-
-      stub_request(:post, "http://localhost:8080/api/v2/auth/login")
-        .to_return(
-          status: 200,
-          headers: { "Set-Cookie" => "SID=test_session_id; path=/" },
-          body: "Ok."
-        )
-
-      stub_request(:get, "http://localhost:8080/api/v2/app/version")
-        .to_return(status: 200, body: "v4.6.0")
-
-      # 409 = category already exists
-      stub_request(:post, "http://localhost:8080/api/v2/torrents/createCategory")
-        .to_return(status: 409)
-
-      assert @client.test_connection
+      assert_not_requested :post, "http://localhost:8080/api/v2/torrents/createCategory"
     end
   end
 
@@ -1312,7 +1297,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   test "test_connection clears session on 403 response" do
     VCR.turned_off do
-      # First: authenticate successfully
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -1320,15 +1304,18 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Then: version endpoint returns 403 (expired session)
       stub_request(:get, "http://localhost:8080/api/v2/app/version")
         .to_return(status: 403, body: "Forbidden")
 
-      assert_not @client.test_connection
+      error = assert_raises(DownloadClients::Base::AuthenticationError) do
+        @client.test_connection
+      end
+
+      assert_equal "Unauthorized", error.message
+      assert_nil Thread.current[:qbittorrent_sessions][@client_record.id][:cookie_value]
     end
   end
 
-  # === Connection Diagnostics Tests ===
 
   test "connection_diagnostics returns save path and category info" do
     VCR.turned_off do
@@ -1363,14 +1350,14 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
     end
   end
 
-  test "connection_diagnostics returns nil on failure" do
+  test "connection_diagnostics returns Failed when login fails" do
     VCR.turned_off do
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(status: 401, body: "Fails.")
 
       result = @client.connection_diagnostics
 
-      assert_nil result
+      assert RemoteResult.failed?(result)
     end
   end
 
@@ -1378,7 +1365,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   test "add_torrent uploads torrent file data via multipart instead of passing URL" do
     VCR.turned_off do
-      # Create a valid bencoded torrent file
       info_dict = {
         "name" => "Seedbox Book.epub",
         "piece length" => 16384,
@@ -1388,7 +1374,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       torrent_data = { "info" => info_dict }.bencode
       expected_hash = Digest::SHA1.hexdigest(info_dict.bencode).downcase
 
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -1396,7 +1381,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub torrent file download (Shelfarr downloads from indexer)
       stub_request(:get, "http://prowlarr:9696/api/v1/indexer/download/123")
         .to_return(
           status: 200,
@@ -1409,7 +1393,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       add_stub = stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=#{expected_hash}")
         .to_return(
           status: 200,
@@ -1420,16 +1403,13 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       result = @client.add_torrent("http://prowlarr:9696/api/v1/indexer/download/123")
 
       assert_equal expected_hash, result
-      # Verify the add request was made (with multipart torrent data, not URL)
       assert_requested(add_stub)
-      # Verify the torrent file was downloaded by Shelfarr (not left for qBittorrent)
       assert_requested(:get, "http://prowlarr:9696/api/v1/indexer/download/123")
     end
   end
 
   test "add_torrent uses urls parameter for magnet links (no multipart needed)" do
     VCR.turned_off do
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -1437,12 +1417,10 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub add torrent — should receive the magnet URL as a parameter
       add_stub = stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .with(body: hash_including("urls" => "magnet:?xt=urn:btih:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
         .to_return(
           status: 200,
@@ -1453,7 +1431,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       result = @client.add_torrent("magnet:?xt=urn:btih:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
 
       assert_equal "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", result
-      # Verify the URL-based add was used (not multipart)
       assert_requested(add_stub)
     end
   end
@@ -1523,7 +1500,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   test "add_torrent retries verification when torrent takes time to appear" do
     VCR.turned_off do
-      # Stub authentication
       stub_request(:post, "http://localhost:8080/api/v2/auth/login")
         .to_return(
           status: 200,
@@ -1531,11 +1507,9 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "Ok."
         )
 
-      # Stub add torrent
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
-      # Stub verification - first call returns empty, second call returns the torrent
       stub_request(:get, "http://localhost:8080/api/v2/torrents/info?hashes=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
         .to_return(
           { status: 200, headers: { "Content-Type" => "application/json" }, body: [].to_json },
@@ -1544,7 +1518,6 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
       result = @client.add_torrent("magnet:?xt=urn:btih:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
 
-      # Should succeed on second verification attempt
       assert_equal "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", result
     end
   end
@@ -1639,7 +1612,370 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
     end
   end
 
+  test "test_connection logs in when IPv6 localhost blackholes" do
+    server = Ipv4OnlyQbittorrentApi.start
+    addresses = Addrinfo.getaddrinfo("localhost", server.port, nil, :STREAM).map(&:ip_address)
+    assert_includes addresses, "::1"
+    assert_includes addresses, "127.0.0.1"
+
+    client_record = DownloadClient.create!(
+      name: "IPv6 blackhole qBittorrent",
+      client_type: "qbittorrent",
+      url: "http://localhost:#{server.port}",
+      username: "admin",
+      password: "adminadmin",
+      priority: 1,
+      enabled: true
+    )
+    client = client_record.adapter
+    log = StringIO.new
+    previous_logger = Rails.logger
+    Rails.logger = ActiveSupport::Logger.new(log)
+    WebMock.allow_net_connect!
+
+    with_blackholed_ipv6_localhost(server.port) do
+      assert client.test_connection, log.string
+    end
+
+    login_params = URI.decode_www_form(server.login_body.to_s).to_h
+    assert_equal "admin", login_params["username"]
+    assert_equal "adminadmin", login_params["password"]
+    assert_match(/SID=test_session_id/, server.version_cookie.to_s)
+  ensure
+    Rails.logger = previous_logger if previous_logger
+    WebMock.disable_net_connect!
+    server&.stop
+  end
+
+  test "HTTPS proxy connections retain the hostname without direct address probes" do
+    @client_record.update!(url: "https://qbittorrent.example.test")
+    connections = []
+    probes = []
+    new_http = Net::HTTP.method(:new)
+
+    with_env("https_proxy" => "http://127.0.0.1:8888", "HTTPS_PROXY" => nil,
+      "http_proxy" => nil, "HTTP_PROXY" => nil, "no_proxy" => nil, "NO_PROXY" => nil) do
+      VCR.turned_off do
+        stub_qbittorrent_connection(@client_record.url)
+
+        Net::HTTP.stub(:new, ->(*args) { new_http.call(*args).tap { |http| connections << http } }) do
+          ReachableAddress.stub(:reachable_ipaddr, ->(*) { probes << true; "203.0.113.10" }) do
+            assert @client.test_connection
+          end
+        end
+      end
+    end
+
+    assert_not_empty connections
+    connections.each do |http|
+      assert http.proxy?
+      assert_nil http.ipaddr, "IP pinning changes the proxy CONNECT destination from the configured hostname"
+      assert_equal "qbittorrent.example.test", http.address
+    end
+    assert_empty probes, "Proxied requests must not open direct probe connections"
+  end
+
+  test "reachable address probe skips an address whose socket cannot be created" do
+    ipv6 = Addrinfo.tcp("2001:db8::1", 8080)
+    ipv4 = Addrinfo.tcp("192.0.2.10", 8080)
+    connected = ProbeSocket.new
+
+    result = probe_addresses([ ipv6, ipv4 ], sockets: lambda { |family, *_rest, **_kwargs|
+      raise Errno::EAFNOSUPPORT if family == Socket::AF_INET6
+
+      connected
+    }, ready: [ connected ])
+
+    assert_equal "192.0.2.10", result
+  end
+
+  test "reachable address probe skips an address whose connect is unreachable" do
+    ipv6 = Addrinfo.tcp("2001:db8::1", 8080)
+    ipv4 = Addrinfo.tcp("192.0.2.10", 8080)
+    blocked = ProbeSocket.new(failure: Errno::ENETUNREACH, fail_on_call: 1)
+    connected = ProbeSocket.new
+
+    result = probe_addresses([ ipv6, ipv4 ], sockets: lambda { |family, *_rest, **_kwargs|
+      family == Socket::AF_INET6 ? blocked : connected
+    }, ready: [ connected ])
+
+    assert_equal "192.0.2.10", result
+  end
+
+  test "reachable address probe does not treat an in-progress connect as the connected address" do
+    ipv6 = Addrinfo.tcp("2001:db8::1", 8080)
+    ipv4 = Addrinfo.tcp("192.0.2.10", 8080)
+    cases = [
+      [ "EINPROGRESS", Errno::EINPROGRESS ],
+      [ "EALREADY", Errno::EALREADY ],
+      [ "WaitWritable", wait_writable_error ]
+    ]
+
+    cases.each do |label, error|
+      slow = ProbeSocket.new(failure: error, fail_on_call: 2)
+      connected = ProbeSocket.new
+
+      result = probe_addresses([ ipv6, ipv4 ], sockets: lambda { |family, *_rest, **_kwargs|
+        family == Socket::AF_INET6 ? slow : connected
+      }, ready: [ slow, connected ])
+
+      assert_equal "192.0.2.10", result, label
+    end
+  end
+
+  test "a failed lookup raises a resolve failure without a second lookup" do
+    host = "missing-qbittorrent.example"
+    client = client_for("http://#{host}:8080")
+    lookups = 0
+    original_lookup = Addrinfo.method(:getaddrinfo)
+    original_open = TCPSocket.method(:open)
+    nxdomain = lambda { |name|
+      next unless name == host
+
+      lookups += 1
+      raise SocketError, "getaddrinfo: Name or service not known"
+    }
+    error = nil
+
+    VCR.turned_off do
+      WebMock.allow_net_connect!
+      Addrinfo.stub(:getaddrinfo, lambda { |*args, **kwargs|
+        nxdomain.call(args[0])
+        kwargs.empty? ? original_lookup.call(*args) : original_lookup.call(*args, **kwargs)
+      }) do
+        TCPSocket.stub(:open, lambda { |*args, **kwargs|
+          nxdomain.call(args[0])
+          kwargs.empty? ? original_open.call(*args) : original_open.call(*args, **kwargs)
+        }) do
+          error = assert_raises(DownloadClients::Base::ConnectionError) do
+            client.test_connection
+          end
+        end
+      end
+    end
+
+    assert_equal "Could not resolve host", error.message
+    assert_equal 1, lookups
+  ensure
+    WebMock.disable_net_connect!
+  end
+
+  test "hostname resolution counts against the qBittorrent connect timeout" do
+    host = "slow-qbittorrent.example"
+    client = client_for("http://#{host}:8080")
+    client.define_singleton_method(:login_connection) do
+      api_connection(timeout: 1, open_timeout: 0.25)
+    end
+    lookups = 0
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    error = nil
+    count_lookup = lambda { |name|
+      next unless name == host
+
+      lookups += 1
+      sleep 0.7
+      true
+    }
+
+    VCR.turned_off do
+      WebMock.allow_net_connect!
+      Addrinfo.stub(:getaddrinfo, lambda { |*args, **_kwargs|
+        count_lookup.call(args[0])
+        []
+      }) do
+        TCPSocket.stub(:open, lambda { |*args, **_kwargs|
+          count_lookup.call(args[0])
+          raise Errno::ETIMEDOUT
+        }) do
+          error = assert_raises(DownloadClients::Base::ConnectionError) do
+            client.test_connection
+          end
+        end
+      end
+    end
+
+    assert_equal 1, lookups
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 0.55
+    assert_equal "Connection timed out", error.message
+  ensure
+    WebMock.disable_net_connect!
+  end
+
+  test "refused addresses raise connection refused without another connect" do
+    port = unused_port
+    client = client_for("http://127.0.0.1:#{port}")
+    opens = 0
+    original_open = TCPSocket.method(:open)
+    addresses = [ Addrinfo.tcp("127.0.0.1", port), Addrinfo.tcp("127.0.0.2", port) ]
+    error = nil
+
+    VCR.turned_off do
+      WebMock.allow_net_connect!
+      Addrinfo.stub(:getaddrinfo, ->(*_args, **_kwargs) { addresses }) do
+        TCPSocket.stub(:open, lambda { |*args, **kwargs|
+          opens += 1
+          kwargs.empty? ? original_open.call(*args) : original_open.call(*args, **kwargs)
+        }) do
+          error = assert_raises(DownloadClients::Base::ConnectionError) do
+            client.test_connection
+          end
+        end
+      end
+    end
+
+    assert_equal "Connection refused", error.message
+    assert_equal 0, opens
+  ensure
+    WebMock.disable_net_connect!
+  end
+
+  test "test_connection times out without a second connect when every address is unreachable" do
+    clock = [ 0.0 ]
+    lookups = 0
+    connects = nil
+    error = nil
+    host = "blackhole-qbittorrent.example"
+    client = client_for("http://#{host}:8080")
+    addresses = [ Addrinfo.tcp("127.0.0.1", 9), Addrinfo.tcp("127.0.0.2", 9) ]
+
+    VCR.turned_off do
+      WebMock.allow_net_connect!
+      Process.stub(:clock_gettime, ->(*) { clock[0] }) do
+        IO.stub(:select, lambda { |*args, **_kwargs|
+          clock[0] += args[3].to_f
+          nil
+        }) do
+          Addrinfo.stub(:getaddrinfo, lambda { |*args, **_kwargs|
+            lookups += 1 if args[0] == host
+            addresses
+          }) do
+            connects = count_stubbed_connects do
+              error = assert_raises(DownloadClients::Base::ConnectionError) do
+                client.test_connection
+              end
+            end
+          end
+        end
+      end
+    end
+
+    assert_equal "Connection timed out", error.message
+    assert_equal 1, lookups
+    assert_equal 0, connects
+  ensure
+    WebMock.disable_net_connect!
+  end
+
   private
+
+  def client_for(url)
+    @client_record.update!(url: url)
+    @client_record.adapter
+  end
+
+  def unused_port
+    server = TCPServer.new("127.0.0.1", 0)
+    server.addr[1]
+  ensure
+    server&.close
+  end
+
+  def count_stubbed_connects
+    connects = 0
+    original = Net::HTTP.method(:new)
+    Net::HTTP.stub(:new, lambda { |*args, **kwargs|
+      http = kwargs.empty? ? original.call(*args) : original.call(*args, **kwargs)
+      http.define_singleton_method(:connect) do
+        connects += 1
+        raise Errno::ETIMEDOUT
+      end
+      http
+    }) { yield }
+
+    connects
+  end
+
+  def with_blackholed_ipv6_localhost(port)
+    rule = [ "-p", "tcp", "-d", "::1", "--dport", port.to_s, "-j", "DROP" ]
+    installed = system("sudo", "-n", "ip6tables", "-I", "INPUT", *rule, out: File::NULL, err: File::NULL)
+    raise "ip6tables could not blackhole ::1:#{port}" unless installed
+
+    yield
+  ensure
+    system("sudo", "-n", "ip6tables", "-D", "INPUT", *rule, out: File::NULL, err: File::NULL) if installed
+  end
+
+  # qBittorrent WebAPI bound to IPv4 loopback only. curl reaches it when ::1
+  # is blackholed; Net::HTTP's single open timeout does not.
+  class Ipv4OnlyQbittorrentApi
+    attr_reader :port, :login_body, :version_cookie
+
+    def self.start
+      server = new
+      server.start
+      server
+    end
+
+    def initialize
+      @tcp = TCPServer.new("127.0.0.1", 0)
+      @port = @tcp.addr[1]
+    end
+
+    def start
+      @thread = Thread.new do
+        loop do
+          client = @tcp.accept
+          serve(client)
+        rescue IOError, Errno::EBADF
+          break
+        rescue StandardError
+          client&.close
+        end
+      end
+    end
+
+    def stop
+      @tcp.close
+      @thread&.join(1)
+    end
+
+    private
+
+    def serve(client)
+      head = +""
+      while (line = client.gets)
+        head << line
+        break if line == "\r\n"
+      end
+      headers = head.lines.map(&:strip)
+      length = headers.grep(/\AContent-Length:/i).first.to_s.split(":", 2).last.to_i
+      body = length.positive? ? client.read(length).to_s : ""
+      path = headers.first.to_s.split[1]
+      response = response_for(path, headers, body)
+      client.write(response)
+    ensure
+      client&.close
+    end
+
+    def response_for(path, headers, body)
+      case path
+      when "/api/v2/auth/login"
+        @login_body = body
+        http_response(200, "Ok.", "Set-Cookie" => "SID=test_session_id; path=/")
+      when "/api/v2/app/version"
+        @version_cookie = headers.grep(/\ACookie:/i).first
+        http_response(200, "v4.6.0")
+      else
+        http_response(404, "")
+      end
+    end
+
+    def http_response(status, body, headers = {})
+      reason = status == 200 ? "OK" : "Not Found"
+      extra = headers.map { |key, value| "#{key}: #{value}\r\n" }.join
+      "HTTP/1.1 #{status} #{reason}\r\nContent-Length: #{body.bytesize}\r\n#{extra}Connection: close\r\n\r\n#{body}"
+    end
+  end
 
   def capture_add_torrent_request(url, **options)
     hash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
@@ -1680,5 +2016,48 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
 
   def qbittorrent_response(status:, body:, headers: {})
     Struct.new(:status, :body, :headers).new(status, body, headers)
+  end
+
+  def probe_addresses(addresses, sockets:, ready:)
+    selects = 0
+    Addrinfo.stub(:getaddrinfo, lambda { |*_args, **_kwargs| addresses }) do
+      Socket.stub(:new, sockets) do
+        IO.stub(:select, lambda { |*_args, **_kwargs|
+          selects += 1
+          selects == 1 ? [ nil, ready, [] ] : nil
+        }) do
+          deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 1
+          ReachableAddress.reachable_ipaddr("http://qbittorrent.example:8080", deadline)
+        end
+      end
+    end
+  end
+
+  def wait_writable_error
+    IOError.new("connect would block").tap { |error| error.extend(IO::WaitWritable) }
+  end
+
+  class ProbeSocket
+    Option = Struct.new(:int)
+
+    def initialize(failure: nil, fail_on_call: 1)
+      @failure = failure
+      @fail_on_call = fail_on_call
+      @calls = 0
+    end
+
+    def connect_nonblock(*_args, **_kwargs)
+      @calls += 1
+      raise @failure if @failure && @calls >= @fail_on_call
+
+      @calls == 1 ? :wait_writable : 0
+    end
+
+    def getsockopt(*_args, **_kwargs)
+      Option.new(0)
+    end
+
+    def close
+    end
   end
 end

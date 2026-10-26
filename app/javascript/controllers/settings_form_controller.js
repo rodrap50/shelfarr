@@ -30,13 +30,13 @@ export default class extends Controller {
     this.explicitSubmitInFlight = false;
     this.manualChangesPending = false;
     this.manualSettingKeys = new Set();
+    this.secretDrafts = new Map();
     this.deferredAction = null;
     this.historyIndex = window.history.state?.turbo?.restorationIndex;
     this.revertingHistory = false;
     this.replayingHistory = false;
     if (this.hasManualKeysTarget) this.manualKeysTarget.name = "manual_keys";
 
-    // Listen for Turbo events to manage status
     this.boundHandleSubmitEnd = this.handleSubmitEnd.bind(this);
     this.boundHandleBeforeVisit = this.handleBeforeVisit.bind(this);
     this.boundHandleBeforeRender = this.handleBeforeRender.bind(this);
@@ -53,6 +53,8 @@ export default class extends Controller {
     this.element.addEventListener("submit", this.boundHandleExternalSubmit, true);
     this.element.addEventListener("change", this.boundHandleManualChange, true);
     this.element.addEventListener("beforeinput", this.boundHandleManualInput, true);
+    this.element.addEventListener("paste", this.boundHandleManualInput, true);
+    this.element.addEventListener("input", this.boundHandleManualInput, true);
     window.addEventListener("beforeunload", this.boundHandleBeforeUnload);
     window.settingsNavigationGuard = this.boundHandlePopState;
 
@@ -70,6 +72,8 @@ export default class extends Controller {
     this.element.removeEventListener("submit", this.boundHandleExternalSubmit, true);
     this.element.removeEventListener("change", this.boundHandleManualChange, true);
     this.element.removeEventListener("beforeinput", this.boundHandleManualInput, true);
+    this.element.removeEventListener("paste", this.boundHandleManualInput, true);
+    this.element.removeEventListener("input", this.boundHandleManualInput, true);
     window.removeEventListener("beforeunload", this.boundHandleBeforeUnload);
     if (window.settingsNavigationGuard === this.boundHandlePopState) delete window.settingsNavigationGuard;
   }
@@ -80,15 +84,12 @@ export default class extends Controller {
 
     this.pendingSettingKeys.add(settingKey);
 
-    // Clear any pending save
     if (this.saveTimeout) {
       clearTimeout(this.saveTimeout);
     }
 
-    // Show saving indicator
     this.showStatus("Saving...");
 
-    // Debounce the save - wait 800ms after last change
     this.saveTimeout = setTimeout(() => {
       this.submitForm();
     }, 800);
@@ -166,17 +167,17 @@ export default class extends Controller {
     // indexer URL is mid-edit or on a hidden tab (where the browser bubble is
     // easy to miss). The form uses novalidate; type="url" remains a soft hint.
     this.inFlightSettingKeys = new Set(this.pendingSettingKeys);
-    this.autosaveKeysTarget.value = [...this.inFlightSettingKeys].join(",");
     this.pendingSettingKeys.clear();
     this.saveTimeout = null;
     this.autosaveInFlight = true;
-    this.syncManualSettingManifest();
+    this.buildPayload(this.autosaveSubmitTarget);
     this.formTarget.requestSubmit(this.autosaveSubmitTarget);
     this.setFormBusy(true);
   }
 
   handleSubmit(event) {
     if (event.submitter === this.autosaveSubmitTarget) return;
+    if (event.submitter?.dataset?.connectionProbe === "true") return;
 
     const saveAll = event.submitter?.name === "commit";
     if (!saveAll && this.manualChangesPending) {
@@ -196,8 +197,11 @@ export default class extends Controller {
     }
 
     this.clearSaveTimeout();
-    if (saveAll && this.hasManualKeysTarget) {
-      this.explicitSubmittedSettingKeys = this.syncManualSettingManifest();
+    if (saveAll) {
+      const { submittedKeys } = this.buildPayload(event.submitter);
+      if (this.hasManualKeysTarget) {
+        this.explicitSubmittedSettingKeys = submittedKeys;
+      }
     }
     this.explicitInFlightSettingKeys = saveAll ? new Set(this.pendingSettingKeys) : new Set();
     if (saveAll) {
@@ -337,9 +341,46 @@ export default class extends Controller {
   }
 
   handleManualInput(event) {
-    if (!event.target.matches("[data-settings-form-manual-save]") || event.target !== document.activeElement) return;
+    const field = event.target;
+    if (!(field instanceof HTMLElement) || !field.matches("[data-settings-form-manual-save]")) return;
+    if (field !== document.activeElement) return;
+    if ((event.type === "input" || event.type === "beforeinput") && !this.directUserInput(event.inputType)) return;
+    // A paste event fires before the browser inserts text, and also fires when
+    // the clipboard does not change the value. Wait until after insertion and
+    // ignore a no-op so a prefilled autofill is not saved as a user edit.
+    if (event.type === "paste") {
+      this.capturePaste(field);
+      return;
+    }
 
-    this.markManualField(event.target);
+    this.markManualField(field);
+    if (event.type !== "beforeinput") this.rememberSecretDraft(field);
+  }
+
+  directUserInput(inputType) {
+    return Boolean(inputType);
+  }
+
+  buildPayload(submitter) {
+    if (submitter?.name === "commit") this.restoreSecretDrafts();
+    if (submitter === this.autosaveSubmitTarget && this.hasAutosaveKeysTarget) {
+      this.autosaveKeysTarget.value = [...this.inFlightSettingKeys].join(",");
+    }
+    const submittedKeys = this.syncManualSettingManifest();
+    return {
+      submittedKeys,
+      body: new FormData(this.formTarget, submitter)
+    };
+  }
+
+  capturePaste(field) {
+    const valueBeforePaste = field.value;
+    setTimeout(() => {
+      if (!field.isConnected || field.value === valueBeforePaste) return;
+
+      this.markManualField(field);
+      this.rememberSecretDraft(field);
+    }, 0);
   }
 
   handleBeforeUnload(event) {
@@ -413,16 +454,15 @@ export default class extends Controller {
     }
 
     this.inFlightSettingKeys = new Set(this.pendingSettingKeys);
-    this.autosaveKeysTarget.value = [...this.inFlightSettingKeys].join(",");
     this.pendingSettingKeys.clear();
     this.autosaveInFlight = true;
     this.setFormBusy(true);
-    this.syncManualSettingManifest();
+    const { body: formBody } = this.buildPayload(this.autosaveSubmitTarget);
 
     try {
       const response = await window.fetch(this.formTarget.action, {
         method: this.formTarget.method,
-        body: new FormData(this.formTarget, this.autosaveSubmitTarget),
+        body: formBody,
         credentials: "same-origin",
         headers: { Accept: "text/vnd.turbo-stream.html" }
       });
@@ -512,6 +552,25 @@ export default class extends Controller {
     this.showStatus("Save all changes before running this action.");
   }
 
+  rememberSecretDraft(field) {
+    const key = this.settingKey(field.name);
+    if (!key || field.type !== "password") return;
+
+    this.secretDrafts.set(key, field.value);
+  }
+
+  restoreSecretDrafts() {
+    if (!this.hasFormTarget) return;
+
+    this.formTarget.querySelectorAll('input[type="password"]').forEach((field) => {
+      const key = this.settingKey(field.name);
+      if (!key || field.value !== "" || !this.manualSettingKeys.has(key)) return;
+
+      const draft = this.secretDrafts.get(key);
+      if (draft) field.value = draft;
+    });
+  }
+
   markManualField(field) {
     const key = this.settingKey(field.name);
     if (!key) return;
@@ -550,9 +609,16 @@ export default class extends Controller {
     }
   }
 
-  clearSecretFields(keys) {
+  clearSecretFields(submittedKeys) {
+    if (!submittedKeys || !this.hasFormTarget) return;
+
     this.formTarget.querySelectorAll('input[type="password"]').forEach((field) => {
-      if (keys.has(this.settingKey(field.name))) field.value = "";
+      const key = this.settingKey(field.name);
+      if (!submittedKeys.has(key)) return;
+
+      if (field.value.trim() !== "") field.placeholder = "********";
+      field.value = "";
+      this.secretDrafts.delete(key);
     });
   }
 

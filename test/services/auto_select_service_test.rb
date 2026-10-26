@@ -43,7 +43,6 @@ class AutoSelectServiceTest < ActiveSupport::TestCase
   end
 
   test "skips when no downloadable results" do
-    # Result without download link or magnet
     create_search_result(seeders: 10)
 
     selection = AutoSelectService.call(@request)
@@ -79,7 +78,6 @@ class AutoSelectServiceTest < ActiveSupport::TestCase
       category: "auto_select"
     )
 
-    # Usenet result has no seeders but download_url with nzb
     result = create_search_result(
       seeders: nil,
       download_url: "http://example.com/download.nzb"
@@ -171,14 +169,12 @@ class AutoSelectServiceTest < ActiveSupport::TestCase
   end
 
   test "selects best result first based on ordering" do
-    # Create results with different quality levels
     low_seeder = create_search_result(seeders: 5, magnet_url: "magnet:?low")
     high_seeder = create_search_result(seeders: 100, magnet_url: "magnet:?high")
 
     selection = AutoSelectService.call(@request)
 
     assert selection.success?
-    # best_first scope orders by preferred type then seeders desc
     assert_equal high_seeder, selection.search_result
   end
 
@@ -415,8 +411,15 @@ class AutoSelectServiceTest < ActiveSupport::TestCase
     )
   end
 
+  test "auto-selects a 100-confidence release whose title contains FRENCH" do
+    assert_french_release_auto_selected("The Pending Ebook.Another.Author.2026.FRENCH.ePUB.")
+  end
+
+  test "auto-selects a 100-confidence release whose title contains TRUEFRENCH" do
+    assert_french_release_auto_selected("The Pending Ebook.Another.Author.2024.TRUEFRENCH.EPUB")
+  end
+
   test "selection result error reason works" do
-    # Test that the SelectionResult with error reason works correctly
     result = AutoSelectService::SelectionResult.new(selected: false, reason: :error)
 
     refute result.success?
@@ -425,6 +428,30 @@ class AutoSelectServiceTest < ActiveSupport::TestCase
   end
 
   private
+
+  def assert_french_release_auto_selected(title)
+    @request.update!(language: "fr")
+    result = create_search_result(
+      title: title,
+      seeders: nil,
+      download_url: "http://example.com/#{SecureRandom.hex(8)}.nzb",
+      magnet_url: nil,
+      confidence_score: nil,
+      detected_language: nil
+    )
+    result.calculate_score!
+
+    assert_equal 100, result.score_breakdown["language"], title
+    assert_equal 100, result.confidence_score, title
+    assert_equal "fr", result.detected_language, title
+
+    assert_enqueued_with(job: DownloadJob) do
+      selection = AutoSelectService.call(@request)
+
+      assert selection.success?, selection.reason.to_s
+      assert_equal result, selection.search_result
+    end
+  end
 
   def assert_comic_title_not_auto_selected(
     series:,
