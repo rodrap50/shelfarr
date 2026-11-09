@@ -776,7 +776,10 @@ class SearchJob < ApplicationJob
       return
     end
 
-    result = AutoSelectService.call(request)
+    result = AutoSelectService.call(
+      request,
+      replace_library_file: request.library_replacement_consent?
+    )
 
     if result.success?
       Rails.logger.info "[SearchJob] Auto-selected result for request ##{request.id}"
@@ -878,7 +881,8 @@ class SearchJob < ApplicationJob
       title: result.title,
       seeders: result.seeders,
       download_url: result.download_url,
-      magnet_url: result.magnet_url
+      magnet_url: result.magnet_url,
+      size_bytes: result.size_bytes
     )
   end
 
@@ -887,8 +891,18 @@ class SearchJob < ApplicationJob
 
     Array(results).select do |tagged_result|
       broad_result_candidate?(tagged_result, request) &&
-        penalized_indexer_score(tagged_result, request) >= threshold
+        retention_indexer_score(tagged_result, request) >= threshold
     end
+  end
+
+  # The size penalty still lowers the stored score used for rank, display,
+  # and auto-select. Retention uses the score from before that penalty so an
+  # oversized match stays visible for manual review.
+  def retention_indexer_score(tagged_result, request)
+    result = indexer_result_from(tagged_result)
+    score = ReleaseScorer.score(search_result_for_scoring(result), request)
+    penalty = tagged_result.is_a?(Hash) ? tagged_result[:score_penalty].to_i : 0
+    [ score.total_before_file_size - penalty, 0 ].max
   end
 
   # Baseline sanity check for results found without category restrictions:
@@ -1010,7 +1024,9 @@ class SearchJob < ApplicationJob
       end
 
       attempts << build_search_attempt(:author_title, [ book.author, preferred_title, language_hint ])
-      attempts << build_search_attempt(:normalized_title, [ normalized_search_title(preferred_title), language_hint ])
+      normalized_search_queries(preferred_title).each do |normalized|
+        attempts << build_search_attempt(:normalized_title, [ normalized, language_hint ])
+      end
 
       numeric_title_variants(preferred_title).each do |title_variant|
         attempts << build_search_attempt(:number_variant, [ title_variant, language_hint ])
@@ -1136,10 +1152,16 @@ class SearchJob < ApplicationJob
   end
 
   def normalized_search_title(title)
-    prepared = title.to_s
-      .gsub(/\([^)]*\)|\[[^\]]*\]/, " ")
-      .gsub(/\b(?:volume|vol\.?|book|part)\s+(\d+)\b/i, "\\1")
-    TitleKey.new(prepared).spaced
+    normalized_search_queries(title).last.to_s
+  end
+
+  # Punctuation-normalized words stay searchable when stripping a marker would
+  # also delete an ordinary word ("Book I Wish" -> "1 Wish").
+  def normalized_search_queries(title)
+    prepared = title.to_s.gsub(/\([^)]*\)|\[[^\]]*\]/, " ")
+    stripped = TitleKey.new(SequenceMarker.strip(prepared)).spaced
+    words = TitleKey.new(prepared).spaced
+    [ words, stripped ].compact_blank.uniq.presence || [ "" ]
   end
 
   def numeric_title_variants(title)

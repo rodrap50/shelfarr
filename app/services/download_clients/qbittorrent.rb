@@ -9,6 +9,12 @@ module DownloadClients
   class Qbittorrent < Base
     DEFAULT_TORRENT_VERIFICATION_MAX_ATTEMPTS = 10
     DEFAULT_TORRENT_VERIFICATION_WAIT_TIME = 2
+    HASH_DETECTION_ATTEMPTS = 30
+    HASH_DETECTION_INTERVAL = 1
+    # Tags on torrents/add arrived in WebAPI 2.6.2. Older clients ignore the field.
+    DISPATCH_TAG_MIN_WEBAPI = Gem::Version.new("2.6.2")
+    DISPATCH_TAG_PATTERN = /\Ashelfarr-[0-9a-f]{16}\z/
+    WEBAPI_VERSION_PATTERN = /\A\d+(?:\.\d+){0,3}\z/
 
     def add_torrent(url, options = {})
       ensure_authenticated!
@@ -18,55 +24,80 @@ module DownloadClients
       precomputed_hash = prepared[:hash]
       torrent_data = prepared[:torrent_data]
 
-      # Only capture existing hashes if we couldn't pre-compute the hash
-      # This is the fallback for edge cases where hash extraction fails
       category = config.category.presence
-      existing_hashes = precomputed_hash.present? ? nil : fetch_torrent_hashes(category: category)
-
-      response = if torrent_data.present?
-        upload_torrent_file(torrent_data, options)
-      else
-        params = build_add_torrent_params(urls: submit_url, options: options)
-        connection.post("api/v2/torrents/add", params)
+      # The info hash is unknown, so this tag is the only proof the torrent came from this add.
+      # Check tag support before the remote add; a client that drops tags cannot be correlated safely.
+      dispatch_tag = nil
+      # Mark reconciliation before the add. A later poll error must still schedule
+      # cleanup, because qBittorrent can recreate the tag when a URL fetch finishes.
+      needs_tag_reconciliation = false
+      tag_delete_attempted = false
+      if precomputed_hash.blank?
+        ensure_dispatch_tags_supported!
+        dispatch_tag = new_dispatch_tag
+        needs_tag_reconciliation = true
       end
 
-      case response.status
-      when 200, 202
-        success_response = parse_add_torrent_success_response(response.body)
-        return nil unless success_response
+      begin
+        response = if torrent_data.present?
+          upload_torrent_file(torrent_data, options)
+        else
+          params = build_add_torrent_params(urls: submit_url, options: options, tag: dispatch_tag)
+          connection.post("api/v2/torrents/add", params)
+        end
 
-        return success_response[:torrent_id] if success_response[:torrent_id].present?
+        case response.status
+        when 200, 202
+          success_response = parse_add_torrent_success_response(response.body)
+          return nil unless success_response
 
-        # Return pre-computed hash if available (eliminates race condition)
-        if precomputed_hash.present?
-          Rails.logger.info "[Qbittorrent] Using pre-computed hash: #{precomputed_hash}"
-
-          # Verify torrent was actually added (qBittorrent returns "Ok." even when it fails silently)
-          if verify_torrent_added(precomputed_hash)
-            return precomputed_hash
-          else
-            Rails.logger.error "[Qbittorrent] Torrent #{precomputed_hash} not found after adding to #{config.name} - " \
-                               "qBittorrent may have rejected it (check disk permissions, save path, or duplicate torrent)"
-            return nil
+          if success_response[:torrent_id].present?
+            if dispatch_tag
+              tag_delete_attempted = true
+              needs_tag_reconciliation = !dispatch_tag_deleted?(dispatch_tag)
+            end
+            return success_response[:torrent_id]
           end
-        end
 
-        # Fallback: detect the newly added torrent by comparing hashes
-        # This path is only taken if hash extraction failed
-        Rails.logger.warn "[Qbittorrent] Falling back to polling for hash detection (race condition possible)"
-        find_newly_added_torrent_hash(existing_hashes, category: category)
-      when 409
-        handle_add_conflict(precomputed_hash)
-      when 401, 403
-        clear_session!
-        raise Base::AuthenticationError, "qBittorrent authentication failed"
-      else
-        Rails.logger.error "[Qbittorrent] Failed to add torrent: #{response.status} - #{response.body}"
-        if transient_http_status?(response.status)
-          raise Base::ConnectionError, "qBittorrent API error: #{response.status}"
-        end
+          # Return pre-computed hash if available (eliminates race condition)
+          if precomputed_hash.present?
+            Rails.logger.info "[Qbittorrent] Using pre-computed hash: #{precomputed_hash}"
 
-        nil
+            # Verify torrent was actually added (qBittorrent returns "Ok." even when it fails silently)
+            if verify_torrent_added(precomputed_hash)
+              return precomputed_hash
+            else
+              Rails.logger.error "[Qbittorrent] Torrent #{precomputed_hash} not found after adding to #{config.name} - " \
+                                 "qBittorrent may have rejected it (check disk permissions, save path, or duplicate torrent)"
+              return nil
+            end
+          end
+
+          Rails.logger.warn "[Qbittorrent] Falling back to tagged hash detection for #{dispatch_tag}"
+          hash = find_torrent_hash_by_dispatch_tag(dispatch_tag, category: category)
+          if hash.present?
+            tag_delete_attempted = true
+            needs_tag_reconciliation = !dispatch_tag_deleted?(dispatch_tag)
+          end
+          hash
+        when 409
+          handle_add_conflict(precomputed_hash)
+        when 401, 403
+          clear_session!
+          raise Base::AuthenticationError, "qBittorrent authentication failed"
+        else
+          Rails.logger.error "[Qbittorrent] Failed to add torrent: #{response.status} - #{response.body}"
+          if transient_http_status?(response.status)
+            raise Base::ConnectionError, "qBittorrent API error: #{response.status}"
+          end
+
+          nil
+        end
+      ensure
+        if needs_tag_reconciliation && dispatch_tag
+          delete_dispatch_tag(dispatch_tag) unless tag_delete_attempted
+          schedule_abandoned_dispatch_tag_cleanup(dispatch_tag)
+        end
       end
     rescue Faraday::Error => e
       raise Base::ConnectionError, "Failed to connect to qBittorrent: #{e.message}"
@@ -120,6 +151,12 @@ module DownloadClients
         connection_error: Base::ConnectionError,
         authentication_error: Base::AuthenticationError
       )
+    end
+
+    def remove_dispatch_tag(tag)
+      return unless tag.is_a?(String) && tag.match?(DISPATCH_TAG_PATTERN)
+
+      delete_dispatch_tag(tag)
     end
 
     def remove_torrent(hash, delete_files: false)
@@ -398,35 +435,142 @@ module DownloadClients
       RemoteResult::Failed.new(error)
     end
 
-    def fetch_torrent_hashes(category: nil)
-      params = category.present? ? { category: category } : {}
-      response = connection.get("api/v2/torrents/info", params)
-      return Set.new unless response.status == 200
-
-      Set.new(Array(response.body).map { |t| t["hash"] })
+    def new_dispatch_tag
+      "shelfarr-#{SecureRandom.hex(8)}"
     end
 
-    # Poll for a newly added torrent by comparing against existing hashes
-    # This is more reliable than querying "most recent" which can race with other downloads
-    # Filters by category to reduce false positives from torrents added by other programs
-    def find_newly_added_torrent_hash(existing_hashes, category: nil)
-      max_wait_seconds = 30
+    def schedule_abandoned_dispatch_tag_cleanup(tag)
+      return if tag.blank? || config.id.nil?
 
-      max_wait_seconds.times do |attempt|
-        sleep 1
+      QbittorrentDispatchTagCleanupJob.schedule(config.id, tag)
+    rescue StandardError => error
+      Rails.logger.warn "[Qbittorrent] Failed to schedule dispatch tag cleanup: #{error.class}"
+    end
 
-        current_hashes = fetch_torrent_hashes(category: category)
-        new_hashes = current_hashes - existing_hashes
+    # qBittorrent keeps tags in a global registry after the torrent is removed.
+    # A non-success means the tag may still exist, so the caller can schedule another delete.
+    def delete_dispatch_tag(tag)
+      return true if tag.blank?
 
-        if new_hashes.any?
-          hash = new_hashes.first
-          Rails.logger.info "[Qbittorrent] Detected new torrent hash after #{attempt + 1}s: #{hash}"
+      response = post_delete_dispatch_tag(tag)
+      # A cached SID can outlive qBittorrent's session. One rejected call is not
+      # proof the tag is gone, so drop that cookie and try a fresh login once.
+      if rejected_session?(response) && api_key.blank?
+        clear_session!
+        response = post_delete_dispatch_tag(tag)
+        clear_session! if rejected_session?(response)
+      end
+      return true if response.status == 200
+
+      Rails.logger.warn "[Qbittorrent] Failed to delete dispatch tag #{tag}: HTTP #{response.status}"
+      false
+    rescue StandardError => error
+      Rails.logger.warn "[Qbittorrent] Failed to delete dispatch tag #{tag}: #{error.class} - #{error.message}"
+      RemoteResult::Failed.new(error)
+    end
+
+    def post_delete_dispatch_tag(tag)
+      ensure_authenticated!
+      connection.post("api/v2/torrents/deleteTags", { tags: tag })
+    end
+
+    def rejected_session?(response)
+      response.status == 401 || response.status == 403
+    end
+
+    def dispatch_tag_deleted?(tag)
+      RemoteResult.succeeded?(delete_dispatch_tag(tag))
+    end
+
+    def ensure_dispatch_tags_supported!
+      return if dispatch_tags_supported?
+
+      raise Base::ConfigurationError, unsupported_dispatch_tags_message
+    end
+
+    def dispatch_tags_supported?
+      version = webapi_version
+      version.present? && version >= DISPATCH_TAG_MIN_WEBAPI
+    end
+
+    def unsupported_dispatch_tags_message
+      reported = " (reported WebAPI #{@reported_webapi_version})" if @reported_webapi_version.present?
+      "qBittorrent cannot tag an unhashed torrent#{reported}. Tags on add require WebAPI 2.6.2 or newer"
+    end
+
+    def webapi_version
+      response = connection.get("api/v2/app/webapiVersion")
+      case response.status
+      when 200
+        parse_webapi_version(response.body)
+      when 401, 403
+        clear_session!
+        raise Base::AuthenticationError, "qBittorrent authentication failed"
+      else
+        if transient_http_status?(response.status)
+          raise Base::ConnectionError, "qBittorrent API error: #{response.status}"
+        end
+
+        @reported_webapi_version = nil
+        nil
+      end
+    end
+
+    def parse_webapi_version(body)
+      raw = webapi_version_text(body)
+      @reported_webapi_version = raw
+      return nil unless raw&.match?(WEBAPI_VERSION_PATTERN)
+
+      Gem::Version.new(raw)
+    end
+
+    def webapi_version_text(body)
+      text = body.is_a?(Hash) ? body["webapiVersion"] : body
+      text.to_s.strip.presence
+    end
+
+    def fetch_torrents(tag: nil, category: nil)
+      params = {}
+      params[:category] = category if category.present?
+      params[:tag] = tag if tag.present?
+      response = connection.get("api/v2/torrents/info", params)
+      return [] unless response.status == 200
+
+      Array(response.body).select { |torrent| torrent.is_a?(Hash) }
+    end
+
+    def find_torrent_hash_by_dispatch_tag(tag, category:)
+      return nil if tag.blank?
+
+      HASH_DETECTION_ATTEMPTS.times do |attempt|
+        hash = hash_for_dispatch_tag(tag, category: category)
+        if hash.present?
+          Rails.logger.info "[Qbittorrent] Detected tagged torrent hash after #{attempt}s: #{hash}"
           return hash
         end
+
+        sleep HASH_DETECTION_INTERVAL
       end
 
-      Rails.logger.warn "[Qbittorrent] No new torrent detected after #{max_wait_seconds} seconds"
+      Rails.logger.warn "[Qbittorrent] No torrent tagged #{tag} detected after #{HASH_DETECTION_ATTEMPTS} seconds"
       nil
+    end
+
+    def hash_for_dispatch_tag(tag, category:)
+      fetch_torrents(tag: tag, category: category).each do |torrent|
+        next unless torrent_has_dispatch_tag?(torrent, tag)
+
+        hash = torrent["hash"].to_s.presence
+        return hash if hash
+      end
+      nil
+    end
+
+    def torrent_has_dispatch_tag?(torrent, tag)
+      raw_tags = torrent["tags"]
+      return false unless raw_tags.is_a?(String)
+
+      raw_tags.split(",").map(&:strip).include?(tag)
     end
 
     def handle_add_conflict(precomputed_hash)
@@ -604,7 +748,7 @@ module DownloadClients
       end
     end
 
-    def build_add_torrent_params(urls: nil, options: {})
+    def build_add_torrent_params(urls: nil, options: {}, tag: nil)
       params = {}
       params[:urls] = urls if urls.present?
       params[:category] = config.category if config.category.present?
@@ -612,6 +756,7 @@ module DownloadClients
       params[:paused] = options[:paused] ? "true" : "false" if options.key?(:paused)
       apply_seed_limits!(params, options)
       params.merge!(adapter_specific_add_torrent_params)
+      params[:tags] = tag if tag.present?
       params
     end
 

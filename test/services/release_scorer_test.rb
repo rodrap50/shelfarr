@@ -1081,4 +1081,611 @@ class ReleaseScorerTest < ActiveSupport::TestCase
     refute result.medium_confidence?
     assert result.low_confidence?
   end
+
+  test "scores a cross-language volume marker as an exact title match" do
+    score_for = lambda do |title, release_title|
+      book = Book.create!(title: title, author: "Andrzej Sapkowski", book_type: :ebook)
+      request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+      ReleaseScorer.score(SearchResult.new(title: release_title, seeders: 50), request)
+    end
+    baseline = score_for.call(
+      "The Witcher Part 2",
+      "The Witcher Part 2 - Andrzej Sapkowski EPUB"
+    )
+
+    assert_equal 100, baseline.breakdown[:title]
+    [
+      "The Witcher Tome 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Partie 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Livre 2 - Andrzej Sapkowski EPUB",
+      "The Witcher T2 - Andrzej Sapkowski EPUB",
+      "The Witcher T.2 - Andrzej Sapkowski EPUB",
+      "The Witcher T02 - Andrzej Sapkowski EPUB",
+      "The Witcher Band 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Teil 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Buch 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Tomo 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Parte 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Libro 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Livro 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Volumen 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Deel 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Boek 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Tome II - Andrzej Sapkowski EPUB",
+      "The Witcher Part. 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Volume 2 - Andrzej Sapkowski EPUB",
+      "The Witcher Book 2 - Andrzej Sapkowski EPUB"
+    ].each do |release_title|
+      score = score_for.call("The Witcher Part 2", release_title)
+
+      assert_equal baseline.breakdown[:title], score.breakdown[:title], release_title
+      assert_equal baseline.total, score.total, release_title
+    end
+  end
+
+  test "scores agreeing split-volume numbers as an exact title match" do
+    book = Book.create!(
+      title: "Chronicles of the Northern Sea Tome 3 Partie 1",
+      author: "Ada Lovelace",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "Chronicles of the Northern Sea Book 3 Part 1 - Ada Lovelace EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title]
+  end
+
+  test "does not score a different volume number as the same title" do
+    book = Book.create!(
+      title: "Chronicles of the Northern Sea Book 2",
+      author: "Ada Lovelace",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "Chronicles of the Northern Sea Tome 3 - Ada Lovelace EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 0, score.breakdown[:title]
+  end
+
+  test "does not score pocket splits that differ by part as the same title" do
+    book = Book.create!(
+      title: "Chronicles of the Northern Sea Tome 3 Partie 1",
+      author: "Ada Lovelace",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "Chronicles of the Northern Sea Tome 3 Partie 2 - Ada Lovelace EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 0, score.breakdown[:title]
+  end
+
+  test "scores abbreviated author initials above the auto-select threshold" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(title: "The Red Book", author: "Carl Gustav Jung", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "The Red Book C. G. Jung English EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title], score.breakdown.inspect
+    assert_operator score.total, :>=, 90, "total #{score.total} breakdown #{score.breakdown.inspect}"
+    assert score.high_confidence?, score.total.to_s
+  end
+
+  test "scores a parenthesized publication year above the auto-select threshold" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(title: "The Jungle Book", author: "Rudyard Kipling", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "Rudyard Kipling - The Jungle Book (1894) English EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title], score.breakdown.inspect
+    assert_operator score.total, :>=, 90, "total #{score.total} breakdown #{score.breakdown.inspect}"
+    assert score.high_confidence?, score.total.to_s
+  end
+
+  test "scores a possessive author title above the auto-select threshold" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(
+      title: "William Shakespeare's Hamlet",
+      author: "William Shakespeare",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(
+        title: "William Shakespeare's Hamlet - William Shakespeare English EPUB",
+        seeders: 50
+      ),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title], score.breakdown.inspect
+    assert_operator score.total, :>=, 90, "total #{score.total} breakdown #{score.breakdown.inspect}"
+    assert score.high_confidence?, score.total.to_s
+  end
+
+  test "does not score author initials as a volume marker" do
+    book = Book.create!(title: "The Red Book", author: "C. G. Jung", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "The Red Book C. G. Jung English EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title]
+  end
+
+  test "still scores a real volume when the release also names the author" do
+    book = Book.create!(title: "The Red Book Volume 2", author: "C. G. Jung", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    matching = ReleaseScorer.score(
+      SearchResult.new(title: "The Red Book Volume 2 C. G. Jung English EPUB", seeders: 50),
+      request
+    )
+    conflicting = ReleaseScorer.score(
+      SearchResult.new(title: "The Red Book Volume 3 C. G. Jung English EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, matching.breakdown[:title]
+    assert_equal 0, conflicting.breakdown[:title]
+  end
+
+  test "scores a contraction the same as the title without inventing a volume" do
+    book = Book.create!(title: "Don't I Know You?", author: "Ada Lovelace", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "Dont I Know You Ada Lovelace EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title]
+  end
+
+  test "scores a hyphenated part release as the spaced part" do
+    book = Book.create!(title: "Dune Part 2", author: "Frank Herbert", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "Dune Part-2 - Frank Herbert EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title]
+  end
+
+  test "scores a hashed volume marker as the spelled volume" do
+    book = Book.create!(title: "Bleach Volume 2", author: "Tite Kubo", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "Bleach Vol. #2 Tite Kubo EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title]
+  end
+
+  test "does not treat an unnumbered marker word as a volume while scoring" do
+    brothers = Book.create!(title: "Band of Brothers", author: "Stephen E. Ambrose", book_type: :ebook)
+    parte = Book.create!(title: "La parte oscura del libro", author: "Mariana Enriquez", book_type: :ebook)
+    brothers_request = Request.create!(book: brothers, user: @user, status: :pending, language: "en")
+    parte_request = Request.create!(book: parte, user: @user, status: :pending, language: "es")
+
+    assert_equal 100, ReleaseScorer.score(
+      SearchResult.new(title: "Band of Brothers - Stephen E. Ambrose EPUB", seeders: 50),
+      brothers_request
+    ).breakdown[:title]
+    assert_operator ReleaseScorer.score(
+      SearchResult.new(title: "Tome 2 - Stephen E. Ambrose EPUB", seeders: 50),
+      brothers_request
+    ).breakdown[:title], :<, 100
+    assert_equal 100, ReleaseScorer.score(
+      SearchResult.new(title: "La parte oscura del libro - Mariana Enriquez EPUB", seeders: 50),
+      parte_request
+    ).breakdown[:title]
+    assert_operator ReleaseScorer.score(
+      SearchResult.new(title: "Libro 2 - Mariana Enriquez EPUB", seeders: 50),
+      parte_request
+    ).breakdown[:title], :<, 100
+  end
+
+  test "scores an underscored volume marker above the auto-select threshold" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(title: "Attack on Titan Vol 2", author: "Hajime Isayama", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "Attack_on_Titan_Vol_2 - Hajime Isayama English EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title], score.breakdown.inspect
+    assert_operator score.total, :>=, 90, "total #{score.total} breakdown #{score.breakdown.inspect}"
+    assert score.high_confidence?, score.total.to_s
+  end
+
+  test "scores a dotted possessive title above the auto-select threshold" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(
+      title: "William Shakespeare's Hamlet",
+      author: "William Shakespeare",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(
+        title: "William.Shakespeare.s.Hamlet.-.William.Shakespeare.English.EPUB",
+        seeders: 50
+      ),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title], score.breakdown.inspect
+    assert_operator score.total, :>=, 90, "total #{score.total} breakdown #{score.breakdown.inspect}"
+    assert score.high_confidence?, score.total.to_s
+  end
+
+  test "scores an extra undotted middle initial above the auto-select threshold" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(title: "The Red Book", author: "Carl Jung", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "The Red Book C G Jung English EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title], score.breakdown.inspect
+    assert score.breakdown[:auto_select_allowed], score.breakdown.inspect
+    assert_operator score.total, :>=, 90, "total #{score.total} breakdown #{score.breakdown.inspect}"
+    assert score.high_confidence?, score.total.to_s
+  end
+
+  test "scores undotted author initials above the auto-select threshold" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(title: "The Red Book", author: "Carl Gustav Jung", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+
+    [
+      "The Red Book C G Jung English EPUB",
+      "The Red Book C. Jung English EPUB"
+    ].each do |release_title|
+      score = ReleaseScorer.score(
+        SearchResult.new(title: release_title, seeders: 50),
+        request
+      )
+
+      assert_equal 100, score.breakdown[:title], "#{release_title} #{score.breakdown.inspect}"
+      assert_operator score.total, :>=, 90, "#{release_title} total #{score.total} breakdown #{score.breakdown.inspect}"
+      assert score.high_confidence?, "#{release_title} #{score.total}"
+    end
+  end
+
+  test "scores the author inside the title when only the volume marker differs" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(
+      title: "The Collected Works of C. G. Jung Volume 1",
+      author: "C. G. Jung",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(
+        title: "The Collected Works of C. G. Jung Band 1 - C. G. Jung English EPUB",
+        seeders: 50
+      ),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title], score.breakdown.inspect
+    assert_operator score.total, :>=, 90, "total #{score.total} breakdown #{score.breakdown.inspect}"
+  end
+
+  test "scores a curly apostrophe volume against a straight apostrophe release" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(
+      title: "L\u2019Attaque des Titans Volume 2",
+      author: "Hajime Isayama",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(title: "L'Attaque des Titans Volume 2 - Hajime Isayama EPUB", seeders: 50),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title], score.breakdown.inspect
+  end
+
+  test "scores an abbreviated roman volume before a part label above the auto-select threshold" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(
+      title: "Les Mis\u00E9rables Tome 5 Partie 1",
+      author: "Victor Hugo",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "fr")
+    score = ReleaseScorer.score(
+      SearchResult.new(
+        title: "Les Miserables T. V Partie 1 - Victor Hugo French EPUB",
+        seeders: 50
+      ),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title], score.breakdown.inspect
+    assert score.breakdown[:auto_select_allowed], score.breakdown.inspect
+    assert_operator score.total, :>=, 90, "total #{score.total} breakdown #{score.breakdown.inspect}"
+    assert score.high_confidence?, score.total.to_s
+  end
+
+  test "scores a terminal roman volume when the author is also inside the title" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(
+      title: "The Collected Works of Carl Gustav Jung Volume I",
+      author: "Carl Gustav Jung",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score = ReleaseScorer.score(
+      SearchResult.new(
+        title: "The Collected Works of Carl Gustav Jung Volume I - Carl Gustav Jung English EPUB",
+        seeders: 50
+      ),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title], score.breakdown.inspect
+    assert score.breakdown[:auto_select_allowed], score.breakdown.inspect
+    assert_operator score.total, :>=, 90, "total #{score.total} breakdown #{score.breakdown.inspect}"
+    assert score.high_confidence?, score.total.to_s
+  end
+
+  test "scores a roman volume followed by a novel subtitle above the auto-select threshold" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(title: "The Dark Tower Book V", author: "Stephen King", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+
+    [
+      "The Dark Tower Book V A Novel - Stephen King English EPUB",
+      "The.Dark.Tower.Book.V.A.Novel.-.Stephen.King.English.EPUB"
+    ].each do |release_title|
+      score = ReleaseScorer.score(
+        SearchResult.new(title: release_title, seeders: 50),
+        request
+      )
+
+      assert_equal 100, score.breakdown[:title], "#{release_title} #{score.breakdown.inspect}"
+      assert score.breakdown[:auto_select_allowed], "#{release_title} #{score.breakdown.inspect}"
+      assert_operator score.total, :>=, 90, "#{release_title} total #{score.total} breakdown #{score.breakdown.inspect}"
+      assert score.high_confidence?, "#{release_title} #{score.total}"
+    end
+  end
+
+  test "scores an abbreviated roman volume before a language code above the auto-select threshold" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(
+      title: "Les Mis\u00E9rables T. V",
+      author: "Victor Hugo",
+      book_type: :ebook
+    )
+    request = Request.create!(book: book, user: @user, status: :pending, language: "fr")
+    score = ReleaseScorer.score(
+      SearchResult.new(
+        title: "Victor.Hugo.-.Les.Miserables.T.V.FR.EPUB",
+        seeders: 50
+      ),
+      request
+    )
+
+    assert_equal 100, score.breakdown[:title], score.breakdown.inspect
+    assert score.breakdown[:auto_select_allowed], score.breakdown.inspect
+    assert_operator score.total, :>=, 90, "total #{score.total} breakdown #{score.breakdown.inspect}"
+    assert score.high_confidence?, score.total.to_s
+  end
+
+  test "optional file size limits score down only releases outside the range" do
+    assert_equal({ title: 40, author: 20, language: 25, format: 10, health: 5 }, ReleaseScorer::WEIGHTS)
+
+    baseline = wind_score(size_bytes: 10.megabytes)
+    SettingsService.set(:audiobook_min_file_size, "")
+    SettingsService.set(:audiobook_max_file_size, "")
+    SettingsService.set(:ebook_min_file_size, "")
+    SettingsService.set(:ebook_max_file_size, "")
+
+    blank = wind_score(size_bytes: 100)
+    assert_equal baseline.total, blank.total
+    assert_equal 0, blank.breakdown[:file_size_adjustment].to_i
+    assert_nil blank.breakdown[:file_size_status]
+    assert blank.breakdown[:auto_select_allowed]
+
+    SettingsService.set(:audiobook_min_file_size, "50 MB")
+    SettingsService.set(:audiobook_max_file_size, "2 GB")
+
+    inside = wind_score(size_bytes: 50.megabytes)
+    at_max = wind_score(size_bytes: 2.gigabytes)
+    [ inside, at_max ].each do |score|
+      assert_equal baseline.total, score.total
+      assert_equal 0, score.breakdown[:file_size_adjustment]
+      assert_equal "within", score.breakdown[:file_size_status]
+      assert score.breakdown[:auto_select_allowed]
+      assert_equal baseline.breakdown[:preference_adjustment], score.breakdown[:preference_adjustment]
+    end
+
+    below = wind_score(size_bytes: 50.megabytes - 1)
+    above = wind_score(size_bytes: 2.gigabytes + 1)
+    [ below, above ].each do |score|
+      %i[title author language format health].each do |component|
+        assert_equal baseline.breakdown[component], score.breakdown[component], component
+      end
+      assert_equal baseline.breakdown[:preference_adjustment], score.breakdown[:preference_adjustment]
+      assert_equal ReleaseScorer::FILE_SIZE_OUT_OF_RANGE_PENALTY, score.breakdown[:file_size_adjustment]
+      assert_equal baseline.total + ReleaseScorer::FILE_SIZE_OUT_OF_RANGE_PENALTY, score.total
+      refute score.breakdown[:auto_select_allowed]
+    end
+    assert_equal "below_min", below.breakdown[:file_size_status]
+    assert_equal "above_max", above.breakdown[:file_size_status]
+
+    unknown = wind_score(size_bytes: nil)
+    assert_equal baseline.total, unknown.total
+    assert_equal 0, unknown.breakdown[:file_size_adjustment]
+    assert_equal "unknown", unknown.breakdown[:file_size_status]
+    assert unknown.breakdown[:auto_select_allowed]
+
+    SettingsService.set(:audiobook_min_file_size, "")
+    SettingsService.set(:audiobook_max_file_size, "")
+    SettingsService.set(:ebook_max_file_size, "1 MB")
+    ignored = wind_score(size_bytes: 100)
+    assert_equal baseline.total, ignored.total
+    assert_nil ignored.breakdown[:file_size_status]
+    assert ignored.breakdown[:auto_select_allowed]
+  end
+
+  test "non-positive file sizes count as unknown when a minimum is set" do
+    SettingsService.set(:audiobook_min_file_size, "50 MB")
+    SettingsService.set(:audiobook_max_file_size, "2 GB")
+    unknown = wind_score(size_bytes: nil)
+
+    [ 0, -1 ].each do |size_bytes|
+      score = wind_score(size_bytes: size_bytes)
+
+      assert_equal unknown.total, score.total, size_bytes
+      assert_equal 0, score.breakdown[:file_size_adjustment], size_bytes
+      assert_equal "unknown", score.breakdown[:file_size_status], size_bytes
+      assert score.breakdown[:auto_select_allowed], size_bytes
+    end
+  end
+
+  test "a maximum alone does not penalize a smaller ebook" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    SettingsService.set(:ebook_min_file_size, "")
+    SettingsService.set(:ebook_max_file_size, "20 MB")
+    book = Book.create!(title: "The Name of the Rose", author: "Umberto Eco", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    score_for = lambda do |size_bytes|
+      ReleaseScorer.score(
+        SearchResult.new(
+          title: "The Name of the Rose - Umberto Eco English EPUB",
+          seeders: 10,
+          size_bytes: size_bytes
+        ),
+        request
+      )
+    end
+
+    small = score_for.call(2.megabytes)
+    large = score_for.call(21.megabytes)
+
+    assert_equal "within", small.breakdown[:file_size_status]
+    assert_equal 0, small.breakdown[:file_size_adjustment]
+    assert small.breakdown[:auto_select_allowed]
+    assert_equal "above_max", large.breakdown[:file_size_status]
+    assert_equal ReleaseScorer::FILE_SIZE_OUT_OF_RANGE_PENALTY, large.breakdown[:file_size_adjustment]
+    refute large.breakdown[:auto_select_allowed]
+    assert_operator large.total, :<, small.total
+    %i[title author language format health].each do |component|
+      assert_equal small.breakdown[component], large.breakdown[component], component
+    end
+  end
+
+  test "an oversized preferred ebook loses the full size penalty from its capped score" do
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [ "epub" ])
+    SettingsService.set(:ebook_min_file_size, "")
+    SettingsService.set(:ebook_max_file_size, "")
+    book = Book.create!(title: "The Name of the Rose", author: "Umberto Eco", book_type: :ebook)
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    release = request.search_results.create!(
+      guid: "rose-epub-80mb",
+      title: "The Name of the Rose - Umberto Eco English EPUB",
+      download_url: "http://localhost:5076/getnzb/rose",
+      size_bytes: 80.megabytes,
+      seeders: nil
+    )
+
+    unlimited = release.calculate_score!
+    assert_equal 12, unlimited.breakdown[:preference_adjustment]
+    assert_equal 100, unlimited.total
+    assert_equal 100, release.confidence_score
+
+    SettingsService.set(:ebook_max_file_size, "20 MB")
+    limited = release.calculate_score!
+
+    assert_equal "above_max", limited.breakdown[:file_size_status]
+    assert_equal ReleaseScorer::FILE_SIZE_OUT_OF_RANGE_PENALTY, release.file_size_adjustment
+    assert_equal "Size -40 (too large)", release.file_size_adjustment_label
+    assert_equal unlimited.total, limited.total_before_file_size
+    assert_equal unlimited.total + release.file_size_adjustment, limited.total
+    assert_equal 60, limited.total
+    assert_equal 60, release.confidence_score
+    refute limited.breakdown[:auto_select_allowed]
+  end
+
+  test "comic releases ignore ebook and audiobook file size limits" do
+    SettingsService.set(:ebook_max_file_size, "1 MB")
+    SettingsService.set(:audiobook_max_file_size, "1 MB")
+    book = Book.create!(title: "Watchmen", author: "Alan Moore", book_type: :comicbook, series: "Watchmen")
+    request = Request.create!(book: book, user: @user, status: :pending, language: "en")
+    release = SearchResult.new(title: "Watchmen - Alan Moore English CBZ", seeders: 20, size_bytes: 80.megabytes)
+
+    limited = ReleaseScorer.score(release, request)
+    SettingsService.set(:ebook_max_file_size, "")
+    SettingsService.set(:audiobook_max_file_size, "")
+    plain = ReleaseScorer.score(release, request)
+
+    assert_equal plain.total, limited.total
+    assert_equal plain.breakdown[:auto_select_allowed], limited.breakdown[:auto_select_allowed]
+    assert_nil limited.breakdown[:file_size_status]
+    assert_equal 0, limited.breakdown[:file_size_adjustment].to_i
+  end
+
+  def wind_score(size_bytes:)
+    ReleaseScorer.score(
+      SearchResult.new(
+        title: "The Name of the Wind - Patrick Rothfuss - English Audiobook M4B",
+        seeders: 50,
+        size_bytes: size_bytes
+      ),
+      @request
+    )
+  end
 end

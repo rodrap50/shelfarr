@@ -46,7 +46,7 @@ class OwnedMediaBackupJob < ApplicationJob
         "[OwnedMediaBackupJob] Could not inspect upload-processing jobs for " \
           "upload ##{upload_id}: #{error.class}"
       )
-      true
+      RemoteResult::Failed.new(error)
     end
 
     private
@@ -610,7 +610,13 @@ class OwnedMediaBackupJob < ApplicationJob
 
   def schedule_poll(media_import, wait: POLL_INTERVAL)
     next_token = OwnedMediaImport.next_poll_token(@poll_token)
-    job = self.class.set(wait: wait).perform_later(media_import.id, next_token)
+    job = SingleChain.enqueue(
+      self.class,
+      media_import.id,
+      next_token,
+      wait: wait,
+      scope: media_import.id
+    )
     unless job.respond_to?(:successfully_enqueued?) && job.successfully_enqueued?
       raise BackupError, "Shelfarr could not queue the next Libation backup check"
     end

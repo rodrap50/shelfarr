@@ -3,6 +3,8 @@
 require "test_helper"
 
 class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
+  include ActiveJob::TestHelper
+
   QBITTORRENT_API_KEY = "qbt_aaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
   setup do
@@ -338,11 +340,7 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           }.to_json
         )
 
-      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
-        .to_return(
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [].to_json },
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [ { "hash" => "async123" } ].to_json }
-        )
+      stub_tagged_hash_poll("async123")
 
       result = @client.add_torrent("http://example.com/file.torrent")
 
@@ -365,16 +363,481 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
 
-      # Stub torrent info - first call returns empty (before adding),
-      # subsequent calls return the new torrent (after adding)
-      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
-        .to_return(
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [].to_json },
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [ { "hash" => "def456abc789" } ].to_json }
-        )
+      stub_tagged_hash_poll("def456abc789")
 
       result = @client.add_torrent("http://example.com/file.torrent")
       assert_equal "def456abc789", result
+    end
+  end
+
+  test "add_torrent polling fallback returns the torrent carrying this add's tag" do
+    foreign_hash = "a" * 40
+    tagged_hash = "b" * 40
+    torrent_url = "http://prowlarr.example:9696/1/download?id=115"
+    @client_record.update!(category: "shelfarr")
+    captured = {}
+    unfiltered_calls = 0
+
+    VCR.turned_off do
+      stub_request(:post, "http://localhost:8080/api/v2/auth/login")
+        .to_return(
+          status: 200,
+          headers: { "Set-Cookie" => "SID=test_session_id; path=/" },
+          body: "Ok."
+        )
+
+      stub_request(:get, torrent_url)
+        .to_return(status: 403, body: "Indexer grab limit reached")
+      stub_webapi_version!("2.8.3")
+      stub_dispatch_tag_delete!
+
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .with { |request|
+          body = request.body
+          parsed = body.is_a?(Hash) ? body : URI.decode_www_form(body.to_s).to_h
+          captured.replace(parsed.transform_keys(&:to_s))
+          true
+        }
+        .to_return(status: 200, body: "Ok.")
+
+      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
+        .to_return do |request|
+          tag = Rack::Utils.parse_query(request.uri.query.to_s)["tag"]
+          payload = if tag.present?
+            [ { "hash" => tagged_hash, "tags" => tag } ]
+          else
+            unfiltered_calls += 1
+            unfiltered_calls == 1 ? [] : [ { "hash" => foreign_hash, "tags" => "" } ]
+          end
+
+          {
+            status: 200,
+            headers: { "Content-Type" => "application/json" },
+            body: payload.to_json
+          }
+        end
+
+      result = @client.stub(:sleep, nil) { @client.add_torrent(torrent_url) }
+
+      assert_equal tagged_hash, result, "polling fallback returned #{result.inspect} instead of the tagged torrent"
+      assert_match(/\Ashelfarr-[0-9a-f]{16}\z/, captured["tags"])
+      assert_equal "shelfarr", captured["category"]
+    end
+  end
+
+  test "refuses to add an unhashed torrent when WebAPI is older than 2.6.2" do
+    torrent_url = "http://indexer.example/download/1"
+    foreign_hash = "e" * 40
+    add_request = nil
+
+    VCR.turned_off do
+      stub_qbit_login!
+      stub_webapi_version!("2.6.1")
+      stub_request(:get, torrent_url).to_return(status: 403, body: "no")
+      add_request = stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .to_return(status: 200, body: "Ok.")
+      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: [ { "hash" => foreign_hash, "name" => "Foreign" } ].to_json
+        )
+
+      result = nil
+      error = nil
+      begin
+        result = @client.stub(:sleep, nil) { @client.add_torrent(torrent_url) }
+      rescue DownloadClients::Base::Error => caught
+        error = caught
+      end
+
+      assert error, "expected a configuration error before adding, got #{result.inspect}"
+      assert_match(/tag/i, error.message)
+      assert_match(/2\.6\.2/, error.message)
+      assert_not_requested add_request
+      refute_equal foreign_hash, result
+    end
+  end
+
+  test "add_torrent tags an unhashed torrent on WebAPI 2.6.2" do
+    torrent_url = "http://indexer.example/download/262"
+    tagged_hash = "c" * 40
+    captured = {}
+
+    VCR.turned_off do
+      stub_qbit_login!
+      stub_webapi_version!("2.6.2")
+      stub_request(:get, torrent_url).to_return(status: 403, body: "no")
+      stub_dispatch_tag_delete!
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .with { |request|
+          captured.replace(add_torrent_params(request).transform_keys(&:to_s))
+          true
+        }
+        .to_return(status: 200, body: "Ok.")
+      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
+        .to_return do |request|
+          tag = Rack::Utils.parse_query(request.uri.query.to_s)["tag"].to_s
+          body = [ { "hash" => tagged_hash, "tags" => tag } ]
+          {
+            status: 200,
+            headers: { "Content-Type" => "application/json" },
+            body: body.to_json
+          }
+        end
+
+      result = @client.stub(:sleep, nil) { @client.add_torrent(torrent_url) }
+
+      assert_equal tagged_hash, result
+      assert_match(/\Ashelfarr-[0-9a-f]{16}\z/, captured["tags"])
+    end
+  end
+
+  test "deletes the dispatch tag after correlating the added torrent" do
+    torrent_url = "http://indexer.example/download/correlated"
+    tagged_hash = "d" * 40
+    sent_tag = nil
+    deleted_tags = nil
+
+    VCR.turned_off do
+      stub_qbit_login!
+      stub_webapi_version!("2.8.3")
+      stub_request(:get, torrent_url).to_return(status: 403, body: "no")
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .with { |request|
+          sent_tag = add_torrent_params(request)["tags"]
+          true
+        }
+        .to_return(status: 200, body: "Ok.")
+      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
+        .to_return do |request|
+          tag = Rack::Utils.parse_query(request.uri.query.to_s)["tag"].to_s
+          {
+            status: 200,
+            headers: { "Content-Type" => "application/json" },
+            body: [ { "hash" => tagged_hash, "tags" => tag } ].to_json
+          }
+        end
+      delete_request = stub_request(:post, "http://localhost:8080/api/v2/torrents/deleteTags")
+        .with { |request|
+          deleted_tags = add_torrent_params(request)["tags"]
+          true
+        }
+        .to_return(status: 200, body: "")
+
+      result = @client.stub(:sleep, nil) { @client.add_torrent(torrent_url) }
+
+      assert_equal tagged_hash, result
+      assert_match(/\Ashelfarr-[0-9a-f]{16}\z/, sent_tag)
+      assert_equal sent_tag, deleted_tags
+      assert_requested delete_request, times: 1
+      assert_no_enqueued_jobs only: QbittorrentDispatchTagCleanupJob
+    end
+  end
+
+  test "deletes the dispatch tag when the add response already includes the hash" do
+    torrent_url = "http://indexer.example/download/early-id"
+    added_hash = "1" * 40
+    sent_tag = nil
+    deleted_tags = nil
+
+    VCR.turned_off do
+      stub_qbit_login!
+      stub_webapi_version!("2.11.0")
+      stub_request(:get, torrent_url).to_return(status: 403, body: "no")
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .with { |request|
+          sent_tag = add_torrent_params(request)["tags"]
+          true
+        }
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { "added_torrent_ids" => [ added_hash ], "success_count" => 1 }.to_json
+        )
+      delete_request = stub_request(:post, "http://localhost:8080/api/v2/torrents/deleteTags")
+        .with { |request|
+          deleted_tags = add_torrent_params(request)["tags"]
+          true
+        }
+        .to_return(status: 200, body: "")
+
+      result = @client.add_torrent(torrent_url)
+
+      assert_equal added_hash, result
+      assert_match(/\Ashelfarr-[0-9a-f]{16}\z/, sent_tag)
+      assert_equal sent_tag, deleted_tags
+      assert_requested delete_request, times: 1
+    end
+  end
+
+  test "deletes the dispatch tag when tagged hash detection is abandoned" do
+    torrent_url = "http://indexer.example/download/abandoned"
+    foreign_hash = "9" * 40
+    sent_tag = nil
+    deleted_tags = nil
+
+    VCR.turned_off do
+      stub_qbit_login!
+      stub_webapi_version!("2.8.3")
+      stub_request(:get, torrent_url).to_return(status: 403, body: "no")
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .with { |request|
+          sent_tag = add_torrent_params(request)["tags"]
+          true
+        }
+        .to_return(status: 200, body: "Ok.")
+      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: [ { "hash" => foreign_hash, "name" => "Foreign" } ].to_json
+        )
+      delete_request = stub_request(:post, "http://localhost:8080/api/v2/torrents/deleteTags")
+        .with { |request|
+          deleted_tags = add_torrent_params(request)["tags"]
+          true
+        }
+        .to_return(status: 200, body: "")
+
+      result = @client.stub(:sleep, nil) { @client.add_torrent(torrent_url) }
+
+      assert_nil result
+      assert_match(/\Ashelfarr-[0-9a-f]{16}\z/, sent_tag)
+      assert_equal sent_tag, deleted_tags
+      assert_requested delete_request, times: 1
+    end
+  end
+
+  test "reconciles a dispatch tag recreated after an abandoned async url fetch" do
+    torrent_url = "http://indexer.example/download/slow-fetch"
+    foreign_hash = "8" * 40
+    sent_tag = nil
+
+    VCR.turned_off do
+      stub_qbit_login!
+      stub_webapi_version!("2.8.3")
+      stub_request(:get, torrent_url).to_return(status: 403, body: "no")
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .with { |request|
+          sent_tag = add_torrent_params(request)["tags"]
+          true
+        }
+        .to_return(status: 200, body: "Ok.")
+      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: [ { "hash" => foreign_hash, "name" => "Foreign" } ].to_json
+        )
+      delete_request = stub_request(:post, "http://localhost:8080/api/v2/torrents/deleteTags")
+        .to_return(status: 200, body: "")
+
+      result = @client.stub(:sleep, nil) { @client.add_torrent(torrent_url) }
+
+      assert_nil result
+      assert_match(/\Ashelfarr-[0-9a-f]{16}\z/, sent_tag)
+      assert_enqueued_jobs QbittorrentDispatchTagCleanupJob::CLEANUP_DELAYS.size,
+        only: QbittorrentDispatchTagCleanupJob
+      assert_enqueued_with(
+        job: QbittorrentDispatchTagCleanupJob,
+        args: [ @client_record.id, sent_tag ]
+      )
+
+      # Polling already deleted the tag. A slow fetch then recreates it, so
+      # reconciliation has to delete that same tag again.
+      QbittorrentDispatchTagCleanupJob.perform_now(@client_record.id, sent_tag)
+
+      assert_requested delete_request, times: 2
+    end
+  end
+
+  test "deletes the dispatch tag when the add request fails" do
+    torrent_url = "http://indexer.example/download/add-failed"
+    sent_tag = nil
+    deleted_tags = nil
+
+    VCR.turned_off do
+      stub_qbit_login!
+      stub_webapi_version!("2.8.3")
+      stub_request(:get, torrent_url).to_return(status: 403, body: "no")
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .with { |request|
+          sent_tag = add_torrent_params(request)["tags"]
+          true
+        }
+        .to_return(status: 503, body: "unavailable")
+      delete_request = stub_request(:post, "http://localhost:8080/api/v2/torrents/deleteTags")
+        .with { |request|
+          deleted_tags = add_torrent_params(request)["tags"]
+          true
+        }
+        .to_return(status: 200, body: "")
+
+      error = assert_raises(DownloadClients::Base::ConnectionError) do
+        @client.add_torrent(torrent_url)
+      end
+
+      assert_equal "qBittorrent API error: 503", error.message
+      assert_match(/\Ashelfarr-[0-9a-f]{16}\z/, sent_tag)
+      assert_equal sent_tag, deleted_tags
+      assert_requested delete_request, times: 1
+    end
+  end
+
+  test "schedules dispatch tag cleanup when the hash poll fails" do
+    torrent_url = "http://indexer.example/download/poll-failed"
+    sent_tag = nil
+
+    VCR.turned_off do
+      stub_qbit_login!
+      stub_webapi_version!("2.8.3")
+      stub_request(:get, torrent_url).to_return(status: 403, body: "no")
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .with { |request|
+          sent_tag = add_torrent_params(request)["tags"]
+          true
+        }
+        .to_return(status: 200, body: "Ok.")
+      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
+        .to_raise(Faraday::ConnectionFailed.new("connection reset"))
+      delete_request = stub_request(:post, "http://localhost:8080/api/v2/torrents/deleteTags")
+        .to_return(status: 200, body: "")
+
+      error = assert_raises(DownloadClients::Base::ConnectionError) do
+        @client.stub(:sleep, nil) { @client.add_torrent(torrent_url) }
+      end
+
+      assert_match(/connection reset/, error.message)
+      assert_match(/\Ashelfarr-[0-9a-f]{16}\z/, sent_tag)
+      assert_requested delete_request, times: 1
+      assert_enqueued_jobs QbittorrentDispatchTagCleanupJob::CLEANUP_DELAYS.size,
+        only: QbittorrentDispatchTagCleanupJob
+      assert_enqueued_with(
+        job: QbittorrentDispatchTagCleanupJob,
+        args: [ @client_record.id, sent_tag ]
+      )
+    end
+  end
+
+  test "retries dispatch tag deletion when correlation succeeds but deleteTags fails" do
+    torrent_url = "http://indexer.example/download/delete-tag-rejected"
+    tagged_hash = "f" * 40
+    sent_tag = nil
+
+    VCR.turned_off do
+      stub_qbit_login!
+      stub_webapi_version!("2.8.3")
+      stub_request(:get, torrent_url).to_return(status: 403, body: "no")
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .with { |request|
+          sent_tag = add_torrent_params(request)["tags"]
+          true
+        }
+        .to_return(status: 200, body: "Ok.")
+      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
+        .to_return do |request|
+          tag = Rack::Utils.parse_query(request.uri.query.to_s)["tag"].to_s
+          {
+            status: 200,
+            headers: { "Content-Type" => "application/json" },
+            body: [ { "hash" => tagged_hash, "tags" => tag } ].to_json
+          }
+        end
+      delete_request = stub_request(:post, "http://localhost:8080/api/v2/torrents/deleteTags")
+        .to_return(status: 500, body: "unavailable")
+
+      result = @client.stub(:sleep, nil) { @client.add_torrent(torrent_url) }
+
+      assert_equal tagged_hash, result
+      assert_match(/\Ashelfarr-[0-9a-f]{16}\z/, sent_tag)
+      assert_requested delete_request, times: 1
+      assert_enqueued_with(
+        job: QbittorrentDispatchTagCleanupJob,
+        args: [ @client_record.id, sent_tag ]
+      )
+    end
+  end
+
+  test "returns the correlated hash when dispatch tag deletion fails" do
+    torrent_url = "http://indexer.example/download/delete-fails"
+    tagged_hash = "c" * 40
+
+    VCR.turned_off do
+      stub_qbit_login!
+      stub_webapi_version!("2.8.3")
+      stub_request(:get, torrent_url).to_return(status: 403, body: "no")
+      stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
+        .to_return(status: 200, body: "Ok.")
+      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
+        .to_return do |request|
+          tag = Rack::Utils.parse_query(request.uri.query.to_s)["tag"].to_s
+          {
+            status: 200,
+            headers: { "Content-Type" => "application/json" },
+            body: [ { "hash" => tagged_hash, "tags" => tag } ].to_json
+          }
+        end
+      delete_request = stub_request(:post, "http://localhost:8080/api/v2/torrents/deleteTags")
+        .to_raise(Faraday::ConnectionFailed.new("connection reset"))
+
+      result = @client.stub(:sleep, nil) { @client.add_torrent(torrent_url) }
+
+      assert_equal tagged_hash, result
+      assert_requested delete_request, times: 1
+    end
+  end
+
+  test "reauthenticates once when an expired session rejects dispatch tag deletion" do
+    tag = "shelfarr-abcdef0123456789"
+    Thread.current[:qbittorrent_sessions][@client_record.id] = {
+      cookie_name: "SID",
+      cookie_value: "expired"
+    }
+    cookies = []
+
+    VCR.turned_off do
+      login = stub_request(:post, "http://localhost:8080/api/v2/auth/login")
+        .to_return(
+          status: 200,
+          headers: { "Set-Cookie" => "SID=fresh; path=/" },
+          body: "Ok."
+        )
+      delete_request = stub_request(:post, "http://localhost:8080/api/v2/torrents/deleteTags")
+        .with(body: hash_including("tags" => tag))
+        .to_return do |request|
+          cookies << request.headers["Cookie"]
+          {
+            status: cookies.size == 1 ? 403 : 200,
+            body: cookies.size == 1 ? "Forbidden" : ""
+          }
+        end
+
+      assert_equal true, @client.remove_dispatch_tag(tag)
+
+      assert_requested login, times: 1
+      assert_requested delete_request, times: 2
+      assert_equal [ "SID=expired", "SID=fresh" ], cookies
+      assert_equal "fresh", Thread.current[:qbittorrent_sessions][@client_record.id][:cookie_value]
+    end
+  end
+
+  test "does not replace a rejected bearer token by logging in for dispatch tag deletion" do
+    tag = "shelfarr-abcdef0123456789"
+    @client_record.update!(api_key: QBITTORRENT_API_KEY)
+
+    VCR.turned_off do
+      delete_request = stub_request(:post, "http://localhost:8080/api/v2/torrents/deleteTags")
+        .with { |request|
+          request.headers["Authorization"] == "Bearer #{QBITTORRENT_API_KEY}" &&
+            request.headers["Cookie"].nil?
+        }
+        .to_return(status: 403, body: "Forbidden")
+
+      assert_equal false, @client.remove_dispatch_tag(tag)
+
+      assert_requested delete_request, times: 1
+      assert_not_requested :post, "http://localhost:8080/api/v2/auth/login"
     end
   end
 
@@ -390,11 +853,7 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       # Since relative URL cannot be used for hash pre-computation, it should fall back to polling
       # First call: get existing hashes (empty)
       # Second call: after adding, find new hash
-      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
-        .to_return(
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [].to_json },
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [ { "hash" => "relative123" } ].to_json }
-        )
+      stub_tagged_hash_poll("relative123")
 
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
@@ -835,11 +1294,7 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       # Since torrent download failed, it should capture existing hashes first
       # First call: get existing hashes (empty)
       # Second call: after adding, find new hash
-      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
-        .to_return(
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [].to_json },
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [ { "hash" => "fallback123" } ].to_json }
-        )
+      stub_tagged_hash_poll("fallback123")
 
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
@@ -866,11 +1321,7 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: "<html>Login required</html>"
         )
 
-      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
-        .to_return(
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [].to_json },
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [ { "hash" => "polled456" } ].to_json }
-        )
+      stub_tagged_hash_poll("polled456")
 
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
@@ -899,11 +1350,7 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
           body: torrent_data
         )
 
-      stub_request(:get, %r{localhost:8080/api/v2/torrents/info})
-        .to_return(
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [].to_json },
-          { status: 200, headers: { "Content-Type" => "application/json" }, body: [ { "hash" => "noinfo789" } ].to_json }
-        )
+      stub_tagged_hash_poll("noinfo789")
 
       stub_request(:post, "http://localhost:8080/api/v2/torrents/add")
         .to_return(status: 200, body: "Ok.")
@@ -1974,6 +2421,45 @@ class DownloadClients::QbittorrentTest < ActiveSupport::TestCase
       reason = status == 200 ? "OK" : "Not Found"
       extra = headers.map { |key, value| "#{key}: #{value}\r\n" }.join
       "HTTP/1.1 #{status} #{reason}\r\nContent-Length: #{body.bytesize}\r\n#{extra}Connection: close\r\n\r\n#{body}"
+    end
+  end
+
+  def stub_qbit_login!
+    stub_request(:post, "http://localhost:8080/api/v2/auth/login")
+      .to_return(
+        status: 200,
+        headers: { "Set-Cookie" => "SID=test_session_id; path=/" },
+        body: "Ok."
+      )
+  end
+
+  def stub_webapi_version!(version)
+    stub_request(:get, "http://localhost:8080/api/v2/app/webapiVersion")
+      .to_return(status: 200, body: version)
+  end
+
+  def stub_dispatch_tag_delete!
+    stub_request(:post, "http://localhost:8080/api/v2/torrents/deleteTags")
+      .to_return(status: 200, body: "")
+  end
+
+  def stub_tagged_hash_poll(hash)
+    stub_webapi_version!("2.8.3")
+    stub_dispatch_tag_delete!
+    payloads = [ [], [ { "hash" => hash } ] ]
+    index = 0
+
+    stub_request(:get, %r{localhost:8080/api/v2/torrents/info}).to_return do |request|
+      payload = payloads[[ index, payloads.length - 1 ].min]
+      index += 1
+      tag = Rack::Utils.parse_query(request.uri.query.to_s)["tag"].to_s
+      body = payload.map { |torrent| tag.empty? ? torrent : torrent.merge("tags" => tag) }
+
+      {
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: body.to_json
+      }
     end
   end
 

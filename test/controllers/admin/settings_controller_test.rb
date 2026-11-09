@@ -236,6 +236,119 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_select "p", text: /Automatically enqueue search immediately for requests created by non-admin users/
   end
 
+  test "index shows the auto-select threshold and optional file size limits" do
+    get admin_settings_url
+
+    assert_response :success
+    assert_select "h2", text: "Auto-Selection"
+    assert_select "label", text: "Auto-Select Confidence Threshold"
+    assert_select "input[name='settings[auto_select_confidence_threshold]'][min='0'][max='100'][value='90']"
+    assert_select "p", text: /Minimum confidence score \(0-100\) for auto-selection/
+    assert_select "h2", text: "Format Preferences"
+    assert_select "label", text: "Minimum Ebook Size"
+    assert_select "label", text: "Maximum Ebook Size"
+    assert_select "label", text: "Minimum Audiobook Size"
+    assert_select "label", text: "Maximum Audiobook Size"
+    assert_select "input[name='settings[ebook_min_file_size]'][value='']"
+    assert_select "input[name='settings[ebook_max_file_size]'][value='']"
+    assert_select "input[name='settings[audiobook_min_file_size]'][value='']"
+    assert_select "input[name='settings[audiobook_max_file_size]'][value='']"
+    assert_select "p", text: /Leave blank to keep scoring unchanged/, minimum: 4
+  end
+
+  test "admin can lower the auto-select confidence threshold" do
+    patch bulk_update_admin_settings_url, params: {
+      settings: { auto_select_confidence_threshold: "75" }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal 75, SettingsService.get(:auto_select_confidence_threshold)
+
+    patch bulk_update_admin_settings_url, params: {
+      settings: { auto_select_confidence_threshold: "101" }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_match "0 to 100", flash[:alert]
+    assert_equal 75, SettingsService.get(:auto_select_confidence_threshold)
+  end
+
+  test "admin can save and clear per-format file size limits" do
+    patch bulk_update_admin_settings_url, params: {
+      settings: {
+        ebook_min_file_size: "200 KB",
+        ebook_max_file_size: "50",
+        audiobook_min_file_size: "",
+        audiobook_max_file_size: "2 GB"
+      }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal "200 KB", SettingsService.get(:ebook_min_file_size)
+    assert_equal "50 MB", SettingsService.get(:ebook_max_file_size)
+    assert_equal "", SettingsService.get(:audiobook_min_file_size)
+    assert_equal "2 GB", SettingsService.get(:audiobook_max_file_size)
+
+    patch bulk_update_admin_settings_url, params: {
+      settings: { ebook_min_file_size: "huge" }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_match "file size", flash[:alert]
+    assert_equal "200 KB", SettingsService.get(:ebook_min_file_size)
+
+    patch bulk_update_admin_settings_url, params: {
+      settings: { ebook_min_file_size: "80 MB", ebook_max_file_size: "50 MB" }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_match "less than or equal to Maximum Ebook Size", flash[:alert]
+    assert_equal "200 KB", SettingsService.get(:ebook_min_file_size)
+    assert_equal "50 MB", SettingsService.get(:ebook_max_file_size)
+
+    patch bulk_update_admin_settings_url, params: {
+      settings: { ebook_min_file_size: "", ebook_max_file_size: "" }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal "", SettingsService.get(:ebook_min_file_size)
+    assert_equal "", SettingsService.get(:ebook_max_file_size)
+  end
+
+  test "index shows the default request format beside other request settings" do
+    get admin_settings_url
+
+    assert_response :success
+    assert_select "label[for='settings_default_request_format']", text: "Default Request Format"
+    assert_select "select[name='settings[default_request_format]']" do
+      assert_select "option[value='ask'][selected='selected']", text: "Ask each time"
+      assert_select "option[value='audiobook']", text: "Audiobook"
+      assert_select "option[value='ebook']", text: "Ebook"
+      assert_select "option[value='both']", text: "Both"
+    end
+    assert_select "p", text: /Format pre-selected on the request form/
+
+    queue = response.body.index("Queue Settings")
+    approve = response.body.index("Auto Approve Requests")
+    field = response.body.index("Default Request Format")
+    batch = response.body.index("Queue Batch Size")
+    assert queue < approve
+    assert approve < field
+    assert field < batch
+  end
+
+  test "overflowing file size input is rejected without changing saved settings" do
+    SettingsService.set(:ebook_max_file_size, "2 GB")
+
+    [ "9" * 400 + " B", "9" * 300 + " GB" ].each do |value|
+      patch bulk_update_admin_settings_url, params: { settings: { ebook_max_file_size: value } }
+
+      assert_redirected_to admin_settings_path
+      assert_match(/file size/, flash[:alert])
+      assert_equal "2 GB", SettingsService.get(:ebook_max_file_size)
+    end
+  end
+
   test "index shows ordered download type preferences" do
     get admin_settings_url
 
@@ -264,6 +377,23 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_select "input[name='settings[precreate_download_archives]']"
     assert_select "p", text: /Cached archives use tmp\/downloads/
     assert_select "p", text: /reference-mode directory downloads use the container's OS temp directory/
+  end
+
+  test "index shows library import permission modes next to the import mode" do
+    get admin_settings_url
+
+    assert_response :success
+    assert_select "label[for='settings_library_import_file_mode']", text: "Library Import File Mode"
+    assert_select "input[name='settings[library_import_file_mode]'][placeholder='0664']"
+    assert_select "label[for='settings_library_import_folder_mode']", text: "Library Import Folder Mode"
+    assert_select "input[name='settings[library_import_folder_mode]'][placeholder='0775']"
+    assert_select "p", text: /Hardlinked imports are skipped because they share the download file's inode/
+    assert_select "p", text: /The configured library root is never changed/
+    body = response.body
+    assert_operator body.index("settings_completed_download_import_mode"), :<,
+      body.index("settings_library_import_file_mode")
+    assert_operator body.index("settings_library_import_file_mode"), :<,
+      body.index("settings_library_import_folder_mode")
   end
 
   test "index shows completed download import mode options and hardlink guidance" do
@@ -365,6 +495,39 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
 
     assert_redirected_to admin_settings_path
     assert_equal true, SettingsService.get(:precreate_download_archives)
+  end
+
+  test "bulk_update stores library import modes and rejects invalid octal" do
+    patch bulk_update_admin_settings_url, params: {
+      settings: {
+        library_import_file_mode: "0664",
+        library_import_folder_mode: "0775"
+      }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal "0664", SettingsService.get(:library_import_file_mode)
+    assert_equal "0775", SettingsService.get(:library_import_folder_mode)
+
+    patch bulk_update_admin_settings_url, params: {
+      settings: {
+        library_import_file_mode: "668"
+      }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_match(/must be a 3 or 4 digit octal mode/, flash[:alert])
+    assert_equal "0664", SettingsService.get(:library_import_file_mode)
+
+    patch bulk_update_admin_settings_url, params: {
+      settings: {
+        library_import_folder_mode: "0664"
+      }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_match(/owner read, write, and execute/, flash[:alert])
+    assert_equal "0775", SettingsService.get(:library_import_folder_mode)
   end
 
   test "bulk_update stores a valid completed download import mode" do
@@ -586,6 +749,23 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
 
     assert_redirected_to admin_settings_path
     assert_equal true, SettingsService.auto_approve_requests?
+  end
+
+  test "bulk_update saves the default request format and rejects an unknown choice" do
+    patch bulk_update_admin_settings_url, params: {
+      settings: { default_request_format: "both" }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal "both", SettingsService.get(:default_request_format)
+
+    patch bulk_update_admin_settings_url, params: {
+      settings: { default_request_format: "everything" }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_match(/must be one of: ask, audiobook, ebook, both/, flash[:alert])
+    assert_equal "both", SettingsService.get(:default_request_format)
   end
 
   test "bulk_update preserves existing secret settings when left blank" do

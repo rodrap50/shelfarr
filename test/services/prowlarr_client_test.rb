@@ -863,6 +863,29 @@ class ProwlarrClientTest < ActiveSupport::TestCase
     end
   end
 
+  # The jobs process never sees the web process's reset_all_connections!.
+  test "search drops the cached connection after Prowlarr settings are removed" do
+    ProwlarrClient.reset_connection!
+
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:9696/api/v1/indexer")
+        .to_return(status: 200, body: "[]", headers: { "Content-Type" => "application/json" })
+
+      assert ProwlarrClient.test_connection
+
+      SettingsService.set(:prowlarr_url, "")
+      SettingsService.set(:prowlarr_api_key, "")
+
+      error = assert_raises ProwlarrClient::NotConfiguredError do
+        ProwlarrClient.search("atomic habits")
+      end
+      assert_equal "Prowlarr is not configured", error.message
+      assert_requested :get, "http://localhost:9696/api/v1/indexer", times: 1
+      assert_nil ProwlarrClient.instance_variable_get(:@connection)
+      assert_nil ProwlarrClient.instance_variable_get(:@connection_settings_key)
+    end
+  end
+
   test "#504 failed idempotent Prowlarr GET retries with the key stored at the retry" do
     SettingsService.set(:prowlarr_url, "http://prowlarr.example:9696")
     SettingsService.set(:prowlarr_api_key, "baked-key")
@@ -1051,6 +1074,52 @@ class ProwlarrClientTest < ActiveSupport::TestCase
       assert_equal "prowlarr.example.test", http.address
     end
     assert_empty probes
+  end
+
+  test "a tag rescue is a failure that is not a list" do
+    SettingsService.set(:prowlarr_tags, "books")
+    ProwlarrClient.instance_variable_set(:@connection, nil)
+
+    VCR.turned_off do
+      stub_request(:get, %r{localhost:9696/api/v1/tag})
+        .to_return(
+          status: 500,
+          headers: { "Content-Type" => "application/json" },
+          body: { "error" => "boom" }.to_json
+        )
+
+      failure = ProwlarrClient.send(:configured_tag_ids_for_names, [ "books" ])
+
+      assert_instance_of RemoteResult::Failed, failure
+      assert_raises(NoMethodError) { failure.empty? }
+      assert_raises(TypeError) { "tags #{failure}" }
+      assert_raises(TypeError) { "tags " + failure }
+      assert_raises(TypeError) { failure.to_a }
+      assert_raises(TypeError) { Array(failure) }
+      assert_not RemoteResult.succeeded?([])
+      assert_raises(NoMethodError) { RemoteResult::Ok.new([]).empty? }
+      assert_equal true, RemoteResult::Empty.new.empty?
+
+      decision = case failure
+      when RemoteResult::Failed
+        :do_not_widen
+      else
+        :widen
+      end
+      assert_equal :do_not_widen, decision
+
+      error = assert_raises(IndexerClients::Base::Error) do
+        ProwlarrClient.send(
+          :book_search_plans,
+          "Frankenstein Mary Shelley",
+          title: "Frankenstein",
+          author: "Mary Shelley",
+          tags: failure,
+          indexers: failure
+        )
+      end
+      assert_same failure.error, error
+    end
   end
 
   private

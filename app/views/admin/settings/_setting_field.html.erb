@@ -35,6 +35,7 @@
       <% integer_constraints = case key.to_s
       when "ebooks_com_search_limit" then { min: 1, max: EbooksComClient::MAX_RESULTS }
       when "health_check_interval" then { min: SettingsService::MIN_HEALTH_CHECK_INTERVAL }
+      when "auto_select_confidence_threshold" then { min: 0, max: 100 }
       else {}
       end %>
       <%= form.number_field "settings[#{key}]", value: data[:value], id: "settings_#{key}", class: "w-full rounded-md border border-gray-700 bg-gray-800 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 px-3 py-2", data: { action: "change->settings-form#autoSave" }, **integer_constraints %>
@@ -79,6 +80,8 @@
         <%= form.select "settings[#{key}]", options_for_select([["User", "user"], ["Admin", "admin"]], data[:value]), {}, id: "settings_#{key}", class: "w-full rounded-md border border-gray-700 bg-gray-800 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 px-3 py-2", data: { settings_form_manual_save: true } %>
       <% elsif key.to_s == "metadata_source" %>
         <%= form.select "settings[#{key}]", options_for_select([["Auto", "auto"], ["Hardcover", "hardcover"], ["Google Books", "google_books"], ["Open Library", "openlibrary"], ["Comic Vine", "comic_vine"]], data[:value]), {}, id: "settings_#{key}", class: "w-full rounded-md border border-gray-700 bg-gray-800 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 px-3 py-2", data: { action: "change->settings-form#autoSave" } %>
+      <% elsif key.to_s == "default_request_format" %>
+        <%= form.select "settings[#{key}]", options_for_select(SettingsService::DEFAULT_REQUEST_FORMAT_OPTIONS, data[:value]), {}, id: "settings_#{key}", class: "w-full rounded-md border border-gray-700 bg-gray-800 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 px-3 py-2", data: { action: "change->settings-form#autoSave" } %>
       <% elsif key.to_s == "telegram_update_mode" %>
         <%= form.select "settings[#{key}]", options_for_select([["Polling", "polling"], ["Webhook", "webhook"]], data[:value]), {}, id: "settings_#{key}", class: "w-full rounded-md border border-gray-700 bg-gray-800 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 px-3 py-2", data: { settings_form_manual_save: true } %>
       <% elsif key.to_s == "discord_webhook_url" %>
@@ -140,6 +143,15 @@
             autocapitalize: "characters",
             spellcheck: false,
             class: "w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 uppercase text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500",
+            data: { action: "change->settings-form#autoSave" } %>
+      <% elsif %w[library_import_file_mode library_import_folder_mode].include?(key.to_s) %>
+        <%= form.text_field "settings[#{key}]",
+            value: data[:value],
+            id: "settings_#{key}",
+            placeholder: (key.to_s == "library_import_folder_mode" ? "0775" : "0664"),
+            spellcheck: false,
+            autocomplete: "off",
+            class: "w-full rounded-md border border-gray-700 bg-gray-800 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 px-3 py-2",
             data: { action: "change->settings-form#autoSave" } %>
       <% elsif SettingsService.manual_save_setting_key?(key) && !SettingsService.secret_setting_key?(key) %>
         <%= form.text_field "settings[#{key}]", value: data[:value], id: "settings_#{key}", autocomplete: "off", class: "w-full rounded-md border border-gray-700 bg-gray-800 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 px-3 py-2", data: { settings_form_manual_save: true } %>

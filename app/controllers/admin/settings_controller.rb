@@ -4,7 +4,13 @@ module Admin
 
     def index
       @settings_by_category = SettingsService.all_by_category
-      @audiobookshelf_libraries = fetch_audiobookshelf_libraries
+      libraries = fetch_audiobookshelf_libraries
+      @audiobookshelf_libraries = case libraries
+      when RemoteResult::Failed
+        []
+      else
+        libraries
+      end
       load_telegram_chat_authorizations
       load_audiobookshelf_cache_summary
     end
@@ -595,9 +601,50 @@ module Admin
     def validate_setting_value(key, value)
       validate_setting_type(key, value) ||
         validate_completed_download_import_mode(key, value) ||
+        validate_library_import_mode(key, value) ||
+        validate_default_request_format(key, value) ||
         validate_path_template(key, value) ||
         validate_indexer_url(key, value) ||
-        validate_ebooks_com_setting(key, value)
+        validate_ebooks_com_setting(key, value) ||
+        validate_auto_select_confidence_threshold(key, value) ||
+        validate_file_size_setting(key, value)
+    end
+
+    def validate_auto_select_confidence_threshold(key, value)
+      return nil unless key.to_s == "auto_select_confidence_threshold"
+
+      parsed = Integer(value.to_s, 10, exception: false)
+      return nil if parsed&.between?(0, 100)
+
+      "must be an integer from 0 to 100"
+    end
+
+    def validate_file_size_setting(key, value)
+      return nil unless SettingsService.file_size_limit_key?(key)
+
+      normalized = SettingsService.canonical_file_size_setting(value)
+      if normalized.present? && SettingsService.parse_file_size_bytes(normalized).nil?
+        return "must be a file size such as 200 KB, 50 MB, or 1.5 GB. A number alone means megabytes."
+      end
+
+      pair = SettingsService::FILE_SIZE_LIMIT_PAIRS.find { |min_key, max_key| [ min_key, max_key ].include?(key.to_sym) }
+      return nil unless pair
+
+      min_key, max_key = pair
+      min_bytes = SettingsService.parse_file_size_bytes(file_size_text_for_validation(min_key, key, normalized))
+      max_bytes = SettingsService.parse_file_size_bytes(file_size_text_for_validation(max_key, key, normalized))
+      return nil if min_bytes.nil? || max_bytes.nil? || min_bytes <= max_bytes
+
+      if key.to_sym == min_key
+        "must be less than or equal to #{SettingsService.label_for(max_key)}"
+      else
+        "must be greater than or equal to #{SettingsService.label_for(min_key)}"
+      end
+    end
+
+    def file_size_text_for_validation(limit_key, current_key, current_value)
+      raw = limit_key.to_sym == current_key.to_sym ? current_value : setting_value_for_validation(limit_key)
+      SettingsService.canonical_file_size_setting(raw)
     end
 
     def validate_setting_type(key, value)
@@ -621,6 +668,22 @@ module Admin
       return nil if SettingsService::COMPLETED_DOWNLOAD_IMPORT_MODES.include?(value.to_s)
 
       "must be one of: #{SettingsService::COMPLETED_DOWNLOAD_IMPORT_MODES.join(', ')}"
+    end
+
+    def validate_library_import_mode(key, value)
+      return nil unless SettingsService::LIBRARY_IMPORT_PERMISSION_KEYS.include?(key.to_sym)
+
+      text = value.to_s.strip
+      return nil if text.empty? || SettingsService.library_import_mode_acceptable?(key, text)
+
+      SettingsService.library_import_mode_requirement(key)
+    end
+
+    def validate_default_request_format(key, value)
+      return nil unless key.to_s == "default_request_format"
+      return nil if SettingsService::DEFAULT_REQUEST_FORMATS.include?(value.to_s)
+
+      "must be one of: #{SettingsService::DEFAULT_REQUEST_FORMATS.join(', ')}"
     end
 
     def validate_path_template(key, value)
@@ -800,6 +863,8 @@ module Admin
     end
 
     def normalize_setting_value(key, value)
+      return SettingsService.canonical_file_size_setting(value) if SettingsService.file_size_limit_key?(key)
+
       case key.to_s
       when "ebooks_com_country_code"
         value.to_s.strip.upcase
@@ -816,7 +881,7 @@ module Admin
       LibraryPlatformClient.libraries
     rescue LibraryPlatformClient::Error => e
       Rails.logger.warn "[SettingsController] Failed to fetch #{LibraryPlatformClient.display_name} libraries: #{e.message}"
-      []
+      RemoteResult::Failed.new(e)
     end
 
     def sync_telegram_transport

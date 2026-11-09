@@ -1971,6 +1971,108 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     assert_empty Dir.children(@dest_dir)
   end
 
+  test "hardlink identity probe cleanup names a mismatched probe" do
+    real_remove = FileCopyService.method(:remove_pinned_child_if_identity)
+    FileCopyService.stub(:remove_pinned_child_if_identity, lambda { |*arguments, **keywords|
+      _parent, basename, = arguments
+      replace_hardlink_probe(basename) { |path| File.write(path, "replacement probe") }
+      real_remove.call(*arguments, **keywords)
+    }) do
+      error = assert_hardlink_probe_removal_error("mismatch")
+
+      assert_instance_of FileCopyService::UnsafePathError, error
+      assert_nil error.cause
+    end
+  end
+
+  test "hardlink identity probe cleanup names a retained probe" do
+    real_remove = FileCopyService.method(:remove_pinned_child_if_identity)
+    FileCopyService.stub(:remove_pinned_child_if_identity, lambda { |*arguments, **keywords|
+      _parent, basename, = arguments
+      replace_hardlink_probe(basename) { |path| File.symlink(@src_file, path) }
+      real_remove.call(*arguments, **keywords)
+    }) do
+      error = assert_hardlink_probe_removal_error("retained")
+
+      assert_instance_of FileCopyService::UnsafePathError, error
+      assert_nil error.cause
+    end
+  end
+
+  test "hardlink identity probe cleanup names quarantine ownership and keeps its cause" do
+    FileCopyService.stub(:private_entry_owned_by_process?, ->(*) { false }) do
+      error = assert_hardlink_probe_removal_error("ownership")
+
+      assert_instance_of FileCopyService::UnsafePathError, error
+      assert_instance_of FileCopyService::UnsafePathError, error.cause
+      assert_equal "cleanup quarantine is owned by another user", error.cause.message
+    end
+  end
+
+  test "hardlink identity probe cleanup names an unsafe quarantine mode and keeps its cause" do
+    real_fchmod = FileCopyService.method(:native_fchmod)
+    FileCopyService.stub(:native_fchmod, ->(descriptor, _mode) { real_fchmod.call(descriptor, 0o600) }) do
+      error = assert_hardlink_probe_removal_error("mode")
+
+      assert_instance_of FileCopyService::UnsafeFilePermissionsError, error
+      assert_instance_of FileCopyService::UnsafeFilePermissionsError, error.cause
+      assert_equal "filesystem did not preserve safe directory permissions", error.cause.message
+    end
+  end
+
+  test "hardlink identity probe cleanup names a non-directory quarantine and keeps its cause" do
+    real_mkdir = FileCopyService.method(:native_mkdirat)
+    FileCopyService.stub(:native_mkdirat, lambda { |directory_fd, basename, mode|
+      result = real_mkdir.call(directory_fd, basename, mode)
+      next result unless basename.start_with?(".shelfarr-copy-quarantine-")
+
+      path = File.join(@dest_dir, basename)
+      FileUtils.rm_rf(path)
+      File.write(path, "not a directory")
+      result
+    }) do
+      error = assert_hardlink_probe_removal_error("symlink/non-directory")
+
+      assert_instance_of FileCopyService::UnsafePathError, error
+      assert_equal "destination contains a symbolic link or non-directory component", error.cause.message
+    end
+  end
+
+  test "hardlink identity probe cleanup names a cross-device removal failure and keeps its cause" do
+    FileCopyService.stub(:native_renameat, ->(*) { raise Errno::EXDEV, "cross-device link" }) do
+      error = assert_hardlink_probe_removal_error("Errno::EXDEV")
+
+      assert_instance_of Errno::EXDEV, error
+      assert_instance_of Errno::EXDEV, error.cause
+      assert_match(/cross-device link/, error.cause.message)
+    end
+  end
+
+  test "hardlink identity probe cleanup names a retained mismatched cleanup entry and keeps its cause" do
+    with_replaced_quarantine_entry do
+      FileCopyService.stub(:native_rename_noreplace, ->(*) { false }) do
+        error = assert_hardlink_probe_removal_error("retained cleanup entry")
+
+        assert_instance_of FileCopyService::UnsafePathError, error
+        assert_equal "mismatched cleanup entry was retained in quarantine", error.cause.message
+      end
+    end
+  end
+
+  test "hardlink identity probe cleanup names an occupied retained cleanup entry and keeps its cause" do
+    with_replaced_quarantine_entry do
+      FileCopyService.stub(:native_rename_noreplace, ->(*) { raise Errno::EEXIST }) do
+        error = assert_hardlink_probe_removal_error("retained cleanup entry")
+
+        assert_instance_of FileCopyService::UnsafePathError, error
+        assert_equal(
+          "mismatched cleanup entry was retained because its original path is occupied",
+          error.cause.message
+        )
+      end
+    end
+  end
+
   test "hardlink_noreplace preserves its typed fallback error when teardown is deferred" do
     destination = File.join(@dest_dir, "hardlinked.txt")
     capability_failure = lambda do |*|
@@ -3478,6 +3580,62 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     assert_equal "test content", File.binread(displaced)
   end
 
+  test "secure_library_file_mode accepts a private copy at the configured mode" do
+    SettingsService.set(:library_import_file_mode, "0664")
+    destination = File.join(@dest_dir, "chapter.mp3")
+    File.binwrite(destination, "chapter")
+    File.chmod(0o664, destination)
+
+    assert FileCopyService.secure_library_file_mode?(destination, root: @dest_dir)
+
+    linked = File.join(@dest_dir, "chapter-link.mp3")
+    File.link(destination, linked)
+    assert_not RemoteResult.succeeded?(
+      FileCopyService.secure_library_file_mode?(destination, root: @dest_dir)
+    )
+    assert_equal 0o664, File.stat(destination).mode & 0o777
+
+    File.unlink(linked)
+    File.chmod(0o640, destination)
+    assert FileCopyService.secure_library_file_mode?(destination, root: @dest_dir)
+
+    File.chmod(0o644, destination)
+    assert_not RemoteResult.succeeded?(
+      FileCopyService.secure_library_file_mode?(destination, root: @dest_dir)
+    )
+  end
+
+  test "hardlink verification accepts a private copy at the configured mode" do
+    SettingsService.set(:library_import_file_mode, "0664")
+    destination = File.join(@dest_dir, "chapter.mp3")
+    FileUtils.cp(@src_file, destination)
+    File.chmod(0o664, destination)
+    source_mode = File.stat(@src_file).mode & 0o777
+
+    snapshot = FileCopyService.verified_library_file_snapshot(
+      @src_file,
+      destination,
+      root: @dest_dir,
+      hardlink_mode: true
+    )
+
+    assert snapshot
+    assert_equal 0o664, File.stat(destination).mode & 0o777
+    assert_equal source_mode, File.stat(@src_file).mode & 0o777
+
+    File.link(destination, File.join(@dest_dir, "chapter-link.mp3"))
+    shared = FileCopyService.verified_library_file_snapshot(
+      @src_file,
+      destination,
+      root: @dest_dir,
+      hardlink_mode: true
+    )
+
+    assert_nil shared
+    assert_equal 0o664, File.stat(destination).mode & 0o777
+    assert_equal source_mode, File.stat(@src_file).mode & 0o777
+  end
+
   test "secure_library_file_mode checks a pinned revalidated regular file" do
     destination = File.join(@dest_dir, "library.txt")
     symlink = File.join(@dest_dir, "library-link.txt")
@@ -4030,6 +4188,68 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     assert_equal "changed bytes", File.binread(destination)
   end
 
+  test "remove_source_file retains its source when the verified destination disappears" do
+    destination = File.join(@dest_dir, "published-missing.txt")
+    FileCopyService.cp_noreplace(@src_file, destination, root: @dest_dir)
+    destination_snapshot = FileCopyService.verified_library_file_snapshot(
+      @src_file,
+      destination,
+      root: @dest_dir,
+      require_durable: true
+    )
+    source_snapshot = FileCopyService.snapshot_source_file(@src_file)
+    File.unlink(destination)
+
+    assert_not FileCopyService.remove_source_file(
+      source_snapshot,
+      destination_snapshot: destination_snapshot
+    )
+    assert_equal "test content", File.binread(@src_file)
+    assert_not File.exist?(destination)
+    assert_empty Dir.glob(File.join(@tmp_dir, ".shelfarr-source-quarantine-*"))
+  end
+
+  test "remove_source_file retains a quarantined source when its verified destination disappears" do
+    destination = File.join(@dest_dir, "published-quarantine.txt")
+    FileCopyService.cp_noreplace(@src_file, destination, root: @dest_dir)
+    destination_snapshot = FileCopyService.verified_library_file_snapshot(
+      @src_file,
+      destination,
+      root: @dest_dir,
+      require_durable: true
+    )
+    source_snapshot = FileCopyService.snapshot_source_file(@src_file)
+    real_unlink = FileCopyService.method(:native_unlinkat)
+    interrupted = false
+
+    unlinking = lambda do |directory_fd, basename, flags = 0|
+      if !interrupted && basename == FileCopyService::COPY_QUARANTINE_ENTRY
+        interrupted = true
+        raise Interrupt, "simulated hard interruption"
+      end
+
+      real_unlink.call(directory_fd, basename, flags)
+    end
+
+    FileCopyService.stub(:native_unlinkat, unlinking) do
+      assert_raises(Interrupt) do
+        FileCopyService.remove_source_file(
+          source_snapshot,
+          destination_snapshot: destination_snapshot
+        )
+      end
+    end
+    File.unlink(destination)
+
+    assert_not FileCopyService.remove_source_file(
+      source_snapshot,
+      destination_snapshot: destination_snapshot
+    )
+    assert_equal "test content", File.binread(@src_file)
+    assert_not File.exist?(destination)
+    assert_empty Dir.glob(File.join(@tmp_dir, ".shelfarr-source-quarantine-*"))
+  end
+
   test "remove_source_file validates the destination when the source is already missing" do
     destination = File.join(@dest_dir, "missing-source-destination.txt")
     FileCopyService.cp_noreplace(@src_file, destination, root: @dest_dir)
@@ -4471,16 +4691,16 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     FileUtils.mkdir_p(source_root_path)
     File.binwrite(File.join(source_root_path, "chapter.mp3"), "chapter")
     snapshot = FileCopyService.snapshot_source_root(source_root_path)
-    hex = "a" * 32
-    quarantine_path = File.join(@tmp_dir, ".shelfarr-remove-#{hex}")
+    quarantine_path = File.join(
+      @tmp_dir,
+      ".shelfarr-remove-#{snapshot.device.to_s(16)}-#{snapshot.inode.to_s(16)}"
+    )
     FileUtils.mkdir_p(quarantine_path)
     File.binwrite(File.join(quarantine_path, "other.mp3"), "other")
 
-    SecureRandom.stub(:hex, hex) do
-      FileCopyService.stub(:native_rename_noreplace, ->(*) { raise Errno::EINVAL, "renameat2" }) do
-        FileCopyService.stub(:native_renameat, ->(*) { flunk "plain rename must not replace a present quarantine name" }) do
-          assert_not FileCopyService.remove_source_tree(snapshot, allow_nonatomic: true)
-        end
+    FileCopyService.stub(:native_rename_noreplace, ->(*) { raise Errno::EINVAL, "renameat2" }) do
+      FileCopyService.stub(:native_renameat, ->(*) { flunk "plain rename must not replace a present quarantine name" }) do
+        assert_not FileCopyService.remove_source_tree(snapshot, allow_nonatomic: true)
       end
     end
 
@@ -4566,6 +4786,154 @@ class FileCopyServiceTest < ActiveSupport::TestCase
 
     assert_equal "replacement", File.binread(File.join(source_root_path, "replacement.mp3"))
     assert File.directory?(displaced)
+  end
+
+  test "remove_source_tree resumes deletion interrupted after quarantine" do
+    source_root_path = File.join(@tmp_dir, "download")
+    FileUtils.mkdir_p(File.join(source_root_path, "Disc One"))
+    File.binwrite(File.join(source_root_path, "audiobook.mp3"), "audio")
+    File.binwrite(File.join(source_root_path, "Disc One", "chapter.mp3"), "chapter")
+    snapshot = FileCopyService.snapshot_source_root(source_root_path)
+    quarantine_path = source_tree_quarantine_path(snapshot)
+    File.rename(source_root_path, quarantine_path)
+    File.unlink(File.join(quarantine_path, "Disc One", "chapter.mp3"))
+    child_quarantine = ".shelfarr-remove-child-#{SecureRandom.hex(16)}"
+    File.rename(
+      File.join(quarantine_path, "audiobook.mp3"),
+      File.join(quarantine_path, child_quarantine)
+    )
+
+    assert_equal true, FileCopyService.remove_source_tree(snapshot)
+    assert_not File.exist?(source_root_path)
+    assert_not File.exist?(quarantine_path)
+    assert_empty Dir.glob(File.join(@tmp_dir, ".shelfarr-remove-*"))
+  end
+
+  test "remove_source_tree completes when the source and owned quarantine are already gone" do
+    source_root_path = File.join(@tmp_dir, "download")
+    FileUtils.mkdir_p(source_root_path)
+    File.binwrite(File.join(source_root_path, "chapter.mp3"), "chapter")
+    snapshot = FileCopyService.snapshot_source_root(source_root_path)
+    FileUtils.rm_rf(source_root_path)
+    occupied = source_tree_quarantine_path(snapshot)
+    FileUtils.mkdir_p(occupied)
+    File.binwrite(File.join(occupied, "keep.mp3"), "keep")
+    unrelated = File.join(@tmp_dir, ".shelfarr-remove-#{SecureRandom.hex(16)}")
+    FileUtils.mkdir_p(unrelated)
+    File.binwrite(File.join(unrelated, "other.mp3"), "other")
+
+    assert_equal true, FileCopyService.remove_source_tree(snapshot)
+    assert_equal true, FileCopyService.remove_source_tree(snapshot)
+    assert_not File.exist?(source_root_path)
+    assert_equal "keep", File.binread(File.join(occupied, "keep.mp3"))
+    assert_equal "other", File.binread(File.join(unrelated, "other.mp3"))
+  end
+
+  test "remove_source_tree releases a finished source when a symlink replaces the original path" do
+    source_root_path = File.join(@tmp_dir, "download")
+    library = File.join(@tmp_dir, "library")
+    FileUtils.mkdir_p(source_root_path)
+    FileUtils.mkdir_p(library)
+    File.binwrite(File.join(source_root_path, "chapter.mp3"), "chapter")
+    File.binwrite(File.join(library, "chapter.mp3"), "library chapter")
+    snapshot = FileCopyService.snapshot_source_root(source_root_path)
+    FileUtils.rm_rf(source_root_path)
+    File.symlink(library, source_root_path)
+
+    assert_equal true, FileCopyService.remove_source_tree(snapshot)
+    assert File.symlink?(source_root_path)
+    assert_equal library, File.readlink(source_root_path)
+    assert_equal "library chapter", File.binread(File.join(library, "chapter.mp3"))
+  end
+
+  test "remove_source_tree releases a finished source when a file replaces the original path" do
+    source_root_path = File.join(@tmp_dir, "download")
+    FileUtils.mkdir_p(source_root_path)
+    File.binwrite(File.join(source_root_path, "chapter.mp3"), "chapter")
+    snapshot = FileCopyService.snapshot_source_root(source_root_path)
+    FileUtils.rm_rf(source_root_path)
+    File.binwrite(source_root_path, "replacement file")
+
+    assert_equal true, FileCopyService.remove_source_tree(snapshot)
+    assert File.file?(source_root_path)
+    assert_equal "replacement file", File.binread(source_root_path)
+  end
+
+  test "remove_source_tree deletes an owned quarantine without following a symlink at the original path" do
+    source_root_path = File.join(@tmp_dir, "download")
+    library = File.join(@tmp_dir, "library")
+    FileUtils.mkdir_p(File.join(source_root_path, "Disc One"))
+    FileUtils.mkdir_p(library)
+    File.binwrite(File.join(source_root_path, "audiobook.mp3"), "audio")
+    File.binwrite(File.join(source_root_path, "Disc One", "chapter.mp3"), "chapter")
+    File.binwrite(File.join(library, "keep.mp3"), "library")
+    snapshot = FileCopyService.snapshot_source_root(source_root_path)
+    quarantine_path = source_tree_quarantine_path(snapshot)
+    File.rename(source_root_path, quarantine_path)
+    File.unlink(File.join(quarantine_path, "Disc One", "chapter.mp3"))
+    File.symlink(library, source_root_path)
+
+    assert_equal true, FileCopyService.remove_source_tree(snapshot)
+    assert_not File.exist?(quarantine_path)
+    assert File.symlink?(source_root_path)
+    assert_equal library, File.readlink(source_root_path)
+    assert_equal "library", File.binread(File.join(library, "keep.mp3"))
+  end
+
+  test "remove_source_tree keeps an owned quarantine when a child quarantine name does not match" do
+    source_root_path = File.join(@tmp_dir, "download")
+    FileUtils.mkdir_p(source_root_path)
+    File.binwrite(File.join(source_root_path, "chapter.mp3"), "chapter")
+    snapshot = FileCopyService.snapshot_source_root(source_root_path)
+    quarantine_path = source_tree_quarantine_path(snapshot)
+    File.rename(source_root_path, quarantine_path)
+    foreign_name = ".shelfarr-remove-child-#{SecureRandom.hex(16)}"
+    File.binwrite(File.join(quarantine_path, foreign_name), "foreign")
+
+    assert_equal false, FileCopyService.remove_source_tree(snapshot)
+    assert_not File.exist?(source_root_path)
+    assert_equal "chapter", File.binread(File.join(quarantine_path, "chapter.mp3"))
+    assert_equal "foreign", File.binread(File.join(quarantine_path, foreign_name))
+  end
+
+  test "restore_owned_source_tree restores child quarantine names before publishing the root" do
+    source_root_path = File.join(@tmp_dir, "download")
+    FileUtils.mkdir_p(File.join(source_root_path, "Disc One"))
+    File.binwrite(File.join(source_root_path, "book.epub"), "epub bytes")
+    File.binwrite(File.join(source_root_path, "Disc One", "chapter.mp3"), "chapter")
+    snapshot = FileCopyService.snapshot_source_root(source_root_path)
+    quarantine_path = source_tree_quarantine_path(snapshot)
+    File.rename(source_root_path, quarantine_path)
+    nested_quarantine = File.join(quarantine_path, ".shelfarr-remove-child-#{SecureRandom.hex(16)}")
+    File.rename(File.join(quarantine_path, "Disc One"), nested_quarantine)
+    File.rename(
+      File.join(nested_quarantine, "chapter.mp3"),
+      File.join(nested_quarantine, ".shelfarr-remove-child-#{SecureRandom.hex(16)}")
+    )
+    File.rename(
+      File.join(quarantine_path, "book.epub"),
+      File.join(quarantine_path, ".shelfarr-remove-child-#{SecureRandom.hex(16)}")
+    )
+    real_rename = FileCopyService.method(:native_rename_noreplace)
+
+    result = FileCopyService.stub(:native_rename_noreplace, lambda { |source_fd, source_name, destination_fd, destination_name|
+      if source_name.to_s.start_with?(".shelfarr-remove-") &&
+          !source_name.to_s.start_with?(".shelfarr-remove-child-")
+        false
+      else
+        real_rename.call(source_fd, source_name, destination_fd, destination_name)
+      end
+    }) do
+      FileCopyService.restore_owned_source_tree(snapshot, allow_nonatomic: false)
+    end
+
+    assert RemoteResult.failed?(result)
+    assert File.directory?(quarantine_path)
+    assert_not File.exist?(source_root_path)
+    assert_equal [ "Disc One", "book.epub" ], Dir.children(quarantine_path).sort
+    assert_equal [ "chapter.mp3" ], Dir.children(File.join(quarantine_path, "Disc One"))
+    assert_equal "epub bytes", File.binread(File.join(quarantine_path, "book.epub"))
+    assert_equal "chapter", File.binread(File.join(quarantine_path, "Disc One", "chapter.mp3"))
   end
 
   test "create_private_directory creates a pinned owner-only child" do
@@ -5181,6 +5549,13 @@ class FileCopyServiceTest < ActiveSupport::TestCase
 
   private
 
+  def source_tree_quarantine_path(snapshot)
+    File.join(
+      snapshot.path.dirname.to_s,
+      ".shelfarr-remove-#{snapshot.device.to_s(16)}-#{snapshot.inode.to_s(16)}"
+    )
+  end
+
   def write_copy_lock(token, temporary_stat)
     lock = File.join(@dest_dir, ".shelfarr-copy-#{token}.lock")
     File.binwrite(
@@ -5225,6 +5600,50 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     end
 
     FileCopyService.stub(:native_rename_noreplace, fallback, &operation)
+  end
+
+  def assert_hardlink_probe_removal_error(detail)
+    destination = File.join(@dest_dir, "hardlinked.txt")
+    error = FileCopyService.stub(:native_linkat, ->(*) {
+      flunk "hardlink identity probe cleanup must fail before the source is linked"
+    }) do
+      assert_raises(StandardError) do
+        FileCopyService.hardlink_noreplace(
+          @src_file,
+          destination,
+          root: @dest_dir,
+          source_root: nil
+        )
+      end
+    end
+
+    assert_equal "hardlink identity probe could not be removed safely: #{detail}", error.message
+    assert_not File.exist?(destination)
+    assert_equal 1, File.stat(@src_file).nlink
+    error
+  end
+
+  def replace_hardlink_probe(basename)
+    return unless basename.start_with?(".shelfarr-hardlink-probe-")
+
+    path = File.join(@dest_dir, basename)
+    return unless File.exist?(path) || File.symlink?(path)
+
+    File.unlink(path)
+    yield path
+  end
+
+  def with_replaced_quarantine_entry(&operation)
+    real_renameat = FileCopyService.method(:native_renameat)
+    FileCopyService.stub(:native_renameat, lambda { |source_fd, source_name, destination_fd, destination_name|
+      real_renameat.call(source_fd, source_name, destination_fd, destination_name)
+      next unless destination_name == FileCopyService::COPY_QUARANTINE_ENTRY
+
+      quarantine = Dir.children(@dest_dir).grep(/\A\.shelfarr-copy-quarantine-/).sole
+      entry = File.join(@dest_dir, quarantine, FileCopyService::COPY_QUARANTINE_ENTRY)
+      File.unlink(entry)
+      File.write(entry, "replacement quarantine entry")
+    }, &operation)
   end
 
   def copy_quarantine_path(expected_stat, token)

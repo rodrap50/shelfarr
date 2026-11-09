@@ -420,7 +420,9 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert File.exist?(File.join(book_one_dest, "cover.png"))
     assert File.exist?(File.join(book_two_dest, "Book Two.m4b"))
     assert File.exist?(File.join(book_two_dest, "cover.png"))
-    assert File.exist?(File.join(book_two_dest, "README.md"))
+    assert_not File.exist?(File.join(book_one_dest, "README.md"))
+    assert_not File.exist?(File.join(book_two_dest, "README.md"))
+    assert_equal "release notes", File.read(File.join(@temp_source, "README.md"))
     assert_not File.exist?(File.join(book_two_dest, "Book One.jpg"))
     assert_not File.exist?(File.join(request_dest, "Book One.m4b"))
   end
@@ -436,6 +438,165 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert_equal expected_dest, @book.reload.file_path
     assert File.exist?(File.join(expected_dest, "audiobook.mp3"))
     assert File.exist?(File.join(expected_dest, "02 - audiobook.mp3"))
+  end
+
+  test "imports every audio part and recognized covers while leaving release extras in the download" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    disc_one = File.join(@temp_source, "Disc 1")
+    disc_two = File.join(@temp_source, "Disc 2")
+    FileUtils.mkdir_p(disc_one)
+    FileUtils.mkdir_p(disc_two)
+    File.write(File.join(disc_one, "01.mp3"), "part one")
+    File.write(File.join(disc_one, "02.mp3"), "part two")
+    File.write(File.join(disc_two, "01.flac"), "part three")
+    File.binwrite(File.join(@temp_source, "cover.jpg"), "cover bytes")
+    File.binwrite(File.join(@temp_source, "folder.png"), "folder cover")
+    File.binwrite(File.join(disc_one, "audiobook.jpg"), "disc image")
+    File.write(File.join(@temp_source, "release.nfo"), "nfo")
+    File.write(File.join(@temp_source, "readme.txt"), "notes")
+    File.write(File.join(@temp_source, "bonus.pdf"), "not audio")
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination = File.join(@temp_dest_base, @book.author, @book.title)
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal "part one", File.read(File.join(destination, "Disc 1", "01.mp3"))
+    assert_equal "part two", File.read(File.join(destination, "Disc 1", "02.mp3"))
+    assert_equal "part three", File.read(File.join(destination, "Disc 2", "01.flac"))
+    assert_equal "cover bytes", File.binread(File.join(destination, "cover.jpg"))
+    assert_equal "folder cover", File.binread(File.join(destination, "folder.png"))
+    assert_not File.exist?(File.join(destination, "Disc 1", "audiobook.jpg"))
+    assert_not File.exist?(File.join(destination, "release.nfo"))
+    assert_not File.exist?(File.join(destination, "readme.txt"))
+    assert_not File.exist?(File.join(destination, "bonus.pdf"))
+    assert_not File.exist?(File.join(disc_one, "01.mp3"))
+    assert_not File.exist?(File.join(@temp_source, "cover.jpg"))
+    assert File.exist?(File.join(disc_one, "audiobook.jpg"))
+    assert_equal "nfo", File.read(File.join(@temp_source, "release.nfo"))
+    assert_equal "notes", File.read(File.join(@temp_source, "readme.txt"))
+    assert_equal "not audio", File.read(File.join(@temp_source, "bonus.pdf"))
+    assert File.directory?(@temp_source)
+  end
+
+  test "marks an audiobook release for attention when it has no audio files" do
+    SettingsService.set(:audiobookshelf_url, "")
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.write(File.join(@temp_source, "readme.txt"), "notes")
+    File.binwrite(File.join(@temp_source, "banner.jpg"), "\xFF\xD8\xFFpromo".b)
+    File.binwrite(File.join(@temp_source, "cover.jpg"), "\xFF\xD8\xFFcover".b)
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination = File.join(@temp_dest_base, @book.author, @book.title)
+    assert @request.reload.attention_needed?
+    assert_match(/no supported audiobook files/i, @request.issue_description)
+    assert_not File.exist?(destination)
+    assert File.exist?(File.join(@temp_source, "readme.txt"))
+    assert File.exist?(File.join(@temp_source, "cover.jpg"))
+  end
+
+  test "imports an audio-only mp4 audiobook" do
+    SettingsService.set(:audiobookshelf_url, "")
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    source = File.join(@temp_source, "audiobook.mp4")
+    write_audio_only_mp4(source)
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination = File.join(@temp_dest_base, @book.author, @book.title, "audiobook.mp4")
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal File.binread(source), File.binread(destination)
+  end
+
+  test "imports an audio-only mp4 part mixed with another audiobook file" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:split_audiobook_bundle_imports, false)
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.write(File.join(@temp_source, "Book.m4b"), "book audio")
+    mp4 = File.join(@temp_source, "bonus.mp4")
+    write_audio_only_mp4(mp4)
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination = File.join(@temp_dest_base, @book.author, @book.title)
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal "book audio", File.read(File.join(destination, "Book.m4b"))
+    assert_equal File.binread(mp4), File.binread(File.join(destination, "bonus.mp4"))
+  end
+
+  test "moves the matching voucher with an accepted aaxc file" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:split_audiobook_bundle_imports, true)
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.binwrite(File.join(@temp_source, "Book.aaxc"), "encrypted audio")
+    File.binwrite(File.join(@temp_source, "Book.voucher"), "voucher bytes")
+    File.binwrite(File.join(@temp_source, "Extra.m4b"), "extra audio")
+    File.binwrite(File.join(@temp_source, "Extra.voucher"), "m4b voucher")
+    File.binwrite(File.join(@temp_source, "Other.voucher"), "unrelated voucher")
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination = File.join(@temp_dest_base, @book.author, @book.title)
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal "encrypted audio", File.binread(File.join(destination, "Book.aaxc"))
+    assert_equal "voucher bytes", File.binread(File.join(destination, "Book.voucher"))
+    assert_equal "extra audio", File.binread(File.join(destination, "Extra.m4b"))
+    assert_not File.exist?(File.join(destination, "Extra.voucher"))
+    assert_not File.exist?(File.join(destination, "Other.voucher"))
+    assert_not File.exist?(File.join(@temp_source, "Book.aaxc"))
+    assert_not File.exist?(File.join(@temp_source, "Book.voucher"))
+    assert_not File.exist?(File.join(@temp_source, "Extra.m4b"))
+    assert_equal "m4b voucher", File.binread(File.join(@temp_source, "Extra.voucher"))
+    assert_equal "unrelated voucher", File.binread(File.join(@temp_source, "Other.voucher"))
+  end
+
+  test "does not import a video mp4 as an audiobook" do
+    SettingsService.set(:audiobookshelf_url, "")
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.write(File.join(@temp_source, "Book.m4b"), "book audio")
+    write_video_mp4(File.join(@temp_source, "bonus.mp4"))
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination = File.join(@temp_dest_base, @book.author, @book.title)
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal "book audio", File.read(File.join(destination, "Book.m4b"))
+    assert_not File.exist?(File.join(destination, "bonus.mp4"))
+    assert File.exist?(File.join(@temp_source, "bonus.mp4"))
+  end
+
+  test "imports a cover image named like the audiobook file" do
+    SettingsService.set(:audiobookshelf_url, "")
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.write(File.join(@temp_source, "Dune.m4b"), "dune audio")
+    File.binwrite(File.join(@temp_source, "Dune.jpg"), "dune cover")
+    File.binwrite(File.join(@temp_source, "cover.jpg"), "generic cover")
+    File.binwrite(File.join(@temp_source, "banner.jpg"), "banner")
+    File.write(File.join(@temp_source, "release.nfo"), "nfo")
+    disc = File.join(@temp_source, "Disc 1")
+    FileUtils.mkdir_p(disc)
+    File.write(File.join(disc, "01.mp3"), "part")
+    File.binwrite(File.join(disc, "01.jpg"), "part cover")
+    File.binwrite(File.join(disc, "audiobook.jpg"), "unrelated")
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination = File.join(@temp_dest_base, @book.author, @book.title)
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal "dune audio", File.read(File.join(destination, "Dune.m4b"))
+    assert_equal "dune cover", File.binread(File.join(destination, "Dune.jpg"))
+    assert_equal "generic cover", File.binread(File.join(destination, "cover.jpg"))
+    assert_equal "part", File.read(File.join(destination, "Disc 1", "01.mp3"))
+    assert_equal "part cover", File.binread(File.join(destination, "Disc 1", "01.jpg"))
+    assert_not File.exist?(File.join(destination, "banner.jpg"))
+    assert_not File.exist?(File.join(destination, "release.nfo"))
+    assert_not File.exist?(File.join(destination, "Disc 1", "audiobook.jpg"))
+    assert_equal "banner", File.binread(File.join(@temp_source, "banner.jpg"))
+    assert_equal "nfo", File.read(File.join(@temp_source, "release.nfo"))
+    assert_equal "unrelated", File.binread(File.join(disc, "audiobook.jpg"))
   end
 
   test "splits audiobook bundles into subfolders even when audiobook path template is blank" do
@@ -570,6 +731,56 @@ class PostProcessingJobTest < ActiveJob::TestCase
       refute_equal [ File.stat(original_file).dev, File.stat(original_file).ino ],
         [ File.stat(destination_file).dev, File.stat(destination_file).ino ]
     end
+  end
+
+  test "copy and reference imports do not run the hardlink identity probe" do
+    SettingsService.set(:audiobookshelf_url, "")
+    probe = ->(*) { flunk "the hardlink identity probe runs only when the import hardlinks" }
+    source = File.join(@temp_source, "audiobook.mp3")
+    destination = File.join(@temp_dest_base, @book.author, @book.title, "audiobook.mp3")
+
+    FileCopyService.stub(:verify_hardlink_identity_support!, probe) do
+      PostProcessingJob.perform_now(@download.id)
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert File.file?(destination)
+    refute_equal [ File.stat(source).dev, File.stat(source).ino ],
+      [ File.stat(destination).dev, File.stat(destination).ino ]
+
+    FileUtils.rm_rf(File.dirname(destination))
+    @request.update!(status: :downloading, issue_description: nil)
+    @download.update!(status: :completed, post_processing_job_id: nil)
+    SettingsService.set(:completed_download_import_mode, "reference")
+
+    FileCopyService.stub(:verify_hardlink_identity_support!, probe) do
+      PostProcessingJob.perform_now(@download.id)
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert File.symlink?(destination)
+    assert_equal Pathname(source).expand_path.to_s, File.readlink(destination)
+  end
+
+  test "hardlink imports run the hardlink identity probe" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "hardlink")
+    probed = false
+    real_probe = FileCopyService.method(:verify_hardlink_identity_support!)
+
+    FileCopyService.stub(:verify_hardlink_identity_support!, ->(*arguments) {
+      probed = true
+      real_probe.call(*arguments)
+    }) do
+      PostProcessingJob.perform_now(@download.id)
+    end
+
+    assert probed
+    assert @request.reload.completed?, @request.issue_description
+    source = File.join(@temp_source, "audiobook.mp3")
+    destination = File.join(@temp_dest_base, @book.author, @book.title, "audiobook.mp3")
+    assert_equal [ File.stat(source).dev, File.stat(source).ino ],
+      [ File.stat(destination).dev, File.stat(destination).ino ]
   end
 
   test "hardlinks directory imports and retains the source without scheduling cleanup" do
@@ -1204,6 +1415,600 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert_not File.exist?(@temp_source), "Source download folder should be removed after successful import"
   end
 
+  test "directory move keeps torrent ownership until the pending source deletion finishes" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    nested = File.join(@temp_source, "Disc One")
+    FileUtils.mkdir_p(nested)
+    File.write(File.join(nested, "chapter.mp3"), "chapter audio")
+    client = DownloadClient.create!(
+      name: "Directory move ownership",
+      client_type: "transmission",
+      url: "http://localhost:9091",
+      username: "transmission",
+      password: "transmission"
+    )
+    external_id = "ab" * 20
+    @download.update!(
+      download_client: client,
+      download_type: "torrent",
+      external_id: external_id
+    )
+    job = PostProcessingJob.new(@download.id)
+    observed = {}
+    original_removal = job.method(:remove_import_source)
+
+    job.stub(:remove_import_source, lambda { |source_cleanup|
+      download = @download.reload
+      observed[:released_at] = download.external_id_released_at
+      observed[:cleanup_state] = download.post_processing_cleanup_state
+      observed[:owner_id] = DownloadJob.new.send(
+        :other_download_with_external_id,
+        external_id,
+        0,
+        download_client_id: client.id
+      )&.id
+      original_removal.call(source_cleanup)
+    }) do
+      job.perform_now
+    end
+
+    assert_nil observed[:released_at], "pending directory deletion should keep the client id"
+    assert observed[:cleanup_state].present?, "pending directory deletion should be a live claim"
+    assert_equal @download.id, observed[:owner_id]
+    assert_not File.exist?(@temp_source)
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+    assert_nil DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )
+  end
+
+  test "directory move recovery finishes pending source deletion before releasing ownership" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    nested = File.join(@temp_source, "Disc One")
+    FileUtils.mkdir_p(nested)
+    File.write(File.join(nested, "chapter.mp3"), "chapter audio")
+    client = DownloadClient.create!(
+      name: "Directory move recovery",
+      client_type: "transmission",
+      url: "http://localhost:9091",
+      username: "transmission",
+      password: "transmission"
+    )
+    external_id = "cd" * 20
+    @download.update!(
+      download_client: client,
+      download_type: "torrent",
+      external_id: external_id
+    )
+    job = PostProcessingJob.new(@download.id)
+
+    job.stub(:remove_import_source, ->(*) { raise Interrupt, "simulated post-commit interruption" }) do
+      assert_raises(Interrupt) { job.perform_now }
+    end
+
+    assert @request.reload.completed?
+    assert File.exist?(@temp_source)
+    assert @download.reload.post_processing_cleanup_state.present?
+    assert_nil @download.external_id_released_at
+    assert_equal @download.id, DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )&.id
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert_not File.exist?(@temp_source)
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+    assert_nil DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )
+  end
+
+  test "directory move recovery resumes cleanup interrupted after quarantine" do
+    external_id = "ef" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    source_stat = File.stat(@temp_source)
+    quarantine = File.join(
+      @temp_download_base,
+      ".shelfarr-remove-#{source_stat.dev.to_s(16)}-#{source_stat.ino.to_s(16)}"
+    )
+    File.rename(@temp_source, quarantine)
+    File.unlink(File.join(quarantine, "Disc One", "chapter.mp3"))
+    assert @request.post_processing_recovery_pending?
+    assert @book.post_processing_recovery_pending?
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert_not File.exist?(@temp_source)
+    assert_not File.exist?(quarantine)
+    assert_empty Dir.glob(File.join(@temp_download_base, ".shelfarr-remove-*"))
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+    assert_not @request.reload.post_processing_recovery_pending?
+    assert_not @book.reload.post_processing_recovery_pending?
+    assert_nil DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )
+    assert_nothing_raised { @request.destroy! }
+    assert_nothing_raised { @book.destroy! }
+  end
+
+  test "directory move recovery releases the cleanup claim when deletion finished first" do
+    external_id = "91" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    FileUtils.rm_rf(@temp_source)
+    assert @request.post_processing_recovery_pending?
+    assert @book.post_processing_recovery_pending?
+    assert_equal @download.id, DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )&.id
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+    assert_not @request.reload.post_processing_recovery_pending?
+    assert_not @book.reload.post_processing_recovery_pending?
+    assert_nil DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )
+    assert_nothing_raised { @request.destroy! }
+    assert_nothing_raised { @book.destroy! }
+  end
+
+  test "directory move recovery releases the cleanup claim when a symlink replaces a finished source" do
+    external_id = "a7" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    source_stat = File.stat(@temp_source)
+    quarantine = File.join(
+      @temp_download_base,
+      ".shelfarr-remove-#{source_stat.dev.to_s(16)}-#{source_stat.ino.to_s(16)}"
+    )
+    library = File.join(@temp_dest_base, @book.author, @book.title)
+    File.rename(@temp_source, quarantine)
+    FileUtils.rm_rf(quarantine)
+    File.symlink(library, @temp_source)
+    assert @request.post_processing_recovery_pending?
+    assert @book.post_processing_recovery_pending?
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert File.symlink?(@temp_source)
+    assert_equal library, File.readlink(@temp_source)
+    assert_equal "test audio content", File.binread(File.join(library, "audiobook.mp3"))
+    assert_equal "chapter audio", File.binread(File.join(library, "Disc One", "chapter.mp3"))
+    assert_not File.exist?(quarantine)
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+    assert_not @request.reload.post_processing_recovery_pending?
+    assert_not @book.reload.post_processing_recovery_pending?
+    assert_nil DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )
+    assert_nothing_raised { @request.destroy! }
+    assert_nothing_raised { @book.destroy! }
+  end
+
+  test "directory move recovery restores an owned quarantine when an imported file changed" do
+    external_id = "b8" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    source_stat = File.stat(@temp_source)
+    quarantine = File.join(
+      @temp_download_base,
+      ".shelfarr-remove-#{source_stat.dev.to_s(16)}-#{source_stat.ino.to_s(16)}"
+    )
+    File.rename(@temp_source, quarantine)
+    File.unlink(File.join(quarantine, "Disc One", "chapter.mp3"))
+    library_file = File.join(@temp_dest_base, @book.author, @book.title, "audiobook.mp3")
+    File.binwrite(library_file, "tagged by the operator")
+    assert @request.post_processing_recovery_pending?
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert_not File.exist?(quarantine)
+    assert File.directory?(@temp_source)
+    assert_equal "test audio content", File.binread(File.join(@temp_source, "audiobook.mp3"))
+    assert_not File.exist?(File.join(@temp_source, "Disc One", "chapter.mp3"))
+    assert_equal "tagged by the operator", File.binread(library_file)
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+    assert_not @request.reload.post_processing_recovery_pending?
+    assert_not @book.reload.post_processing_recovery_pending?
+    assert_nil DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )
+    assert_nothing_raised { @request.destroy! }
+    assert_nothing_raised { @book.destroy! }
+  end
+
+  test "directory move recovery keeps the cleanup claim until an owned quarantine can be restored" do
+    external_id = "c9" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    source_stat = File.stat(@temp_source)
+    quarantine = File.join(
+      @temp_download_base,
+      ".shelfarr-remove-#{source_stat.dev.to_s(16)}-#{source_stat.ino.to_s(16)}"
+    )
+    File.rename(@temp_source, quarantine)
+    File.unlink(File.join(quarantine, "audiobook.mp3"))
+    FileUtils.mkdir_p(@temp_source)
+    File.binwrite(File.join(@temp_source, "new-download.mp3"), "new download")
+    library_file = File.join(@temp_dest_base, @book.author, @book.title, "audiobook.mp3")
+    File.binwrite(library_file, "tagged by the operator")
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert File.directory?(quarantine)
+    assert_equal "chapter audio", File.binread(File.join(quarantine, "Disc One", "chapter.mp3"))
+    assert_equal "new download", File.binread(File.join(@temp_source, "new-download.mp3"))
+    assert_equal "tagged by the operator", File.binread(library_file)
+    assert @download.reload.post_processing_cleanup_state.present?
+    assert_nil @download.external_id_released_at
+    assert @request.reload.post_processing_recovery_pending?
+    assert @book.reload.post_processing_recovery_pending?
+    assert_equal @download.id, DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )&.id
+    assert_raises(ActiveRecord::RecordNotDestroyed) { @request.destroy! }
+    assert_raises(ActiveRecord::RecordNotDestroyed) { @book.reload.destroy! }
+  end
+
+  test "directory move recovery releases the cleanup claim when the source parent is already gone" do
+    external_id = "d4" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    library_file = File.join(@temp_dest_base, @book.author, @book.title, "audiobook.mp3")
+    File.binwrite(library_file, "tagged by the operator")
+    FileUtils.rm_rf(@temp_download_base)
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert_equal "tagged by the operator", File.binread(library_file)
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+    assert_not @request.reload.post_processing_recovery_pending?
+    assert_not @book.reload.post_processing_recovery_pending?
+    assert_nil DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )
+    assert_nothing_raised { @request.destroy! }
+    assert_nothing_raised { @book.destroy! }
+  end
+
+  test "directory move recovery releases ownership when the source parent is gone and the library is unchanged" do
+    external_id = "e6" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    library = File.join(@temp_dest_base, @book.author, @book.title)
+    library_audio = File.binread(File.join(library, "audiobook.mp3"))
+    library_chapter = File.binread(File.join(library, "Disc One", "chapter.mp3"))
+    FileUtils.rm_rf(@temp_download_base)
+    assert_not File.exist?(@temp_download_base)
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert_equal library_audio, File.binread(File.join(library, "audiobook.mp3"))
+    assert_equal library_chapter, File.binread(File.join(library, "Disc One", "chapter.mp3"))
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+    assert_not @request.reload.post_processing_recovery_pending?
+    assert_not @book.reload.post_processing_recovery_pending?
+    assert_nil DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )
+    assert_nothing_raised { @request.destroy! }
+    assert_nothing_raised { @book.destroy! }
+  end
+
+  test "directory move recovery keeps ownership when deletion raises ENOENT inside an owned quarantine" do
+    external_id = "e7" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    source_stat = File.stat(@temp_source)
+    quarantine = File.join(
+      @temp_download_base,
+      ".shelfarr-remove-#{source_stat.dev.to_s(16)}-#{source_stat.ino.to_s(16)}"
+    )
+    File.rename(@temp_source, quarantine)
+    child_quarantine = ".shelfarr-remove-child-#{SecureRandom.hex(16)}"
+    File.rename(
+      File.join(quarantine, "audiobook.mp3"),
+      File.join(quarantine, child_quarantine)
+    )
+
+    FileCopyService.stub(:native_unlinkat, ->(*) { raise Errno::ENOENT, "missing child" }) do
+      PostProcessingRecoveryJob.perform_now
+    end
+
+    assert File.directory?(quarantine)
+    assert_equal "test audio content", File.binread(File.join(quarantine, child_quarantine))
+    assert_includes files_under(quarantine).map { |path| File.binread(path) }, "chapter audio"
+    assert @download.reload.post_processing_cleanup_state.present?
+    assert_nil @download.external_id_released_at
+    assert @request.reload.post_processing_recovery_pending?
+    assert @book.reload.post_processing_recovery_pending?
+    assert_equal @download.id, DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )&.id
+    assert_raises(ActiveRecord::RecordNotDestroyed) { @request.destroy! }
+    assert_raises(ActiveRecord::RecordNotDestroyed) { @book.reload.destroy! }
+  end
+
+  test "directory move recovery restores quarantined child names when an imported file changed" do
+    external_id = "e8" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    source_stat = File.stat(@temp_source)
+    quarantine = File.join(
+      @temp_download_base,
+      ".shelfarr-remove-#{source_stat.dev.to_s(16)}-#{source_stat.ino.to_s(16)}"
+    )
+    File.rename(@temp_source, quarantine)
+    nested_quarantine = File.join(quarantine, ".shelfarr-remove-child-#{SecureRandom.hex(16)}")
+    File.rename(File.join(quarantine, "Disc One"), nested_quarantine)
+    File.rename(
+      File.join(nested_quarantine, "chapter.mp3"),
+      File.join(nested_quarantine, ".shelfarr-remove-child-#{SecureRandom.hex(16)}")
+    )
+    File.rename(
+      File.join(quarantine, "audiobook.mp3"),
+      File.join(quarantine, ".shelfarr-remove-child-#{SecureRandom.hex(16)}")
+    )
+    library_file = File.join(@temp_dest_base, @book.author, @book.title, "audiobook.mp3")
+    File.binwrite(library_file, "tagged by the operator")
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert_not File.exist?(quarantine)
+    assert_equal [ "Disc One", "audiobook.mp3" ], Dir.children(@temp_source).sort
+    assert_equal [ "chapter.mp3" ], Dir.children(File.join(@temp_source, "Disc One"))
+    assert_equal "test audio content", File.binread(File.join(@temp_source, "audiobook.mp3"))
+    assert_equal "chapter audio", File.binread(File.join(@temp_source, "Disc One", "chapter.mp3"))
+    assert_equal "tagged by the operator", File.binread(library_file)
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+    assert_not @request.reload.post_processing_recovery_pending?
+    assert_not @book.reload.post_processing_recovery_pending?
+    assert_nil DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )
+    assert_nothing_raised { @request.destroy! }
+    assert_nothing_raised { @book.destroy! }
+  end
+
+  test "directory move recovery keeps ownership when a child quarantine does not match the source" do
+    external_id = "e9" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    source_stat = File.stat(@temp_source)
+    quarantine = File.join(
+      @temp_download_base,
+      ".shelfarr-remove-#{source_stat.dev.to_s(16)}-#{source_stat.ino.to_s(16)}"
+    )
+    File.rename(@temp_source, quarantine)
+    foreign_name = ".shelfarr-remove-child-#{SecureRandom.hex(16)}"
+    File.binwrite(File.join(quarantine, foreign_name), "foreign bytes")
+    library_file = File.join(@temp_dest_base, @book.author, @book.title, "audiobook.mp3")
+    File.binwrite(library_file, "tagged by the operator")
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert File.directory?(quarantine)
+    assert_not File.exist?(@temp_source)
+    assert_equal "foreign bytes", File.binread(File.join(quarantine, foreign_name))
+    assert_equal "test audio content", File.binread(File.join(quarantine, "audiobook.mp3"))
+    assert_equal "chapter audio", File.binread(File.join(quarantine, "Disc One", "chapter.mp3"))
+    assert_equal "tagged by the operator", File.binread(library_file)
+    assert @download.reload.post_processing_cleanup_state.present?
+    assert_nil @download.external_id_released_at
+    assert @request.reload.post_processing_recovery_pending?
+    assert @book.reload.post_processing_recovery_pending?
+    assert_equal @download.id, DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )&.id
+    assert_raises(ActiveRecord::RecordNotDestroyed) { @request.destroy! }
+    assert_raises(ActiveRecord::RecordNotDestroyed) { @book.reload.destroy! }
+  end
+
+  test "directory move recovery keeps the cleanup claim when the download filesystem is not mounted" do
+    category = File.join(@temp_download_base, "shelfarr")
+    nested_source = File.join(category, "Book")
+    FileUtils.mkdir_p(category)
+    FileUtils.mv(@temp_source, nested_source)
+    @temp_source = nested_source
+    @download.update!(download_path: @temp_source)
+    external_id = "f1" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    source_stat = File.stat(@temp_source)
+    quarantine_name = ".shelfarr-remove-#{source_stat.dev.to_s(16)}-#{source_stat.ino.to_s(16)}"
+    quarantine = File.join(category, quarantine_name)
+    File.rename(@temp_source, quarantine)
+    original_state = @download.reload.post_processing_cleanup_state
+    hidden_disk = Dir.mktmpdir("unmounted-download")
+    preserved = File.join(hidden_disk, "shelfarr")
+    FileUtils.mv(category, preserved)
+    payload = JSON.parse(original_state)
+    # The mountpoint is still here, on a different device than the snapshot.
+    payload["source_root"]["parent_device"] = File.stat(@temp_download_base).dev + 1
+    @download.update!(post_processing_cleanup_state: JSON.generate(payload))
+    assert File.directory?(@temp_download_base)
+    assert_not File.exist?(category)
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert File.directory?(File.join(preserved, quarantine_name))
+    assert_equal "chapter audio", File.binread(File.join(preserved, quarantine_name, "Disc One", "chapter.mp3"))
+    assert @download.reload.post_processing_cleanup_state.present?
+    assert_nil @download.external_id_released_at
+    assert @request.reload.post_processing_recovery_pending?
+    assert_equal @download.id, DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )&.id
+
+    FileUtils.mv(preserved, category)
+    @download.update!(post_processing_cleanup_state: original_state)
+    PostProcessingRecoveryJob.perform_now
+
+    assert_not File.exist?(quarantine)
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+    assert_nil DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )
+  ensure
+    FileUtils.rm_rf(hidden_disk) if hidden_disk
+  end
+
+  test "directory move recovery restores quarantined child names when the owned source file changed" do
+    external_id = "f2" * 20
+    client = interrupt_directory_move_before_source_deletion(external_id: external_id)
+    source_stat = File.stat(@temp_source)
+    quarantine = File.join(
+      @temp_download_base,
+      ".shelfarr-remove-#{source_stat.dev.to_s(16)}-#{source_stat.ino.to_s(16)}"
+    )
+    File.rename(@temp_source, quarantine)
+    disc_quarantine = File.join(quarantine, ".shelfarr-remove-child-#{SecureRandom.hex(16)}")
+    File.rename(File.join(quarantine, "Disc One"), disc_quarantine)
+    chapter_quarantine = File.join(disc_quarantine, ".shelfarr-remove-child-#{SecureRandom.hex(16)}")
+    File.rename(File.join(disc_quarantine, "chapter.mp3"), chapter_quarantine)
+    File.binwrite(chapter_quarantine, "tagged chapter")
+    library = File.join(@temp_dest_base, @book.author, @book.title)
+    assert_equal "chapter audio", File.binread(File.join(library, "Disc One", "chapter.mp3"))
+
+    PostProcessingRecoveryJob.perform_now
+
+    assert_not File.exist?(quarantine)
+    assert_equal [ "Disc One", "audiobook.mp3" ], Dir.children(@temp_source).sort
+    assert_equal [ "chapter.mp3" ], Dir.children(File.join(@temp_source, "Disc One"))
+    assert_equal "tagged chapter", File.binread(File.join(@temp_source, "Disc One", "chapter.mp3"))
+    assert_equal "test audio content", File.binread(File.join(@temp_source, "audiobook.mp3"))
+    assert_equal "chapter audio", File.binread(File.join(library, "Disc One", "chapter.mp3"))
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+    assert_not @request.reload.post_processing_recovery_pending?
+    assert_nil DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )
+  end
+
+  test "directory move keeps the cleanup claim when a child rename raises ENOENT" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    nested = File.join(@temp_source, "Disc One")
+    FileUtils.mkdir_p(nested)
+    File.write(File.join(nested, "chapter.mp3"), "chapter audio")
+    client = DownloadClient.create!(
+      name: "Directory move child ENOENT",
+      client_type: "transmission",
+      url: "http://localhost:9091",
+      username: "transmission",
+      password: "transmission"
+    )
+    external_id = "f3" * 20
+    @download.update!(
+      download_client: client,
+      download_type: "torrent",
+      external_id: external_id
+    )
+    source_stat = File.stat(@temp_source)
+    quarantine = File.join(
+      @temp_download_base,
+      ".shelfarr-remove-#{source_stat.dev.to_s(16)}-#{source_stat.ino.to_s(16)}"
+    )
+    real_rename = FileCopyService.method(:native_rename_noreplace)
+
+    FileCopyService.stub(:native_rename_noreplace, lambda { |source_fd, source_name, destination_fd, destination_name|
+      if destination_name.to_s.start_with?(".shelfarr-remove-child-")
+        raise Errno::ENOENT, "missing child"
+      end
+
+      real_rename.call(source_fd, source_name, destination_fd, destination_name)
+    }) do
+      PostProcessingJob.perform_now(@download.id)
+    end
+
+    assert @request.reload.completed?
+    assert File.directory?(quarantine)
+    assert_equal "chapter audio", File.binread(File.join(quarantine, "Disc One", "chapter.mp3"))
+    assert @download.reload.post_processing_cleanup_state.present?
+    assert_nil @download.external_id_released_at
+    assert_equal @download.id, DownloadJob.new.send(
+      :other_download_with_external_id,
+      external_id,
+      0,
+      download_client_id: client.id
+    )&.id
+    assert_raises(ActiveRecord::RecordNotDestroyed) { @request.destroy! }
+  end
+
+  test "directory cleanup recovery holds the post-processing lock while deleting" do
+    external_id = "f4" * 20
+    interrupt_directory_move_before_source_deletion(external_id: external_id)
+    held_during_delete = false
+    real_remove = FileCopyService.method(:remove_source_tree)
+
+    FileCopyService.stub(:remove_source_tree, lambda { |source_root, allow_nonatomic: false|
+      held_during_delete = post_processing_lock_busy?(@download.id)
+      real_remove.call(source_root, allow_nonatomic: allow_nonatomic)
+    }) do
+      PostProcessingRecoveryJob.perform_now
+    end
+
+    assert held_during_delete
+    assert_not File.exist?(@temp_source)
+    assert_nil @download.reload.post_processing_cleanup_state
+  end
+
   test "move import removes the source on NFS EINVAL when non-atomic publication is enabled" do
     SettingsService.set(:audiobookshelf_url, "")
     SettingsService.set(:completed_download_import_mode, "move")
@@ -1238,7 +2043,7 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert_no_match(/Source directory changed/, output)
   end
 
-  test "removes source directory after split audiobook bundle move import" do
+  test "moves split audiobook audio and leaves hidden release metadata in the download" do
     SettingsService.set(:audiobookshelf_url, "")
     SettingsService.set(:split_audiobook_bundle_imports, true)
     SettingsService.set(:completed_download_import_mode, "move")
@@ -1253,11 +2058,56 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert @request.reload.completed?
     assert File.exist?(File.join(@temp_dest_base, @book.author, "Book One", "Book One.m4b"))
     assert File.exist?(File.join(@temp_dest_base, @book.author, "Book Two", "Book Two.m4b"))
-    assert File.exist?(File.join(@temp_dest_base, @book.author, "Book Two", ".bundle-metadata.json"))
-    assert_not File.exist?(@temp_source), "Source download folder should be removed after successful split import"
+    assert_not File.exist?(File.join(@temp_dest_base, @book.author, "Book Two", ".bundle-metadata.json"))
+    assert_not File.exist?(File.join(@temp_source, "Book One.m4b"))
+    assert_not File.exist?(File.join(@temp_source, "Book Two.m4b"))
+    assert_equal "release metadata", File.read(File.join(@temp_source, ".bundle-metadata.json"))
   end
 
-  test "preserves hidden directories when bundle splitting falls back" do
+  test "moves a shared split-bundle cover once and still removes the usenet download" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:split_audiobook_bundle_imports, true)
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:remove_completed_usenet_downloads, true)
+    @book.update!(title: "Book Two")
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.write(File.join(@temp_source, "Book One.m4b"), "book one audio")
+    File.write(File.join(@temp_source, "Book Two.m4b"), "book two audio")
+    File.binwrite(File.join(@temp_source, "cover.png"), "shared cover")
+    File.write(File.join(@temp_source, "Book One.nfo"), "book one notes")
+    client = DownloadClient.create!(
+      name: "SABnzbd Shared Cover",
+      client_type: :sabnzbd,
+      url: "http://localhost:8080",
+      api_key: "test-api-key"
+    )
+    @download.update!(download_client: client, external_id: "SABnzbd_nzo_sharedcover")
+
+    VCR.turned_off do
+      history = stub_partial_move_usenet_history("SABnzbd_nzo_sharedcover")
+
+      PostProcessingJob.perform_now(@download.id)
+
+      assert_requested history
+    end
+
+    book_one = File.join(@temp_dest_base, @book.author, "Book One")
+    book_two = File.join(@temp_dest_base, @book.author, "Book Two")
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal "book one audio", File.read(File.join(book_one, "Book One.m4b"))
+    assert_equal "book two audio", File.read(File.join(book_two, "Book Two.m4b"))
+    assert_equal "shared cover", File.binread(File.join(book_one, "cover.png"))
+    assert_equal "shared cover", File.binread(File.join(book_two, "cover.png"))
+    assert_not File.exist?(File.join(book_one, "Book One.nfo"))
+    assert_not File.exist?(File.join(book_two, "Book One.nfo"))
+    assert_not File.exist?(File.join(@temp_source, "Book One.m4b"))
+    assert_not File.exist?(File.join(@temp_source, "Book Two.m4b"))
+    assert_not File.exist?(File.join(@temp_source, "cover.png"))
+    assert_equal "book one notes", File.read(File.join(@temp_source, "Book One.nfo"))
+    assert_nil @download.reload.post_processing_cleanup_state
+  end
+
+  test "leaves hidden release metadata in the download when bundle splitting falls back" do
     SettingsService.set(:audiobookshelf_url, "")
     SettingsService.set(:split_audiobook_bundle_imports, true)
     SettingsService.set(:completed_download_import_mode, "move")
@@ -1274,8 +2124,10 @@ class PostProcessingJobTest < ActiveJob::TestCase
     request_destination = File.join(@temp_dest_base, @book.author, @book.title)
     assert @request.reload.completed?
     assert File.exist?(File.join(request_destination, "Book One.m4b"))
-    assert File.exist?(File.join(request_destination, ".release-metadata", "manifest.json"))
-    assert_not File.exist?(@temp_source)
+    assert File.exist?(File.join(request_destination, "Book Two.m4b"))
+    assert_not File.exist?(File.join(request_destination, ".release-metadata"))
+    assert_not File.exist?(File.join(@temp_source, "Book One.m4b"))
+    assert_equal "{}", File.read(File.join(hidden_directory, "manifest.json"))
   end
 
   test "rejects split destinations inside the source before move cleanup" do
@@ -1605,7 +2457,7 @@ class PostProcessingJobTest < ActiveJob::TestCase
     end
   end
 
-  test "keeps exact-stem companions with each split book during move import" do
+  test "moves split audiobook audio and leaves exact-stem booklets in the download" do
     SettingsService.set(:audiobookshelf_url, "")
     SettingsService.set(:split_audiobook_bundle_imports, true)
     SettingsService.set(:completed_download_import_mode, "move")
@@ -1622,10 +2474,12 @@ class PostProcessingJobTest < ActiveJob::TestCase
     book_two_dest = File.join(@temp_dest_base, @book.author, "Book Two")
     assert @request.reload.completed?
     assert File.exist?(File.join(book_one_dest, "Book One.aax"))
-    assert File.exist?(File.join(book_one_dest, "Book One.pdf"))
+    assert_not File.exist?(File.join(book_one_dest, "Book One.pdf"))
     assert File.exist?(File.join(book_two_dest, "Book Two.aax"))
-    assert File.exist?(File.join(book_two_dest, "Book Two.pdf"))
-    assert_not File.exist?(@temp_source)
+    assert_not File.exist?(File.join(book_two_dest, "Book Two.pdf"))
+    assert_not File.exist?(File.join(@temp_source, "Book One.aax"))
+    assert_equal "book one companion", File.read(File.join(@temp_source, "Book One.pdf"))
+    assert_equal "book two companion", File.read(File.join(@temp_source, "Book Two.pdf"))
   end
 
   test "moves and renames single file imports when enabled" do
@@ -2495,6 +3349,472 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert File.exist?(File.join(expected_dest, "audiobook.mp3")), "File should be copied using client-specific path"
   end
 
+  test "move import removes imported ebook bytes when the download folder also contains files that are not imported" do
+    source_ebook, source_extra = prepare_ebook_download_with_unimported_repair_file
+
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+
+    PostProcessingJob.perform_now(@download.id)
+
+    expected_dest = File.join(@temp_dest_base, @book.author, @book.title)
+    assert @request.reload.completed?
+    assert File.exist?(File.join(expected_dest, "Test Author - Test Audiobook.epub"))
+    assert_not File.exist?(source_ebook),
+      "imported ebook was copied and left in the download folder"
+    assert File.exist?(source_extra),
+      "a file Shelfarr did not import should remain in the download folder"
+  end
+
+  test "removes a completed usenet download after moving an ebook folder that also contains unimported files" do
+    source_ebook, source_extra = prepare_ebook_download_with_unimported_repair_file
+    client = DownloadClient.create!(
+      name: "SABnzbd Move Extra",
+      client_type: :sabnzbd,
+      url: "http://localhost:8080",
+      api_key: "test-api-key"
+    )
+    @download.update!(download_client: client, external_id: "SABnzbd_nzo_moveextra")
+
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:remove_completed_usenet_downloads, true)
+
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:8080/api")
+        .with(query: hash_including(
+          "mode" => "queue",
+          "name" => "delete",
+          "value" => "SABnzbd_nzo_moveextra"
+        ))
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { "status" => false, "nzo_ids" => [] }.to_json
+        )
+      history = stub_request(:get, "http://localhost:8080/api")
+        .with(query: hash_including(
+          "mode" => "history",
+          "name" => "delete",
+          "value" => "SABnzbd_nzo_moveextra",
+          "del_files" => "1"
+        ))
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { "status" => true }.to_json
+        )
+
+      PostProcessingJob.perform_now(@download.id)
+
+      assert_requested history
+    end
+
+    assert @request.reload.completed?
+    assert_not File.exist?(source_ebook)
+    assert File.exist?(source_extra)
+  end
+
+  test "partial move recovery deletes remaining imported files and the completed usenet item" do
+    source_epub, source_pdf, source_extra = prepare_ebook_download_with_two_books_and_repair_file
+    pdf_bytes = File.binread(source_pdf)
+    client = DownloadClient.create!(
+      name: "SABnzbd Partial Recovery",
+      client_type: :sabnzbd,
+      url: "http://localhost:8080",
+      api_key: "test-api-key"
+    )
+    @download.update!(download_client: client, external_id: "SABnzbd_nzo_partial")
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:remove_completed_usenet_downloads, true)
+    job = PostProcessingJob.new(@download.id)
+    real_remove = FileCopyService.method(:remove_source_file)
+    real_unlink = FileCopyService.method(:native_unlinkat)
+
+    removing = lambda do |source_snapshot, destination_snapshot: nil, destination_snapshots: nil|
+      destination_snapshot ||= Array(destination_snapshots).first
+      basename = source_snapshot.path.basename.to_s
+      if basename == "a.epub"
+        return real_remove.call(source_snapshot, destination_snapshot: destination_snapshot)
+      end
+
+      flunk "unexpected imported source #{basename}" unless basename == "b.pdf"
+
+      unlinking = lambda do |directory_fd, name, flags = 0|
+        if name == FileCopyService::COPY_QUARANTINE_ENTRY
+          raise Interrupt, "killed during quarantine"
+        end
+
+        real_unlink.call(directory_fd, name, flags)
+      end
+      FileCopyService.stub(:native_unlinkat, unlinking) do
+        real_remove.call(source_snapshot, destination_snapshot: destination_snapshot)
+      end
+    end
+
+    VCR.turned_off do
+      history = stub_partial_move_usenet_history("SABnzbd_nzo_partial")
+
+      FileCopyService.stub(:remove_source_file, removing) do
+        assert_raises(Interrupt) { job.perform_now }
+      end
+
+      assert @request.reload.completed?
+      assert_not File.exist?(source_epub)
+      assert_not File.exist?(source_pdf)
+      assert File.exist?(source_extra)
+      assert_equal pdf_bytes, File.binread(Dir.glob(File.join(@temp_source, ".shelfarr-source-quarantine-*", "entry")).sole)
+      assert @download.reload.post_processing_cleanup_state.present?
+      assert_not_requested history
+
+      FileCopyService.stub(:snapshot_source_file, ->(*) { flunk "recovery re-snapshotted a source file" }) do
+        PostProcessingRecoveryJob.perform_now
+      end
+
+      assert_requested history
+    end
+
+    library = File.join(@temp_dest_base, @book.author, @book.title)
+    assert File.exist?(File.join(library, "Test Author - Test Audiobook.epub"))
+    assert File.exist?(File.join(library, "Test Author - Test Audiobook.pdf"))
+    assert_not File.exist?(source_pdf)
+    assert_empty Dir.glob(File.join(@temp_source, ".shelfarr-source-quarantine-*"))
+    assert File.exist?(source_extra)
+    assert_nil @download.reload.post_processing_cleanup_state
+  end
+
+  test "partial move recovery removes the completed usenet item after imported files are already gone" do
+    _source_epub, _source_pdf, source_extra = prepare_ebook_download_with_two_books_and_repair_file
+    client = DownloadClient.create!(
+      name: "SABnzbd Partial Client Cleanup",
+      client_type: :sabnzbd,
+      url: "http://localhost:8080",
+      api_key: "test-api-key"
+    )
+    @download.update!(download_client: client, external_id: "SABnzbd_nzo_client")
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:remove_completed_usenet_downloads, true)
+    job = PostProcessingJob.new(@download.id)
+
+    VCR.turned_off do
+      history = stub_partial_move_usenet_history("SABnzbd_nzo_client")
+
+      job.stub(:cleanup_usenet_download, ->(*) { raise Interrupt, "killed before client cleanup" }) do
+        assert_raises(Interrupt) { job.perform_now }
+      end
+
+      assert @request.reload.completed?
+      assert File.exist?(source_extra)
+      assert_not Dir.glob(File.join(@temp_source, "*.epub")).any?
+      assert_not Dir.glob(File.join(@temp_source, "*.pdf")).any?
+      assert @download.reload.post_processing_cleanup_state.present?
+      assert_not_requested history
+
+      FileCopyService.stub(:snapshot_source_file, ->(*) { flunk "recovery re-snapshotted a source file" }) do
+        PostProcessingRecoveryJob.perform_now
+      end
+
+      assert_requested history
+    end
+
+    assert File.exist?(source_extra)
+    assert_nil @download.reload.post_processing_cleanup_state
+  end
+
+  test "partial move recovery retries when the library is unavailable and a source file is quarantined" do
+    crashed = nil
+
+    VCR.turned_off do
+      history = stub_partial_move_usenet_history("SABnzbd_nzo_offline")
+      crashed = crash_during_partial_move_quarantine!(
+        external_id: "SABnzbd_nzo_offline",
+        client_name: "SABnzbd Offline Library"
+      )
+      library = crashed.fetch(:library)
+      hidden_library = "#{library}-offline"
+      File.rename(library, hidden_library)
+
+      PostProcessingRecoveryJob.perform_now
+
+      assert @download.reload.post_processing_cleanup_state.present?,
+        "cleanup journal was cleared while the library could not be opened"
+      assert_equal crashed.fetch(:pdf_bytes),
+        File.binread(Dir.glob(File.join(@temp_source, ".shelfarr-source-quarantine-*", "entry")).sole)
+      assert_not_requested history
+
+      File.rename(hidden_library, library)
+      PostProcessingRecoveryJob.perform_now
+
+      assert_requested history
+    end
+
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_empty Dir.glob(File.join(@temp_source, ".shelfarr-source-quarantine-*"))
+    assert_not File.exist?(crashed.fetch(:source_pdf))
+    assert File.exist?(crashed.fetch(:source_extra))
+  end
+
+  test "partial move recovery retries a failed library check after the imported files are already gone" do
+    _source_epub, _source_pdf, source_extra = prepare_ebook_download_with_two_books_and_repair_file
+    client = DownloadClient.create!(
+      name: "SABnzbd Offline Cleanup",
+      client_type: :sabnzbd,
+      url: "http://localhost:8080",
+      api_key: "test-api-key"
+    )
+    @download.update!(download_client: client, external_id: "SABnzbd_nzo_offline_gone")
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:remove_completed_usenet_downloads, true)
+    job = PostProcessingJob.new(@download.id)
+    library = File.join(@temp_dest_base, @book.author, @book.title)
+
+    VCR.turned_off do
+      history = stub_partial_move_usenet_history("SABnzbd_nzo_offline_gone")
+
+      job.stub(:cleanup_usenet_download, ->(*) { raise Interrupt, "killed before client cleanup" }) do
+        assert_raises(Interrupt) { job.perform_now }
+      end
+
+      hidden_library = "#{library}-offline"
+      File.rename(library, hidden_library)
+      PostProcessingRecoveryJob.perform_now
+
+      assert @download.reload.post_processing_cleanup_state.present?,
+        "cleanup journal was cleared while the library could not be opened"
+      assert_not_requested history
+      assert File.exist?(source_extra)
+
+      File.rename(hidden_library, library)
+      PostProcessingRecoveryJob.perform_now
+
+      assert_requested history
+    end
+
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert File.exist?(source_extra)
+  end
+
+  test "partial move recovery restores a quarantined source when the library file changed" do
+    VCR.turned_off do
+      history = stub_partial_move_usenet_history("SABnzbd_nzo_changed")
+      crashed = crash_during_partial_move_quarantine!(
+        external_id: "SABnzbd_nzo_changed",
+        client_name: "SABnzbd Changed Library"
+      )
+      library_epub = Dir.glob(File.join(crashed.fetch(:library), "*.epub")).sole
+      library_pdf = Dir.glob(File.join(crashed.fetch(:library), "*.pdf")).sole
+      File.binwrite(library_epub, "PK\x03\x04replaced library bytes")
+      File.binwrite(library_pdf, "%PDF-1.7\nreplaced library bytes")
+
+      PostProcessingRecoveryJob.perform_now
+
+      assert File.exist?(crashed.fetch(:source_pdf)),
+        "quarantined source was left hidden after the library file changed"
+      assert_equal crashed.fetch(:pdf_bytes), File.binread(crashed.fetch(:source_pdf))
+      assert_empty Dir.glob(File.join(@temp_source, ".shelfarr-source-quarantine-*"))
+      assert_nil @download.reload.post_processing_cleanup_state
+      assert_not_requested history
+      assert File.exist?(crashed.fetch(:source_extra))
+    end
+  end
+
+  test "partial move recovery keeps usenet cleanup when the client connection fails" do
+    _source_epub, _source_pdf, source_extra = prepare_ebook_download_with_two_books_and_repair_file
+    client = DownloadClient.create!(
+      name: "SABnzbd Recovery Outage",
+      client_type: :sabnzbd,
+      url: "http://localhost:8080",
+      api_key: "test-api-key"
+    )
+    @download.update!(download_client: client, external_id: "SABnzbd_nzo_outage")
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:remove_completed_usenet_downloads, true)
+    job = PostProcessingJob.new(@download.id)
+
+    VCR.turned_off do
+      outage = stub_request(:get, "http://localhost:8080/api")
+        .with(query: hash_including("name" => "delete"))
+        .to_raise(Faraday::ConnectionFailed.new("down"))
+
+      job.stub(:cleanup_usenet_download, ->(*) { raise Interrupt, "killed before client cleanup" }) do
+        assert_raises(Interrupt) { job.perform_now }
+      end
+
+      assert @download.reload.post_processing_cleanup_state.present?
+      PostProcessingRecoveryJob.perform_now
+
+      assert @download.reload.post_processing_cleanup_state.present?,
+        "pending usenet cleanup was discarded after a connection error"
+      assert File.exist?(source_extra)
+
+      remove_request_stub(outage)
+      history = stub_partial_move_usenet_history("SABnzbd_nzo_outage")
+      PostProcessingRecoveryJob.perform_now
+
+      assert_requested history
+    end
+
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert File.exist?(source_extra)
+  end
+
+  test "partial move recovery keeps usenet cleanup when the client rejects removal" do
+    _source_epub, _source_pdf, source_extra = prepare_ebook_download_with_two_books_and_repair_file
+    client = DownloadClient.create!(
+      name: "SABnzbd Recovery Rejected",
+      client_type: :sabnzbd,
+      url: "http://localhost:8080",
+      api_key: "test-api-key"
+    )
+    @download.update!(download_client: client, external_id: "SABnzbd_nzo_rejected")
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:remove_completed_usenet_downloads, true)
+    job = PostProcessingJob.new(@download.id)
+
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:8080/api")
+        .with(query: hash_including("mode" => "queue", "name" => "delete", "value" => "SABnzbd_nzo_rejected"))
+        .to_return(
+          { status: 200, headers: { "Content-Type" => "application/json" }, body: { "status" => false }.to_json },
+          { status: 200, headers: { "Content-Type" => "application/json" }, body: { "status" => false }.to_json }
+        )
+      history = stub_request(:get, "http://localhost:8080/api")
+        .with(query: hash_including(
+          "mode" => "history",
+          "name" => "delete",
+          "value" => "SABnzbd_nzo_rejected",
+          "del_files" => "1"
+        ))
+        .to_return(
+          { status: 200, headers: { "Content-Type" => "application/json" }, body: { "status" => false }.to_json },
+          { status: 200, headers: { "Content-Type" => "application/json" }, body: { "status" => true }.to_json }
+        )
+
+      job.stub(:cleanup_usenet_download, ->(*) { raise Interrupt, "killed before client cleanup" }) do
+        assert_raises(Interrupt) { job.perform_now }
+      end
+
+      PostProcessingRecoveryJob.perform_now
+
+      assert @download.reload.post_processing_cleanup_state.present?,
+        "pending usenet cleanup was discarded after the client rejected removal"
+      assert File.exist?(source_extra)
+      assert_nil @download.external_id_released_at
+
+      PostProcessingRecoveryJob.perform_now
+
+      assert_requested history, times: 2
+    end
+
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+  end
+
+  test "partial move recovery finishes after confirmed usenet removal deleted the source directory" do
+    prepare_ebook_download_with_two_books_and_repair_file
+    client = DownloadClient.create!(
+      name: "SABnzbd Removed Source", client_type: :sabnzbd,
+      url: "http://localhost:8080", api_key: "test-api-key"
+    )
+    @download.update!(download_client: client, external_id: "SABnzbd_nzo_removed_source")
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:remove_completed_usenet_downloads, true)
+    job = PostProcessingJob.new(@download.id)
+    source_device = File.stat(@temp_source).dev
+
+    VCR.turned_off do
+      stub_partial_move_usenet_history("SABnzbd_nzo_removed_source")
+      stub_request(:get, "http://localhost:8080/api")
+        .with(query: hash_including("mode" => "history", "name" => "delete", "del_files" => "1"))
+        .to_return do
+          FileUtils.rm_rf(@temp_source)
+          { status: 200, headers: { "Content-Type" => "application/json" }, body: { "status" => true }.to_json }
+        end
+      job.stub(:clear_source_cleanup_state, ->(*) { raise Interrupt, "killed after client removal" }) do
+        assert_raises(Interrupt) { job.perform_now }
+      end
+
+      assert_not File.exist?(@temp_source)
+      assert @download.reload.post_processing_cleanup_state.present?
+      assert_nil @download.external_id_released_at
+
+      FileCopyService.stub(:deepest_existing_directory_device, source_device + 1) do
+        PostProcessingRecoveryJob.perform_now
+      end
+      assert @download.reload.post_processing_cleanup_state.present?, "an unavailable mount must keep the journal"
+      assert_nil @download.external_id_released_at
+
+      PostProcessingRecoveryJob.perform_now
+    end
+
+    assert_nil @download.reload.post_processing_cleanup_state
+    assert_not_nil @download.external_id_released_at
+  end
+
+  test "partial directory cleanup recovery holds the post-processing lock while deleting" do
+    VCR.turned_off do
+      stub_partial_move_usenet_history("SABnzbd_nzo_partial_lock")
+      crash_during_partial_move_quarantine!(
+        external_id: "SABnzbd_nzo_partial_lock", client_name: "SABnzbd Partial Lock"
+      )
+      held_during_delete = false
+      real_remove = FileCopyService.method(:remove_source_file)
+
+      FileCopyService.stub(:remove_source_file, lambda { |snapshot, destination_snapshot: nil, destination_snapshots: nil|
+        held_during_delete = post_processing_lock_busy?(@download.id)
+        destination_snapshot ||= Array(destination_snapshots).first
+        real_remove.call(snapshot, destination_snapshot: destination_snapshot)
+      }) do
+        PostProcessingRecoveryJob.perform_now
+      end
+
+      assert held_during_delete
+      assert_nil @download.reload.post_processing_cleanup_state
+      assert_not_nil @download.external_id_released_at
+    end
+  end
+
+  test "NFS move retains the source and does not remove the completed usenet item" do
+    client = DownloadClient.create!(
+      name: "SABnzbd NFS Retain",
+      client_type: :sabnzbd,
+      url: "http://localhost:8080",
+      api_key: "test-api-key"
+    )
+    @download.update!(download_client: client, external_id: "SABnzbd_nzo_nfsretain")
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:allow_nonatomic_nfs_directory_publication, false)
+    SettingsService.set(:remove_completed_usenet_downloads, true)
+
+    VCR.turned_off do
+      queue = stub_request(:get, "http://localhost:8080/api")
+        .with(query: hash_including("mode" => "queue", "name" => "delete"))
+      history = stub_request(:get, "http://localhost:8080/api")
+        .with(query: hash_including("mode" => "history", "name" => "delete"))
+
+      with_nfs_rejecting_source_quarantine_renames do
+        PostProcessingJob.perform_now(@download.id)
+      end
+
+      assert_not_requested queue
+      assert_not_requested history
+    end
+
+    expected_dest = File.join(@temp_dest_base, @book.author, @book.title)
+    assert @request.reload.completed?
+    assert File.exist?(File.join(expected_dest, "audiobook.mp3"))
+    assert File.exist?(File.join(@temp_source, "audiobook.mp3"))
+  ensure
+    SettingsService.set(:allow_nonatomic_nfs_directory_publication, false)
+  end
+
   test "removes usenet download from client after successful import" do
     client = DownloadClient.create!(
       name: "SABnzbd Test",
@@ -2867,7 +4187,47 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert_not File.exist?(File.join(expected_dest, "Calibre Export"))
   end
 
-  test "copies UTF-8 ebook sidecar names into UTF-8 destination paths" do
+  test "hardlinks only the ebook and recognized cover from a release folder" do
+    FileUtils.rm_rf(@temp_source)
+    FileUtils.mkdir_p(@temp_source)
+    epub = File.join(@temp_source, "Thud!.epub")
+    cover = File.join(@temp_source, "cover.jpg")
+    folder_cover = File.join(@temp_source, "folder.jpg")
+    banner = File.join(@temp_source, "banner.jpg")
+    promo = File.join(@temp_source, "_ DOWNLOAD free audiobook version.txt")
+    nfo = File.join(@temp_source, "release.nfo")
+    opf = File.join(@temp_source, "metadata.opf")
+    write_valid_ebook_file(epub)
+    File.binwrite(cover, "\xFF\xD8\xFFvalid cover content".b)
+    File.binwrite(folder_cover, "\xFF\xD8\xFFvalid folder cover".b)
+    File.binwrite(banner, "\xFF\xD8\xFFpromo image".b)
+    File.write(promo, "promo")
+    File.write(nfo, "scene notes")
+    File.write(opf, "<package>not the book</package>")
+
+    @book.update!(title: "Thud!", author: "Terry Pratchett", book_type: :ebook)
+    SettingsService.set(:ebook_output_path, @temp_dest_base)
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "hardlink")
+
+    PostProcessingJob.perform_now(@download.id)
+
+    expected_dest = File.join(@temp_dest_base, "Terry Pratchett", "Thud!")
+    imported_epub = File.join(expected_dest, "Terry Pratchett - Thud!.epub")
+    imported_cover = File.join(expected_dest, "cover.jpg")
+    imported_folder = File.join(expected_dest, "folder.jpg")
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal [ "Terry Pratchett - Thud!.epub", "cover.jpg", "folder.jpg" ], Dir.children(expected_dest).sort
+    assert_equal [ File.stat(epub).dev, File.stat(epub).ino ], [ File.stat(imported_epub).dev, File.stat(imported_epub).ino ]
+    assert_equal [ File.stat(cover).dev, File.stat(cover).ino ], [ File.stat(imported_cover).dev, File.stat(imported_cover).ino ]
+    assert_equal [ File.stat(folder_cover).dev, File.stat(folder_cover).ino ], [ File.stat(imported_folder).dev, File.stat(imported_folder).ino ]
+    [ banner, promo, nfo, opf ].each do |extra|
+      assert_not File.exist?(File.join(expected_dest, File.basename(extra)))
+      assert File.exist?(extra)
+    end
+  end
+
+  test "imports a UTF-8 ebook title and leaves unicode release notes in the download" do
     FileUtils.rm_rf(@temp_source)
     FileUtils.mkdir_p(@temp_source)
     title = "The Reverse Centaur’s Guide to Life After AI"
@@ -2883,7 +4243,8 @@ class PostProcessingJobTest < ActiveJob::TestCase
 
     expected_dest = File.join(@temp_dest_base, @book.author, title)
     assert @request.reload.completed?
-    assert_equal "release notes", File.read(File.join(expected_dest, sidecar))
+    assert_not File.exist?(File.join(expected_dest, sidecar))
+    assert_equal "release notes", File.read(File.join(@temp_source, sidecar))
     assert File.exist?(File.join(expected_dest, "Cory Doctorow - #{title}.epub"))
   end
 
@@ -2903,7 +4264,7 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert File.exist?(File.join(expected_dest, "Test Author - Test Audiobook.djvu"))
   end
 
-  test "imports ebook directories with non UTF-8 nfo sidecars" do
+  test "imports an ebook when the release folder contains a non UTF-8 nfo" do
     FileUtils.rm_rf(@temp_source)
     FileUtils.mkdir_p(@temp_source)
     write_valid_ebook_file(File.join(@temp_source, "Valid Book.epub"))
@@ -2918,7 +4279,8 @@ class PostProcessingJobTest < ActiveJob::TestCase
     expected_dest = File.join(@temp_dest_base, @book.author, @book.title)
     assert @request.reload.completed?
     assert File.exist?(File.join(expected_dest, "Test Author - Test Audiobook.epub"))
-    assert File.exist?(File.join(expected_dest, "release.nfo"))
+    assert_not File.exist?(File.join(expected_dest, "release.nfo"))
+    assert File.binread(File.join(@temp_source, "release.nfo")).bytes.include?(0xB3)
   end
 
   test "remaps Windows download path when remote path uses forward slashes" do
@@ -3881,7 +5243,1252 @@ class PostProcessingJobTest < ActiveJob::TestCase
     assert_equal [ "audio-lib" ], scanned
   end
 
+  test "copy import completes a chapter-per-file audiobook past the old publication journal cap" do
+    SettingsService.set(:audiobookshelf_url, "")
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    file_count = 1_001
+    file_count.times do |index|
+      File.binwrite(File.join(@temp_source, format("chapter-%04d.mp3", index)), "x")
+    end
+
+    LibraryPlatformClient.stub(:configured?, false) do
+      NotificationService.stub(:request_completed, ->(_request) { true }) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    imported_dir = File.join(@temp_dest_base, @book.author, @book.title)
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal file_count, Dir.children(imported_dir).size
+    assert_nil @download.reload.library_replacement_state
+  end
+
+  test "retry completes a copy import whose publication journal already holds a thousand reused files" do
+    SettingsService.set(:audiobookshelf_url, "")
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    imported_dir = File.join(@temp_dest_base, @book.author, @book.title)
+    FileUtils.mkdir_p(imported_dir)
+    reused_paths = Array.new(1_000) do |index|
+      name = format("chapter-%04d.mp3", index)
+      source = File.join(@temp_source, name)
+      destination = File.join(imported_dir, name)
+      File.binwrite(source, "x")
+      File.binwrite(destination, "x")
+      Pathname(destination).expand_path.to_s
+    end
+    new_name = "chapter-1000.mp3"
+    File.binwrite(File.join(@temp_source, new_name), "y")
+    @download.update!(library_replacement_state: JSON.generate("published_paths" => reused_paths))
+
+    LibraryPlatformClient.stub(:configured?, false) do
+      NotificationService.stub(:request_completed, ->(_request) { true }) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal "y", File.binread(File.join(@book.reload.file_path, new_name))
+    assert_equal 1_001, Dir.children(@book.file_path).size
+    assert_nil @download.reload.library_replacement_state
+  end
+
+  test "blank library import modes leave copy and folder permissions unchanged" do
+    SettingsService.set(:audiobookshelf_url, "")
+    root_mode = File.stat(@temp_dest_base).mode & 0o777
+    source = File.join(@temp_source, "audiobook.mp3")
+    File.chmod(0o604, source)
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination_dir = File.join(@temp_dest_base, @book.author, @book.title)
+    destination = File.join(destination_dir, "audiobook.mp3")
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal 0o604, File.stat(source).mode & 0o777
+    assert_equal 0o640, File.stat(destination).mode & 0o777
+    assert_equal 0o750, File.stat(destination_dir).mode & 0o777
+    assert_equal 0o750, File.stat(File.dirname(destination_dir)).mode & 0o777
+    assert_equal root_mode, File.stat(@temp_dest_base).mode & 0o777
+  end
+
+  test "copy and move imports apply configured file and folder modes without changing the library root" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:library_import_file_mode, "0664")
+    SettingsService.set(:library_import_folder_mode, "0775")
+    root_mode = File.stat(@temp_dest_base).mode & 0o777
+    source = File.join(@temp_source, "audiobook.mp3")
+    File.chmod(0o604, source)
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination_dir = File.join(@temp_dest_base, @book.author, @book.title)
+    destination = File.join(destination_dir, "audiobook.mp3")
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal 0o604, File.stat(source).mode & 0o777
+    assert_equal 0o664, File.stat(destination).mode & 0o777
+    assert_equal 0o775, File.stat(destination_dir).mode & 0o777
+    assert_equal 0o775, File.stat(File.dirname(destination_dir)).mode & 0o777
+    assert_equal root_mode, File.stat(@temp_dest_base).mode & 0o777
+
+    FileUtils.rm_rf(destination_dir)
+    move_source = File.join(@temp_download_base, "move-source")
+    FileUtils.mkdir_p(move_source)
+    File.write(File.join(move_source, "audiobook.mp3"), "moved audio")
+    File.chmod(0o604, File.join(move_source, "audiobook.mp3"))
+    @request.update!(status: :downloading, issue_description: nil)
+    @download.update!(status: :completed, download_path: move_source, post_processing_job_id: nil)
+    SettingsService.set(:completed_download_import_mode, "move")
+
+    PostProcessingJob.perform_now(@download.id)
+
+    moved = File.join(destination_dir, "audiobook.mp3")
+    assert @request.reload.completed?, @request.issue_description
+    assert_not File.exist?(File.join(move_source, "audiobook.mp3"))
+    assert_equal 0o664, File.stat(moved).mode & 0o777
+    assert_equal 0o775, File.stat(destination_dir).mode & 0o777
+    assert_equal root_mode, File.stat(@temp_dest_base).mode & 0o777
+  end
+
+  test "hardlinked imports keep the shared inode mode and still apply the folder mode" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "hardlink")
+    SettingsService.set(:library_import_file_mode, "0664")
+    SettingsService.set(:library_import_folder_mode, "0775")
+    source = File.join(@temp_source, "audiobook.mp3")
+    File.chmod(0o604, source)
+    root_mode = File.stat(@temp_dest_base).mode & 0o777
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination_dir = File.join(@temp_dest_base, @book.author, @book.title)
+    destination = File.join(destination_dir, "audiobook.mp3")
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal [ File.stat(source).dev, File.stat(source).ino ],
+      [ File.stat(destination).dev, File.stat(destination).ino ]
+    assert_equal 0o604, File.stat(source).mode & 0o777
+    assert_equal 0o604, File.stat(destination).mode & 0o777
+    assert_equal 0o775, File.stat(destination_dir).mode & 0o777
+    assert_equal root_mode, File.stat(@temp_dest_base).mode & 0o777
+  end
+
+  test "hardlink fallback copies receive the configured file mode" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "hardlink")
+    SettingsService.set(:library_import_file_mode, "0664")
+    SettingsService.set(:library_import_folder_mode, "0775")
+    source = File.join(@temp_source, "audiobook.mp3")
+    File.chmod(0o604, source)
+
+    FileCopyService.stub(:hardlink_noreplace, ->(*) { raise FileCopyService::HardlinkUnsupportedError, "unsupported" }) do
+      PostProcessingJob.perform_now(@download.id)
+    end
+
+    destination = File.join(@temp_dest_base, @book.author, @book.title, "audiobook.mp3")
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal 0o604, File.stat(source).mode & 0o777
+    refute_equal [ File.stat(source).dev, File.stat(source).ino ],
+      [ File.stat(destination).dev, File.stat(destination).ino ]
+    assert_equal 0o664, File.stat(destination).mode & 0o777
+  end
+
+  test "a library import chmod failure is a warning and does not fail the import" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:library_import_file_mode, "0664")
+    SettingsService.set(:library_import_folder_mode, "0775")
+    real_fchmod = FileCopyService.method(:native_fchmod)
+    denying_fchmod = lambda do |descriptor, mode|
+      raise Errno::EPERM, "nfs" if [ 0o664, 0o775 ].include?(mode)
+
+      real_fchmod.call(descriptor, mode)
+    end
+
+    output = FileCopyService.stub(:native_fchmod, denying_fchmod) do
+      capture_private_post_processing_logs do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    destination_dir = File.join(@temp_dest_base, @book.author, @book.title)
+    destination = File.join(destination_dir, "audiobook.mp3")
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal 0o640, File.stat(destination).mode & 0o777
+    assert_equal 0o750, File.stat(destination_dir).mode & 0o777
+    assert_includes output, "Could not apply the configured library import mode (Errno::EPERM)"
+    refute_includes output, @temp_dest_base
+    refute_includes output, @temp_source
+  end
+
+  test "reference imports do not chmod the download target" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "reference")
+    SettingsService.set(:library_import_file_mode, "0664")
+    SettingsService.set(:library_import_folder_mode, "0775")
+    source = File.join(@temp_source, "audiobook.mp3")
+    File.chmod(0o604, source)
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination_dir = File.join(@temp_dest_base, @book.author, @book.title)
+    destination = File.join(destination_dir, "audiobook.mp3")
+    assert @request.reload.completed?, @request.issue_description
+    assert File.symlink?(destination)
+    assert_equal 0o604, File.stat(source).mode & 0o777
+    assert_equal 0o775, File.stat(destination_dir).mode & 0o777
+  end
+
+  test "folder modes are applied after the imported file exists" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:library_import_folder_mode, "0775")
+    destination_dir = File.join(@temp_dest_base, @book.author, @book.title)
+    file_present = []
+    real_apply = LibraryImportPermissions.method(:apply_directory!)
+
+    LibraryImportPermissions.stub(:apply_directory!, ->(path, root:) {
+      file_present << File.exist?(File.join(destination_dir, "audiobook.mp3"))
+      real_apply.call(path, root: root)
+    }) do
+      PostProcessingJob.perform_now(@download.id)
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal [ true ], file_present
+    assert_equal 0o775, File.stat(destination_dir).mode & 0o777
+    assert_equal 0o775, File.stat(File.dirname(destination_dir)).mode & 0o777
+  end
+
+  test "a failed import does not chmod library folders before publication finishes" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:library_import_file_mode, "0664")
+    SettingsService.set(:library_import_folder_mode, "0775")
+    author = File.join(@temp_dest_base, @book.author)
+    sibling = File.join(author, "Sibling Title")
+    FileUtils.mkdir_p(sibling)
+    File.chmod(0o750, author)
+    File.chmod(0o750, sibling)
+    File.binwrite(File.join(sibling, "kept.mp3"), "kept")
+
+    FileCopyService.stub(:cp_noreplace, ->(*) { raise Errno::ENOSPC, "library" }) do
+      PostProcessingJob.perform_now(@download.id)
+    end
+
+    destination_dir = File.join(author, @book.title)
+    assert @request.reload.attention_needed?
+    assert_match(/out of space/, @request.issue_description)
+    assert_equal 0o750, File.stat(author).mode & 0o777
+    assert_equal 0o750, File.stat(sibling).mode & 0o777
+    assert_equal "kept", File.binread(File.join(sibling, "kept.mp3"))
+    assert_not File.exist?(File.join(destination_dir, "audiobook.mp3"))
+    if File.directory?(destination_dir)
+      assert_equal 0o750, File.stat(destination_dir).mode & 0o777
+    end
+  end
+
+  test "hardlink fallback retry reuses chapters published with the configured file mode" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "hardlink")
+    SettingsService.set(:library_import_file_mode, "0664")
+    source_file = File.join(@temp_source, "audiobook.mp3")
+    chapter = File.join(@temp_source, "chapter.mp3")
+    File.chmod(0o604, source_file)
+    File.write(chapter, "second chapter")
+    File.chmod(0o604, chapter)
+    destination = File.join(@temp_dest_base, @book.author, @book.title)
+    state = { copies: 0, fail: true }
+    real_copy = FileCopyService.method(:cp_noreplace)
+    first_job = PostProcessingJob.new(@download.id)
+
+    output = FileCopyService.stub(:hardlink_noreplace, ->(*) {
+      raise FileCopyService::HardlinkUnsupportedError, "cross-filesystem"
+    }) do
+      FileCopyService.stub(:cp_noreplace, ->(*args, **kwargs) {
+        state[:copies] += 1
+        raise Errno::ENOSPC, "library" if state[:fail] && state[:copies] > 1
+
+        real_copy.call(*args, **kwargs)
+      }) do
+        first_job.perform_now
+
+        assert @request.reload.attention_needed?
+        assert @request.processing?
+        assert_equal [ "audiobook.mp3" ], Dir.children(destination).sort
+        assert_equal 0o664, File.stat(File.join(destination, "audiobook.mp3")).mode & 0o777
+        assert_equal 0o604, File.stat(source_file).mode & 0o777
+
+        state[:fail] = false
+        retry_job = PostProcessingJob.new(@download.id, 0, first_job.job_id)
+        capture_private_post_processing_logs do
+          retry_job.perform_now
+        end
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal [ "audiobook.mp3", "chapter.mp3" ], Dir.children(destination).sort
+    assert_equal "test audio content", File.binread(File.join(destination, "audiobook.mp3"))
+    assert_equal "second chapter", File.binread(File.join(destination, "chapter.mp3"))
+    assert_equal 0o664, File.stat(File.join(destination, "audiobook.mp3")).mode & 0o777
+    assert_equal 0o664, File.stat(File.join(destination, "chapter.mp3")).mode & 0o777
+    assert_equal 0o604, File.stat(source_file).mode & 0o777
+    assert_equal 0o604, File.stat(chapter).mode & 0o777
+    refute_equal [ File.stat(source_file).dev, File.stat(source_file).ino ],
+      [ File.stat(File.join(destination, "audiobook.mp3")).dev, File.stat(File.join(destination, "audiobook.mp3")).ino ]
+    assert_includes output, "0 hardlinked, 1 copied after unsupported fallback, 1 reused"
+  end
+
+  test "flat copy imports chmod the file and leave the library root unchanged" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:audiobook_path_template, "")
+    SettingsService.set(:library_import_file_mode, "0664")
+    SettingsService.set(:library_import_folder_mode, "0777")
+    root_mode = File.stat(@temp_dest_base).mode & 0o777
+
+    PostProcessingJob.perform_now(@download.id)
+
+    destination = File.join(@temp_dest_base, "audiobook.mp3")
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal 0o664, File.stat(destination).mode & 0o777
+    assert_equal root_mode, File.stat(@temp_dest_base).mode & 0o777
+  end
+
   private
+
+  def post_processing_lock_busy?(download_id)
+    slot = download_id % PostProcessingJob::POST_PROCESSING_LOCK_SLOTS
+    path = Rails.root.join("tmp/post-processing-locks/#{slot}.lock")
+    return false unless File.exist?(path)
+
+    File.open(path, File::RDWR) do |file|
+      acquired = file.flock(File::LOCK_EX | File::LOCK_NB)
+      return true unless acquired
+
+      file.flock(File::LOCK_UN)
+      false
+    end
+  end
+
+  def files_under(directory)
+    Dir.children(directory).flat_map do |entry|
+      path = File.join(directory, entry)
+      if File.directory?(path)
+        files_under(path)
+      elsif File.file?(path)
+        [ path ]
+      else
+        []
+      end
+    end
+  end
+
+  def interrupt_directory_move_before_source_deletion(external_id:)
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    nested = File.join(@temp_source, "Disc One")
+    FileUtils.mkdir_p(nested)
+    File.write(File.join(nested, "chapter.mp3"), "chapter audio")
+    client = DownloadClient.create!(
+      name: "Directory move interruption #{external_id}",
+      client_type: "transmission",
+      url: "http://localhost:9091",
+      username: "transmission",
+      password: "transmission"
+    )
+    @download.update!(
+      download_client: client,
+      download_type: "torrent",
+      external_id: external_id
+    )
+    job = PostProcessingJob.new(@download.id)
+    job.stub(:remove_import_source, ->(*) { raise Interrupt, "simulated post-commit interruption" }) do
+      assert_raises(Interrupt) { job.perform_now }
+    end
+
+    assert @request.reload.completed?
+    assert File.exist?(@temp_source)
+    assert @download.reload.post_processing_cleanup_state.present?
+    assert_nil @download.external_id_released_at
+    client
+  end
+
+  def crash_during_partial_move_quarantine!(external_id:, client_name:)
+    source_epub, source_pdf, source_extra = prepare_ebook_download_with_two_books_and_repair_file
+    pdf_bytes = File.binread(source_pdf)
+    client = DownloadClient.create!(
+      name: client_name,
+      client_type: :sabnzbd,
+      url: "http://localhost:8080",
+      api_key: "test-api-key"
+    )
+    @download.update!(download_client: client, external_id: external_id)
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:completed_download_import_mode, "move")
+    SettingsService.set(:remove_completed_usenet_downloads, true)
+    job = PostProcessingJob.new(@download.id)
+    real_remove = FileCopyService.method(:remove_source_file)
+    real_unlink = FileCopyService.method(:native_unlinkat)
+    removing = lambda do |source_snapshot, destination_snapshot: nil, destination_snapshots: nil|
+      destination_snapshot ||= Array(destination_snapshots).first
+      basename = source_snapshot.path.basename.to_s
+      if basename == "a.epub"
+        return real_remove.call(source_snapshot, destination_snapshot: destination_snapshot)
+      end
+
+      flunk "unexpected imported source #{basename}" unless basename == "b.pdf"
+
+      unlinking = lambda do |directory_fd, name, flags = 0|
+        raise Interrupt, "killed during quarantine" if name == FileCopyService::COPY_QUARANTINE_ENTRY
+
+        real_unlink.call(directory_fd, name, flags)
+      end
+      FileCopyService.stub(:native_unlinkat, unlinking) do
+        real_remove.call(source_snapshot, destination_snapshot: destination_snapshot)
+      end
+    end
+
+    FileCopyService.stub(:remove_source_file, removing) do
+      assert_raises(Interrupt) { job.perform_now }
+    end
+
+    assert @request.reload.completed?
+    assert_not File.exist?(source_epub)
+    assert_not File.exist?(source_pdf)
+    assert File.exist?(source_extra)
+    assert_equal pdf_bytes, File.binread(Dir.glob(File.join(@temp_source, ".shelfarr-source-quarantine-*", "entry")).sole)
+    assert @download.reload.post_processing_cleanup_state.present?
+
+    {
+      source_epub: source_epub,
+      source_pdf: source_pdf,
+      source_extra: source_extra,
+      pdf_bytes: pdf_bytes,
+      library: File.join(@temp_dest_base, @book.author, @book.title)
+    }
+  end
+
+  def prepare_ebook_download_with_unimported_repair_file
+    FileUtils.rm_rf(@temp_source)
+    FileUtils.mkdir_p(@temp_source)
+    source_ebook = File.join(@temp_source, "Valid Book.epub")
+    source_extra = File.join(@temp_source, "release.par2")
+    write_valid_ebook_file(source_ebook)
+    File.binwrite(source_extra, "PAR2\nrepair data")
+    @book.update!(book_type: :ebook)
+    SettingsService.set(:ebook_output_path, @temp_dest_base)
+    [ source_ebook, source_extra ]
+  end
+
+  def prepare_ebook_download_with_two_books_and_repair_file
+    FileUtils.rm_rf(@temp_source)
+    FileUtils.mkdir_p(@temp_source)
+    source_epub = File.join(@temp_source, "a.epub")
+    source_pdf = File.join(@temp_source, "b.pdf")
+    source_extra = File.join(@temp_source, "release.par2")
+    write_valid_ebook_file(source_epub)
+    write_valid_ebook_file(source_pdf)
+    File.binwrite(source_extra, "PAR2\nrepair data")
+    @book.update!(book_type: :ebook)
+    SettingsService.set(:ebook_output_path, @temp_dest_base)
+    SettingsService.set(:ebook_filename_template, "{author} - {title}")
+    [ source_epub, source_pdf, source_extra ]
+  end
+
+  def stub_partial_move_usenet_history(external_id)
+    stub_request(:get, "http://localhost:8080/api")
+      .with(query: hash_including(
+        "mode" => "queue",
+        "name" => "delete",
+        "value" => external_id
+      ))
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: { "status" => false, "nzo_ids" => [] }.to_json
+      )
+    stub_request(:get, "http://localhost:8080/api")
+      .with(query: hash_including(
+        "mode" => "history",
+        "name" => "delete",
+        "value" => external_id,
+        "del_files" => "1"
+      ))
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: { "status" => true }.to_json
+      )
+  end
+
+  test "a confirmed replacement removes the old library directory only after import succeeds" do
+    SettingsService.set(:audiobookshelf_url, "")
+    old_dir = File.join(@temp_dest_base, "old-copy")
+    FileUtils.mkdir_p(old_dir)
+    File.binwrite(File.join(old_dir, "old.mp3"), "old audio")
+    @book.update!(file_path: old_dir)
+    @download.update!(replace_library_file: true)
+
+    LibraryPlatformClient.stub(:configured?, false) do
+      NotificationService.stub(:request_completed, ->(_request) { true }) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    @book.reload
+    assert @request.reload.completed?, @request.issue_description
+    assert_not_equal old_dir, @book.file_path
+    assert_equal "test audio content", File.binread(File.join(@book.file_path, "audiobook.mp3"))
+    assert_not File.exist?(old_dir)
+  end
+
+  test "a failed replacement import does not change the existing library directory" do
+    SettingsService.set(:audiobookshelf_url, "")
+    old_dir = File.join(@temp_dest_base, "old-copy")
+    FileUtils.mkdir_p(old_dir)
+    File.binwrite(File.join(old_dir, "old.mp3"), "old audio")
+    @book.update!(file_path: old_dir)
+    @download.update!(replace_library_file: true)
+
+    FileCopyService.stub(:cp_noreplace, ->(*) { raise "import failed" }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert_equal old_dir, @book.reload.file_path
+    assert_equal "old audio", File.binread(File.join(old_dir, "old.mp3"))
+    assert_not @request.reload.completed?
+  end
+
+  test "a retried replacement reuses the isolated directory and removes the old copy" do
+    SettingsService.set(:audiobookshelf_url, "")
+    @book.update!(title: "Title", author: "Ada")
+    old_dir = File.join(@temp_dest_base, "Ada", "Title")
+    isolated = File.join(@temp_dest_base, "Ada", "Title (2)")
+    third = File.join(@temp_dest_base, "Ada", "Title (3)")
+    FileUtils.mkdir_p(old_dir)
+    File.binwrite(File.join(old_dir, "old.mp3"), "old audio")
+    @book.update!(file_path: old_dir)
+    @download.update!(replace_library_file: true)
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.binwrite(File.join(@temp_source, "01.mp3"), "track one")
+    File.binwrite(File.join(@temp_source, "02.mp3"), "track two")
+    copied = 0
+    real_copy = FileCopyService.method(:cp_noreplace)
+
+    FileCopyService.stub(:cp_noreplace, ->(source, destination, **kwargs) {
+      copied += 1
+      if copied == 1
+        state = @download.reload.library_replacement_state.to_s
+        assert_includes state, old_dir
+        assert_includes state, "Title (2)"
+        real_copy.call(source, destination, **kwargs)
+        raise Errno::ENOSPC
+      end
+
+      real_copy.call(source, destination, **kwargs)
+    }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        NotificationService.stub(:request_completed, ->(_request) { true }) do
+          PostProcessingJob.perform_now(@download.id)
+          assert @request.reload.attention_needed?
+          assert_equal old_dir, @book.reload.file_path
+          assert File.directory?(isolated)
+          assert_not File.exist?(third)
+          assert_includes @download.reload.library_replacement_state.to_s, old_dir
+
+          @request.clear_attention!
+          PostProcessingJob.new(@download.id, 0, @download.post_processing_job_id).perform_now
+        end
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal isolated, @book.reload.file_path
+    assert_equal "track one", File.binread(File.join(isolated, "01.mp3"))
+    assert_equal "track two", File.binread(File.join(isolated, "02.mp3"))
+    assert_not File.exist?(old_dir)
+    assert_not File.exist?(third)
+    assert_nil @download.reload.library_replacement_state
+  end
+
+  test "replacement cleanup survives a crash after the new file is attached" do
+    SettingsService.set(:audiobookshelf_url, "")
+    @book.update!(title: "Title", author: "Ada")
+    old_dir = File.join(@temp_dest_base, "Ada", "Title")
+    FileUtils.mkdir_p(old_dir)
+    File.binwrite(File.join(old_dir, "old.mp3"), "old audio")
+    @book.update!(file_path: old_dir)
+    @download.update!(replace_library_file: true)
+
+    SafeLibraryDeletionService.stub(:delete_previous_library_file!, ->(*) {
+      RemoteResult::Failed.new(Errno::EIO.new("previous library file"))
+    }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        NotificationService.stub(:request_completed, ->(_request) { true }) do
+          PostProcessingJob.perform_now(@download.id)
+        end
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_not_equal old_dir, @book.reload.file_path
+    assert_equal "old audio", File.binread(File.join(old_dir, "old.mp3"))
+    assert_includes @download.reload.library_replacement_state.to_s, old_dir
+
+    LibraryPlatformClient.stub(:configured?, false) do
+      PostProcessingRecoveryJob.perform_now
+    end
+
+    assert_not File.exist?(old_dir)
+    assert_nil @download.reload.library_replacement_state
+    assert_equal "test audio content", File.binread(File.join(@book.reload.file_path, "audiobook.mp3"))
+  end
+
+  test "cancelling an import that published nothing leaves a pre-existing library copy" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:audiobook_path_template, "{author}/{title}")
+    @book.update!(title: "Title", author: "Ada", file_path: nil)
+    library = File.join(@temp_dest_base, "Ada", "Title")
+    FileUtils.mkdir_p(library)
+    manual = File.join(library, "01.mp3")
+    File.binwrite(manual, "manual copy")
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.binwrite(File.join(@temp_source, "01.mp3"), "downloaded track")
+    File.binwrite(File.join(@temp_source, "02.mp3"), "second track")
+
+    FileCopyService.stub(:cp_noreplace, ->(*) { raise Errno::ENOSPC }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.attention_needed?
+    assert_nil @book.reload.file_path
+    assert_equal "manual copy", File.binread(manual)
+
+    @request.remove_as_admin!
+
+    assert_not Request.exists?(@request.id)
+    assert_equal "manual copy", File.binread(manual)
+    assert File.directory?(library)
+  end
+
+  test "cancelling a failed flat replacement removes every file that import published" do
+    FileUtils.rm_rf(@temp_source)
+    FileUtils.mkdir_p(@temp_source)
+    write_valid_ebook_file(File.join(@temp_source, "a.epub"))
+    write_valid_ebook_file(File.join(@temp_source, "b.pdf"))
+    File.binwrite(File.join(@temp_source, "cover.jpg"), "\xFF\xD8\xFFcover".b)
+    @book.update!(title: "Dune", author: "Frank Herbert", book_type: :ebook)
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:ebook_output_path, @temp_dest_base)
+    SettingsService.set(:ebook_path_template, "")
+    SettingsService.set(:ebook_filename_template, "{author} - {title}")
+    existing = File.join(@temp_dest_base, "Frank Herbert - Dune.epub")
+    folder = File.join(@temp_dest_base, "Frank Herbert - Dune")
+    published_epub = File.join(folder, "Frank Herbert - Dune.epub")
+    published_pdf = File.join(folder, "Frank Herbert - Dune.pdf")
+    published_cover = File.join(folder, "cover.jpg")
+    File.binwrite(existing, "PK\x03\x04old ebook")
+    @book.update!(file_path: existing)
+    @download.update!(replace_library_file: true)
+    real_copy = FileCopyService.method(:cp_noreplace)
+
+    FileCopyService.stub(:cp_noreplace, lambda { |source, destination, **kwargs|
+      raise Errno::ENOSPC if File.extname(source) == ".jpg"
+
+      real_copy.call(source, destination, **kwargs)
+    }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.attention_needed?
+    assert_equal existing, @book.reload.file_path
+    assert File.exist?(published_epub)
+    assert File.exist?(published_pdf)
+    assert_not File.exist?(published_cover)
+
+    @request.remove_as_admin!
+
+    assert_not Request.exists?(@request.id)
+    assert_not File.exist?(published_epub)
+    assert_not File.exist?(published_pdf)
+    assert_not File.exist?(published_cover)
+    assert_equal "PK\x03\x04old ebook", File.binread(existing)
+  end
+
+  test "a flat replacement of a track folder does not reuse the old single-file shape" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:audiobook_path_template, "")
+    SettingsService.set(:audiobook_filename_template, "{author} - {title}")
+    @book.update!(title: "Title", author: "Ada")
+    existing = File.join(@temp_dest_base, "Ada - Title.m4b")
+    folder = File.join(@temp_dest_base, "Ada - Title")
+    File.binwrite(existing, "old audio")
+    @book.update!(file_path: existing)
+    @download.update!(replace_library_file: true)
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.binwrite(File.join(@temp_source, "01.mp3"), "track one")
+    File.binwrite(File.join(@temp_source, "02.mp3"), "track two")
+
+    LibraryPlatformClient.stub(:configured?, false) do
+      NotificationService.stub(:request_completed, ->(_request) { true }) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal folder, @book.reload.file_path
+    assert_equal "track one", File.binread(File.join(folder, "01.mp3"))
+    assert_equal "track two", File.binread(File.join(folder, "02.mp3"))
+    assert_not File.exist?(existing)
+    assert_not File.exist?(File.join(@temp_dest_base, "01.mp3"))
+    assert_not File.exist?(File.join(@temp_dest_base, "02.mp3"))
+    assert_not File.exist?(File.join(@temp_dest_base, "Ada - Title (2).m4b"))
+  end
+
+  test "a flat ebook replacement uses the downloaded file extension" do
+    FileUtils.rm_rf(@temp_source)
+    FileUtils.mkdir_p(@temp_source)
+    write_valid_ebook_file(File.join(@temp_source, "Dune.pdf"))
+    @book.update!(title: "Dune", author: "Frank Herbert", book_type: :ebook)
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:ebook_output_path, @temp_dest_base)
+    SettingsService.set(:ebook_path_template, "")
+    SettingsService.set(:ebook_filename_template, "{author} - {title}")
+    existing = File.join(@temp_dest_base, "Frank Herbert - Dune.epub")
+    replacement = File.join(@temp_dest_base, "Frank Herbert - Dune.pdf")
+    File.binwrite(existing, "PK\x03\x04old ebook")
+    @book.update!(file_path: existing)
+    @download.update!(replace_library_file: true)
+
+    LibraryPlatformClient.stub(:configured?, false) do
+      NotificationService.stub(:request_completed, ->(_request) { true }) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal replacement, @book.reload.file_path
+    assert File.binread(replacement).start_with?("%PDF")
+    assert_not File.exist?(existing)
+    assert_not Dir.children(@temp_dest_base).any? { |name| name.end_with?(".epub") }
+  end
+
+  test "a replacement keeps the old library file when the new artifact is missing" do
+    FileUtils.rm_rf(@temp_source)
+    FileUtils.mkdir_p(@temp_source)
+    write_valid_ebook_file(File.join(@temp_source, "Dune.epub"))
+    @book.update!(title: "Dune", author: "Frank Herbert", book_type: :ebook)
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:ebook_output_path, @temp_dest_base)
+    SettingsService.set(:ebook_path_template, "")
+    SettingsService.set(:ebook_filename_template, "{author} - {title}")
+    existing = File.join(@temp_dest_base, "Frank Herbert - Dune.epub")
+    replacement = File.join(@temp_dest_base, "Frank Herbert - Dune (2).epub")
+    File.binwrite(existing, "PK\x03\x04old ebook")
+    @book.update!(file_path: existing)
+    @download.update!(replace_library_file: true)
+    real_finish = LibraryReplacement.method(:finish_cleanup!)
+
+    LibraryReplacement.stub(:finish_cleanup!, lambda { |download|
+      FileUtils.rm_f(replacement)
+      real_finish.call(download)
+    }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        NotificationService.stub(:request_completed, ->(_request) { true }) do
+          PostProcessingJob.perform_now(@download.id)
+        end
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal "PK\x03\x04old ebook", File.binread(existing)
+    assert_not File.exist?(replacement)
+    assert_includes @download.reload.library_replacement_state.to_s, existing
+  end
+
+  test "a flat ebook replacement keeps the output directory and attaches a sibling file" do
+    FileUtils.rm_rf(@temp_source)
+    FileUtils.mkdir_p(@temp_source)
+    write_valid_ebook_file(File.join(@temp_source, "Dune.epub"))
+    @book.update!(title: "Dune", author: "Frank Herbert", book_type: :ebook)
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:ebook_output_path, @temp_dest_base)
+    SettingsService.set(:ebook_path_template, "")
+    SettingsService.set(:ebook_filename_template, "{author} - {title}")
+    existing = File.join(@temp_dest_base, "Frank Herbert - Dune.epub")
+    replacement = File.join(@temp_dest_base, "Frank Herbert - Dune (2).epub")
+    File.binwrite(existing, "PK\x03\x04old ebook")
+    @book.update!(file_path: existing)
+    @download.update!(replace_library_file: true)
+
+    LibraryPlatformClient.stub(:configured?, false) do
+      NotificationService.stub(:request_completed, ->(_request) { true }) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal replacement, @book.reload.file_path
+    assert File.exist?(replacement)
+    assert_not File.exist?(existing)
+    assert_not File.exist?("#{@temp_dest_base} (2)")
+    assert_nil @download.reload.library_replacement_state
+  end
+
+  test "a flat replacement of several ebook formats keeps every file with the book" do
+    FileUtils.rm_rf(@temp_source)
+    FileUtils.mkdir_p(@temp_source)
+    write_valid_ebook_file(File.join(@temp_source, "a.epub"))
+    write_valid_ebook_file(File.join(@temp_source, "b.pdf"))
+    @book.update!(title: "Title", author: "Ada", book_type: :ebook)
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:ebook_output_path, @temp_dest_base)
+    SettingsService.set(:ebook_path_template, "")
+    SettingsService.set(:ebook_filename_template, "{author} - {title}")
+    existing = File.join(@temp_dest_base, "Ada - Title.epub")
+    File.binwrite(existing, "PK\x03\x04old ebook")
+    @book.update!(file_path: existing)
+    @download.update!(replace_library_file: true)
+
+    LibraryPlatformClient.stub(:configured?, false) do
+      NotificationService.stub(:request_completed, ->(_request) { true }) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    @book.reload
+    folder = @book.file_path
+    published_epub = File.join(folder, "Ada - Title.epub")
+    published_pdf = File.join(folder, "Ada - Title.pdf")
+
+    assert @request.reload.completed?, @request.issue_description
+    assert File.directory?(folder)
+    assert_equal "Ada - Title", File.basename(folder)
+    assert File.binread(published_epub).start_with?("PK\x03\x04")
+    assert File.binread(published_pdf).start_with?("%PDF")
+    assert_not File.exist?(existing)
+    assert_nil @download.reload.library_replacement_state
+    assert_not Dir.children(@temp_dest_base).any? { |name| name.end_with?(".pdf", ".epub") }
+
+    assert SafeLibraryDeletionService.new(@book).delete!
+    assert_not File.exist?(published_epub)
+    assert_not File.exist?(published_pdf)
+    assert_not File.exist?(folder)
+  end
+
+  test "a split audiobook replacement imports the tracked book into the isolated folder" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:split_audiobook_bundle_imports, true)
+    @book.update!(title: "Book Two", author: "Ada")
+    old_dir = File.join(@temp_dest_base, "Ada", "Book Two")
+    isolated = File.join(@temp_dest_base, "Ada", "Book Two (2)")
+    book_one = File.join(@temp_dest_base, "Ada", "Book One")
+    FileUtils.mkdir_p(old_dir)
+    File.binwrite(File.join(old_dir, "old.m4b"), "old audio")
+    @book.update!(file_path: old_dir)
+    @download.update!(replace_library_file: true)
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.binwrite(File.join(@temp_source, "Book One.m4b"), "book one audio")
+    File.binwrite(File.join(@temp_source, "Book Two.m4b"), "book two audio")
+
+    LibraryPlatformClient.stub(:configured?, false) do
+      NotificationService.stub(:request_completed, ->(_request) { true }) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal isolated, @book.reload.file_path
+    assert_equal "book two audio", File.binread(File.join(isolated, "Book Two.m4b"))
+    assert_equal "book one audio", File.binread(File.join(book_one, "Book One.m4b"))
+    assert_not File.exist?(old_dir)
+    assert_not File.exist?(File.join(old_dir, "Book Two.m4b"))
+    assert_not File.exist?(File.join(isolated, "Book One.m4b"))
+  end
+
+  test "cancelling a failed split replacement keeps a file another acquired book owns" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:split_audiobook_bundle_imports, true)
+    SettingsService.set(:audiobook_path_template, "{author}/{title}")
+    @book.update!(title: "Book Two", author: "Ada")
+    old_dir = File.join(@temp_dest_base, "Ada", "Book Two")
+    book_one_dir = File.join(@temp_dest_base, "Ada", "Book One")
+    book_one_file = File.join(book_one_dir, "Book One.m4b")
+    FileUtils.mkdir_p(old_dir)
+    File.binwrite(File.join(old_dir, "old.m4b"), "old audio")
+    @book.update!(file_path: old_dir)
+    @download.update!(replace_library_file: true)
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.binwrite(File.join(@temp_source, "Book One.m4b"), "book one audio")
+    File.binwrite(File.join(@temp_source, "Book Two.m4b"), "book two audio")
+    real_copy = FileCopyService.method(:cp_noreplace)
+
+    FileCopyService.stub(:cp_noreplace, lambda { |source, destination, **kwargs|
+      raise Errno::EIO if File.basename(source) == "Book Two.m4b"
+
+      real_copy.call(source, destination, **kwargs)
+    }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.attention_needed?
+    assert_equal old_dir, @book.reload.file_path
+    assert_equal "book one audio", File.binread(book_one_file)
+    assert_includes @download.reload.library_replacement_state.to_s, book_one_file
+
+    book_one = Book.create!(title: "Book One", author: "Ada", book_type: :audiobook)
+    solo = File.join(@temp_download_base, "book-one-solo")
+    FileUtils.mkdir_p(solo)
+    File.binwrite(File.join(solo, "Book One.m4b"), "book one audio")
+    solo_request = Request.create!(book: book_one, user: users(:one), status: :downloading)
+    solo_download = solo_request.downloads.create!(
+      name: "Book One",
+      status: :completed,
+      download_path: solo,
+      progress: 100
+    )
+    LibraryPlatformClient.stub(:configured?, false) do
+      NotificationService.stub(:request_completed, ->(_request) { true }) do
+        PostProcessingJob.perform_now(solo_download.id)
+      end
+    end
+
+    assert solo_request.reload.completed?, solo_request.issue_description
+    assert_equal book_one_dir, book_one.reload.file_path
+    assert_equal "book one audio", File.binread(book_one_file)
+
+    intruder = Book.find(@book.id)
+    intruder.file_path = book_one_file
+    assert_raises(SafeLibraryDeletionService::Error) do
+      SafeLibraryDeletionService.new(intruder).delete!
+    end
+    assert_equal "book one audio", File.binread(book_one_file)
+
+    @request.remove_as_admin!
+
+    assert_not Request.exists?(@request.id)
+    assert_equal book_one_dir, book_one.reload.file_path
+    assert_equal "book one audio", File.binread(book_one_file)
+    assert_equal "old audio", File.binread(File.join(old_dir, "old.m4b"))
+  end
+
+  test "deleting completed history keeps tracks an earlier failed import published" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:audiobook_path_template, "{author}/{title}")
+    @book.update!(title: "Title", author: "Ada")
+    library = File.join(@temp_dest_base, "Ada", "Title")
+    track_one = File.join(library, "01.mp3")
+    track_two = File.join(library, "02.mp3")
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.binwrite(File.join(@temp_source, "01.mp3"), "track one")
+    File.binwrite(File.join(@temp_source, "02.mp3"), "track two")
+    real_copy = FileCopyService.method(:cp_noreplace)
+
+    FileCopyService.stub(:cp_noreplace, lambda { |source, destination, **kwargs|
+      raise Errno::ENOSPC if File.basename(source) == "02.mp3"
+
+      real_copy.call(source, destination, **kwargs)
+    }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.attention_needed?
+    assert_nil @book.reload.file_path
+    assert_equal "track one", File.binread(track_one)
+    assert @download.reload.post_processing_job_id.present?
+    assert_includes @download.library_replacement_state.to_s, track_one
+
+    result = @request.search_results.create!(
+      guid: "other-release",
+      title: "Other release",
+      indexer: "Test",
+      download_url: "https://example.com/other.torrent",
+      status: :pending
+    )
+    LibraryPlatformClient.stub(:configured?, false) do
+      NotificationService.stub(:request_completed, ->(_request) { true }) do
+        replacement = @request.select_result!(result)
+        replacement.update!(status: :completed, download_path: @temp_source, progress: 100)
+        PostProcessingJob.perform_now(replacement.id)
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal library, @book.reload.file_path
+    assert_equal "track one", File.binread(track_one)
+    assert_equal "track two", File.binread(track_two)
+    assert @download.reload.post_processing_job_id.present?
+    assert_includes @download.library_replacement_state.to_s, track_one
+
+    @request.remove_as_admin!
+
+    assert_not Request.exists?(@request.id)
+    assert_equal library, @book.reload.file_path
+    assert File.exist?(track_one), "completed history deletion removed a track the book still uses"
+    assert_equal "track one", File.binread(track_one)
+    assert_equal "track two", File.binread(track_two)
+  end
+
+  test "a later release replaces using its own format and removes the abandoned copy" do
+    FileUtils.rm_rf(@temp_source)
+    FileUtils.mkdir_p(@temp_source)
+    write_valid_ebook_file(File.join(@temp_source, "a.epub"))
+    File.binwrite(File.join(@temp_source, "cover.jpg"), "\xFF\xD8\xFFcover".b)
+    @book.update!(title: "Title", author: "Ada", book_type: :ebook)
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:ebook_output_path, @temp_dest_base)
+    SettingsService.set(:ebook_path_template, "")
+    SettingsService.set(:ebook_filename_template, "{author} - {title}")
+    existing = File.join(@temp_dest_base, "Ada - Title.epub")
+    abandoned = File.join(@temp_dest_base, "Ada - Title (2).epub")
+    pdf_path = File.join(@temp_dest_base, "Ada - Title.pdf")
+    mismatched = File.join(@temp_dest_base, "Ada - Title (3).epub")
+    File.binwrite(existing, "PK\x03\x04old ebook")
+    @book.update!(file_path: existing)
+    @download.update!(replace_library_file: true)
+    real_copy = FileCopyService.method(:cp_noreplace)
+
+    FileCopyService.stub(:cp_noreplace, lambda { |source, destination, **kwargs|
+      raise Errno::ENOSPC if File.extname(source) == ".jpg"
+
+      real_copy.call(source, destination, **kwargs)
+    }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.attention_needed?
+    assert_equal existing, @book.reload.file_path
+    assert File.exist?(abandoned)
+    assert_equal "PK\x03\x04old ebook", File.binread(existing)
+
+    pdf_source = File.join(@temp_download_base, "pdf-release")
+    FileUtils.mkdir_p(pdf_source)
+    write_valid_ebook_file(File.join(pdf_source, "Title.pdf"))
+    result = @request.search_results.create!(
+      guid: "pdf-release",
+      title: "Title [PDF]",
+      indexer: "Test",
+      download_url: "https://example.com/title.pdf",
+      status: :pending
+    )
+    LibraryPlatformClient.stub(:configured?, false) do
+      NotificationService.stub(:request_completed, ->(_request) { true }) do
+        replacement = @request.select_result!(result, replace_library_file: true)
+        replacement.update!(status: :completed, download_path: pdf_source, progress: 100)
+        PostProcessingJob.perform_now(replacement.id)
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal pdf_path, @book.reload.file_path
+    assert File.binread(pdf_path).start_with?("%PDF")
+    assert_not File.exist?(existing)
+    assert_not File.exist?(abandoned)
+    assert_not File.exist?(mismatched)
+  end
+
+  test "cancelling a replacement removes a file published before a later copy error" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:audiobook_path_template, "{author}/{title}")
+    @book.update!(title: "Title", author: "Ada")
+    old_dir = File.join(@temp_dest_base, "Ada", "Title")
+    isolated = File.join(@temp_dest_base, "Ada", "Title (2)")
+    FileUtils.mkdir_p(old_dir)
+    File.binwrite(File.join(old_dir, "old.mp3"), "old audio")
+    @book.update!(file_path: old_dir)
+    @download.update!(replace_library_file: true)
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.binwrite(File.join(@temp_source, "01.mp3"), "track one")
+    File.binwrite(File.join(@temp_source, "02.mp3"), "track two")
+    second = File.join(isolated, "02.mp3")
+    real_copy = FileCopyService.method(:cp_noreplace)
+
+    FileCopyService.stub(:cp_noreplace, lambda { |source, destination, **kwargs|
+      real_copy.call(source, destination, **kwargs)
+      raise Errno::EIO if File.basename(source) == "02.mp3"
+    }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.attention_needed?
+    assert_equal old_dir, @book.reload.file_path
+    assert_equal "old audio", File.binread(File.join(old_dir, "old.mp3"))
+    assert File.exist?(second)
+
+    @request.remove_as_admin!
+
+    assert_not Request.exists?(@request.id)
+    assert_not File.exist?(second)
+    assert_not File.exist?(File.join(isolated, "01.mp3"))
+    assert_equal "old audio", File.binread(File.join(old_dir, "old.mp3"))
+  end
+
+  test "selecting another replacement does not retire a live importer on the same book" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:audiobook_path_template, "{author}/{title}")
+    @book.update!(title: "Title", author: "Ada")
+    old_dir = File.join(@temp_dest_base, "Ada", "Title")
+    isolated = File.join(@temp_dest_base, "Ada", "Title (2)")
+    track_one = File.join(isolated, "01.mp3")
+    track_two = File.join(isolated, "02.mp3")
+    FileUtils.mkdir_p(old_dir)
+    File.binwrite(File.join(old_dir, "old.mp3"), "old audio")
+    @book.update!(file_path: old_dir)
+    @download.update!(replace_library_file: true)
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.binwrite(File.join(@temp_source, "01.mp3"), "track one")
+    File.binwrite(File.join(@temp_source, "02.mp3"), "track two")
+    earlier = Request.create!(
+      book: @book,
+      user: users(:one),
+      status: :failed,
+      created_at: 1.hour.ago
+    )
+    other = earlier.search_results.create!(
+      guid: "earlier-other-release",
+      title: "Other release",
+      indexer: "Test",
+      download_url: "https://example.com/other.torrent",
+      status: :pending
+    )
+    queue_job = nil
+    original_queue_config = SolidQueue::Record.connection_db_config
+    real_copy = FileCopyService.method(:cp_noreplace)
+
+    FileCopyService.stub(:cp_noreplace, lambda { |source, destination, **kwargs|
+      if File.basename(source) == "02.mp3"
+        owner_id = @download.reload.post_processing_job_id
+        assert owner_id.present?
+        assert_equal "track one", File.binread(track_one)
+        SolidQueue::Record.establish_connection(:queue)
+        queue_job = SolidQueue::Job.create!(
+          active_job_id: owner_id,
+          class_name: "PostProcessingJob",
+          queue_name: "default",
+          arguments: { "job_class" => "PostProcessingJob", "arguments" => [] },
+          priority: 0,
+          scheduled_at: Time.current
+        )
+
+        error = assert_raises(ArgumentError) do
+          earlier.select_result!(other, replace_library_file: true)
+        end
+        assert_match(/library file/i, error.message)
+        assert_equal "track one", File.binread(track_one)
+        assert_includes @download.reload.library_replacement_state.to_s, track_one
+        assert_equal owner_id, @download.post_processing_job_id
+      end
+
+      real_copy.call(source, destination, **kwargs)
+    }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        NotificationService.stub(:request_completed, ->(_request) { true }) do
+          PostProcessingJob.perform_now(@download.id)
+        end
+      end
+    end
+
+    assert @request.reload.completed?, @request.issue_description
+    assert_equal isolated, @book.reload.file_path
+    assert_equal "track one", File.binread(track_one)
+    assert_equal "track two", File.binread(track_two)
+    assert_not File.exist?(old_dir)
+    assert earlier.reload.failed?
+    assert_equal 0, earlier.downloads.count
+  ensure
+    if queue_job
+      SolidQueue::ReadyExecution.where(job_id: queue_job.id).delete_all
+      SolidQueue::ScheduledExecution.where(job_id: queue_job.id).delete_all
+      SolidQueue::ClaimedExecution.where(job_id: queue_job.id).delete_all
+      SolidQueue::BlockedExecution.where(job_id: queue_job.id).delete_all
+      SolidQueue::FailedExecution.where(job_id: queue_job.id).delete_all
+      queue_job.delete
+    end
+    SolidQueue::Record.establish_connection(original_queue_config) if original_queue_config
+  end
+
+  test "cancelling a failed bundle import keeps a file a live import has reused" do
+    SettingsService.set(:audiobookshelf_url, "")
+    SettingsService.set(:split_audiobook_bundle_imports, true)
+    SettingsService.set(:audiobook_path_template, "{author}/{title}")
+    @book.update!(title: "Book Two", author: "Ada")
+    old_dir = File.join(@temp_dest_base, "Ada", "Book Two")
+    book_one_dir = File.join(@temp_dest_base, "Ada", "Book One")
+    book_one_file = File.join(book_one_dir, "Book One.m4b")
+    book_three_dir = File.join(@temp_dest_base, "Ada", "Book Three")
+    book_three_file = File.join(book_three_dir, "Book Three.m4b")
+    FileUtils.mkdir_p(old_dir)
+    File.binwrite(File.join(old_dir, "old.m4b"), "old audio")
+    @book.update!(file_path: old_dir)
+    @download.update!(replace_library_file: true)
+    FileUtils.rm_f(File.join(@temp_source, "audiobook.mp3"))
+    File.binwrite(File.join(@temp_source, "Book One.m4b"), "book one audio")
+    File.binwrite(File.join(@temp_source, "Book Two.m4b"), "book two audio")
+    real_copy = FileCopyService.method(:cp_noreplace)
+
+    FileCopyService.stub(:cp_noreplace, lambda { |source, destination, **kwargs|
+      raise Errno::EIO if File.basename(source) == "Book Two.m4b"
+
+      real_copy.call(source, destination, **kwargs)
+    }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        PostProcessingJob.perform_now(@download.id)
+      end
+    end
+
+    assert @request.reload.attention_needed?
+    assert_equal "book one audio", File.binread(book_one_file)
+    assert_includes @download.reload.library_replacement_state.to_s, book_one_file
+
+    book_one = Book.create!(title: "Book One", author: "Ada", book_type: :audiobook)
+    bundle = File.join(@temp_download_base, "book-one-and-three")
+    FileUtils.mkdir_p(bundle)
+    File.binwrite(File.join(bundle, "Book One.m4b"), "book one audio")
+    File.binwrite(File.join(bundle, "Book Three.m4b"), "book three audio")
+    live_request = Request.create!(book: book_one, user: users(:one), status: :downloading)
+    live_download = live_request.downloads.create!(
+      name: "Book One",
+      status: :completed,
+      download_path: bundle,
+      progress: 100
+    )
+    cancelled_during_copy = false
+
+    FileCopyService.stub(:cp_noreplace, lambda { |source, destination, **kwargs|
+      if File.basename(source) == "Book Three.m4b"
+        cancelled_during_copy = true
+        assert_equal "book one audio", File.binread(book_one_file)
+        @request.remove_as_admin!
+        assert_not Request.exists?(@request.id)
+        assert_equal "book one audio", File.binread(book_one_file)
+        assert File.directory?(book_one_dir)
+      end
+
+      real_copy.call(source, destination, **kwargs)
+    }) do
+      LibraryPlatformClient.stub(:configured?, false) do
+        NotificationService.stub(:request_completed, ->(_request) { true }) do
+          PostProcessingJob.perform_now(live_download.id)
+        end
+      end
+    end
+
+    assert cancelled_during_copy
+    assert live_request.reload.completed?, live_request.issue_description
+    assert_equal book_one_dir, book_one.reload.file_path
+    assert_equal "book one audio", File.binread(book_one_file)
+    assert_equal "book three audio", File.binread(book_three_file)
+    assert File.directory?(book_one_dir)
+  end
 
   def without_atomic_file_publication(&operation)
     FileCopyService.stub(:native_linkat, ->(*) { raise Errno::EOPNOTSUPP }) do
@@ -3943,6 +6550,15 @@ class PostProcessingJobTest < ActiveJob::TestCase
           ]
         }.to_json
       )
+  end
+
+  # ffmpeg's audio-only MP4 uses the isom brand and puts moov after mdat.
+  def write_audio_only_mp4(path)
+    FileUtils.cp(file_fixture("audio_only_isom.mp4"), path)
+  end
+
+  def write_video_mp4(path)
+    File.binwrite(path, [ 24 ].pack("N") + "ftypisom" + ("\0" * 12))
   end
 
   def stub_audiobookshelf_scan

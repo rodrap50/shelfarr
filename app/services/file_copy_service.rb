@@ -45,6 +45,7 @@ class FileCopyService
   COPY_QUARANTINE_PATTERN = /\A\.shelfarr-copy-quarantine-([0-9a-f]+)-([0-9a-f]+)-([0-9a-f]{32})\z/
   DISCARD_PATTERN = /\A\.shelfarr-discard-([0-9a-f]+)-([0-9a-f]+)-[0-9a-f]{32}\.tmp\z/
   SOURCE_QUARANTINE_PATTERN = /\A\.shelfarr-source-quarantine-([0-9a-f]+)-([0-9a-f]+)-([0-9a-f]{32})\z/
+  SOURCE_TREE_CHILD_QUARANTINE_PATTERN = /\A\.shelfarr-remove-child-[0-9a-f]{32}\z/
   COPY_QUARANTINE_ENTRY = "entry"
   COPY_QUARANTINE_STALE_AGE = 24 * 60 * 60
   TIMESTAMP_SETTLE_ATTEMPTS = 3
@@ -135,7 +136,8 @@ class FileCopyService
     # directory. Publication uses an atomic no-replace operation and fails
     # closed when the destination filesystem cannot provide one. Every
     # destination component is opened from a pinned root descriptor with
-    # O_NOFOLLOW.
+    # O_NOFOLLOW. before_publish receives the private file's publication proof
+    # and may raise to stop before the destination name exists.
     def cp_noreplace(
       src,
       dest,
@@ -144,7 +146,8 @@ class FileCopyService
       source_snapshot: nil,
       heartbeat: nil,
       hardlink_mode: false,
-      require_durable: false
+      require_durable: false,
+      before_publish: nil
     )
       if hardlink_mode
         with_pinned_hardlink_source(src, source_root: source_root, validate_content: false, heartbeat: heartbeat) do |source, parent, basename, parent_path, manifest|
@@ -159,7 +162,8 @@ class FileCopyService
             source_validator: validator,
             accepted_modes: LIBRARY_FILE_MODES,
             require_durable: require_durable,
-            source_digest: file_manifest_digest(manifest)
+            source_digest: file_manifest_digest(manifest),
+            before_publish: before_publish
           )
         end
       else
@@ -177,7 +181,8 @@ class FileCopyService
             source_validator: validator,
             accepted_modes: LIBRARY_FILE_MODES,
             require_durable: require_durable,
-            source_digest: source_digest
+            source_digest: source_digest,
+            before_publish: before_publish
           )
         end
       end
@@ -188,7 +193,7 @@ class FileCopyService
     # source race. The source name is first linked to a private destination
     # entry, which must match the already-open source descriptor before the
     # existing no-replace publication protocol can make it final.
-    def hardlink_noreplace(src, dest, root:, source_root:, require_durable: false)
+    def hardlink_noreplace(src, dest, root:, source_root:, require_durable: false, before_publish: nil)
       with_pinned_hardlink_source(src, source_root: source_root, validate_content: false) do |source, source_parent, source_basename, source_parent_path, source_manifest|
         publish_hardlink_noreplace(
           source,
@@ -198,7 +203,8 @@ class FileCopyService
           source_manifest,
           dest,
           root: root,
-          require_durable: require_durable
+          require_durable: require_durable,
+          before_publish: before_publish
         )
       end
       dest
@@ -206,6 +212,43 @@ class FileCopyService
 
     def stable_hardlink_identity?(*filesystem_entries)
       !hardlink_identity_unreliable?(*filesystem_entries)
+    end
+
+    # A publication proof is taken from the private descriptor before its name
+    # is published, so a journal that outlives a crash can still tell this
+    # import's inode from whatever occupies the pathname afterwards. An inode
+    # number can be reused once the private file is gone. Size, mtime, and
+    # content keep such a reuse from passing as the published file.
+    def publication_identity_matches?(proof, stat)
+      return false unless stat.file?
+      return false unless proof["exclusive_inode"] == true && stat.nlink == 1
+      return false unless file_identity(stat) == [ proof["device"], proof["inode"] ]
+      return false unless stat.size == proof["size"]
+
+      proof["mtime_ns"].nil? || publication_mtime(stat) == proof["mtime_ns"]
+    end
+
+    def publication_content_matches?(proof, io, deadline: nil)
+      stat = io.stat
+      return false unless publication_identity_matches?(proof, stat)
+      return true if proof["digest"].nil?
+
+      snapshot = file_manifest_entry(stat)
+      catch(:publication_verification_expired) do
+        check_budget = lambda do
+          throw :publication_verification_expired, false if deadline && publication_verification_time >= deadline
+        end
+        check_budget.call
+        pinned_content_matches?(io, proof["digest"], stat.size, heartbeat: check_budget) && file_manifest_entry(io.stat) == snapshot
+      end
+    end
+
+    def publication_verification_time
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    def publication_parent_matches?(proof, parent_stat)
+      file_identity(parent_stat) == [ proof["parent_device"], proof["parent_inode"] ]
     end
 
     # Create a no-replace library entry that is a symlink to a verified regular
@@ -219,7 +262,8 @@ class FileCopyService
       source_root:,
       source_snapshot: nil,
       authorized_roots: nil,
-      authorized_root_snapshot: nil
+      authorized_root_snapshot: nil,
+      before_publish: nil
     )
       source_path = Pathname(src).expand_path
       destination_path = Pathname(dest).expand_path
@@ -250,6 +294,10 @@ class FileCopyService
             raise Errno::EEXIST, destination_path.to_s
           end
 
+          # The target records intent, not ownership: another writer can
+          # create an identical link after this attempt fails. Cancellation
+          # retains these entries because there is no private inode proof.
+          before_publish&.call(publication_symlink_proof(target, parent))
           begin
             native_symlinkat(target, parent.fileno, basename)
           rescue Errno::EEXIST
@@ -359,10 +407,16 @@ class FileCopyService
 
     # Publish from a source descriptor already pinned by the caller (for
     # example, a verified HTTP Tempfile) without resolving its pathname again.
-    def cp_io_noreplace(source, dest, root: nil, heartbeat: nil)
+    def cp_io_noreplace(source, dest, root: nil, heartbeat: nil, before_publish: nil)
       raise Errno::EINVAL, "source is not a regular file" unless source.stat.file?
 
-      publish_source_io_noreplace(source, dest, root: root, heartbeat: heartbeat)
+      publish_source_io_noreplace(
+        source,
+        dest,
+        root: root,
+        heartbeat: heartbeat,
+        before_publish: before_publish
+      )
       dest
     end
 
@@ -412,7 +466,8 @@ class FileCopyService
       root:,
       source_root: nil,
       heartbeat: nil,
-      allow_nonatomic: false
+      allow_nonatomic: false,
+      before_publish: nil
     )
       source_root ||= snapshot_source_root(source, heartbeat: heartbeat)
       source_path = Pathname(source).expand_path
@@ -436,6 +491,10 @@ class FileCopyService
           secure_pinned_library_tree!(source_directory, heartbeat: heartbeat)
 
           with_pinned_destination_parent(destination_path, root: root) do |destination_parent, basename, parent_path|
+            if before_publish && !hardlink_identity_unreliable?(destination_parent)
+              before_publish.call(directory_publication_proofs(source_root, source_directory, destination_parent))
+            end
+
             published = begin
               native_rename_noreplace(
                 source_parent.fileno,
@@ -544,6 +603,48 @@ class FileCopyService
         sync_io(directory)
       end
       path
+    end
+
+    # chmod one library entry through a no-follow descriptor so a symlink cannot
+    # redirect the mode change onto another inode. A regular file with more
+    # than one link is skipped: fchmod would change every name for that inode,
+    # including a retained download. The link count is read from the same
+    # descriptor that would be chmodded. Callers decide whether a failure is fatal.
+    def chmod_nofollow(path, mode, root:, directory:)
+      with_pinned_destination_parent(path, root: root) do |parent, basename, parent_path|
+        if directory
+          child = open_pinned_directory_child(parent, basename)
+          begin
+            native_fchmod(child.fileno, mode)
+          ensure
+            child.close unless child.closed?
+          end
+        else
+          with_pinned_regular_child(parent, basename) do |file|
+            next if file.stat.nlink > 1
+
+            native_fchmod(file.fileno, mode)
+          end
+        end
+        validate_current_directory_identity!(parent_path, parent)
+      end
+      path
+    end
+
+    # Stat a library file through a no-follow descriptor. Move cleanup compares
+    # this manifest, so a later mode change has to be recorded or the download
+    # is kept as if the library file had been replaced.
+    def library_file_manifest(path, root:)
+      manifest = nil
+      with_pinned_destination_parent(path, root: root) do |parent, basename, parent_path|
+        with_pinned_regular_child(parent, basename) do |file|
+          manifest = file_manifest_entry(file.stat).freeze
+        end
+        validate_current_directory_identity!(parent_path, parent)
+      end
+      manifest || RemoteResult::Failed.new(Errno::ENOENT.new("library file is absent"))
+    rescue SystemCallError, UnsafePathError => error
+      RemoteResult::Failed.new(error)
     end
 
     def secure_private_directory!(path, root:)
@@ -711,6 +812,62 @@ class FileCopyService
           result
         ensure
           lock.close unless lock.closed?
+        end
+      end
+    end
+
+    # Like with_private_lock, but the caller keeps the descriptor. Closing it
+    # releases the lock. A shared holder can outlive the call that acquired it.
+    def open_held_private_lock(path, root:, shared: false, nonblock: false)
+      with_pinned_destination_parent(path, root: root) do |parent, basename, parent_path|
+        attempts = 0
+        descriptor = begin
+          attempts += 1
+          native_openat(
+            parent.fileno,
+            basename,
+            File::RDWR | File::CREAT | File::NOFOLLOW,
+            0o600
+          )
+        rescue Errno::ENOENT
+          retry if attempts < 3
+
+          raise
+        end
+        lock = File.for_fd(descriptor, "r+b", autoclose: true)
+        acquired = nil
+        begin
+          stat = lock.stat
+          unless stat.file? && private_entry_owned_by_process?(stat, parent)
+            raise UnsafePathError, "private lock is not an application-owned regular file"
+          end
+
+          native_fchmod(lock.fileno, 0o600)
+          lock_flags = shared ? File::LOCK_SH : File::LOCK_EX
+          lock_flags |= File::LOCK_NB if nonblock
+          acquired = begin
+            lock.flock(lock_flags)
+          rescue Errno::EWOULDBLOCK => error
+            raise unless nonblock
+
+            RemoteResult::Failed.new(error)
+          end
+          if acquired && !RemoteResult.failed?(acquired)
+            identity = file_identity(lock.stat)
+            with_pinned_regular_child(parent, basename) do |current|
+              raise Errno::ESTALE, "private lock changed before use" unless file_identity(current.stat) == identity
+            end
+            validate_current_directory_identity!(parent_path, parent)
+          end
+        rescue
+          lock.close unless lock.closed?
+          raise
+        end
+        if acquired && !RemoteResult.failed?(acquired)
+          lock
+        else
+          lock.close unless lock.closed?
+          false
         end
       end
     end
@@ -1084,72 +1241,86 @@ class FileCopyService
 
     # DrvFS can change inode identities during rename, so the generic
     # quarantine-based remover must continue to reject it. Direct-download v2
-    # staging instead uses an application-authenticated private namespace and
-    # can remove a fully preflighted tree without renaming it. Callers must
-    # validate that parent_path and child_name name that exact namespace.
+    # staging is an application-authenticated private namespace and can be
+    # removed without RENAME_NOREPLACE. Callers must validate that parent_path
+    # and child_name name that exact namespace. Pass require_drvfs: false only
+    # for that namespace; other filesystems can reject the rename flag too.
     def remove_owned_private_tree_on_drvfs(
       parent_path,
       child_name,
       root:,
       expected_identity:,
-      expected_parent_identity:
+      expected_parent_identity:,
+      require_drvfs: true
     )
       if child_name.include?(File::SEPARATOR) || child_name.in?([ ".", ".." ])
-        raise UnsafePathError, "private directory child name is unsafe"
+        return :retained
       end
 
-      with_pinned_directory(parent_path, root: root, create: false, mode: 0o700) do |parent|
-        return :not_drvfs unless drvfs_mount?(parent) == true
+      on_drvfs = false
+      # :fallback lets the caller quarantine-delete. DrvFS must not take that path.
+      refusal = lambda { on_drvfs ? :retained : :fallback }
 
-        parent_stat = parent.stat
-        if expected_parent_identity && file_identity(parent_stat) != expected_parent_identity
-          return :retained
-        end
-        unless drvfs_private_staging_directory?(parent_stat, parent, root: true)
-          return :retained
-        end
+      begin
+        with_pinned_directory(parent_path, root: root, create: false, mode: 0o700) do |parent|
+          mount = drvfs_mount?(parent)
+          return :retained if RemoteResult.failed?(mount)
 
-        child = begin
-          open_pinned_directory_child(parent, child_name)
-        rescue Errno::ENOENT
-          return :missing
-        end
-        begin
-          child_stat = child.stat
-          child_identity = file_identity(child_stat)
-          return :retained if expected_identity && child_identity != expected_identity
-          return :retained unless drvfs_private_staging_directory?(child_stat, parent, root: true)
-
-          root_manifest = drvfs_private_staging_manifest(child_stat, parent)
-          current_root = lambda do
-            validate_current_directory_identity!(Pathname(parent_path).expand_path, parent)
-            drvfs_private_staging_child_manifest(parent, child_name) == root_manifest
-          rescue SystemCallError, IOError, UnsafePathError => error
-            RemoteResult::Failed.new(error)
+          on_drvfs = mount == true
+          if require_drvfs
+            return :not_drvfs unless on_drvfs
           end
 
-          return :retained unless current_root.call
+          parent_stat = parent.stat
+          if expected_parent_identity && file_identity(parent_stat) != expected_parent_identity
+            return refusal.call
+          end
+          unless drvfs_private_staging_directory?(parent_stat, parent, root: true)
+            return refusal.call
+          end
 
-          manifest = snapshot_pinned_drvfs_private_tree(child)
-          return :retained unless current_root.call
+          child = begin
+            open_pinned_directory_child(parent, child_name)
+          rescue Errno::ENOENT
+            return :missing
+          end
+          begin
+            child_stat = child.stat
+            child_identity = file_identity(child_stat)
+            return refusal.call if expected_identity && child_identity != expected_identity
+            return refusal.call unless drvfs_private_staging_directory?(child_stat, parent, root: true)
 
-          remove_pinned_drvfs_private_tree_contents!(
-            child,
-            manifest,
-            before_remove: current_root
-          )
-          return :retained unless current_root.call
+            root_manifest = drvfs_private_staging_manifest(child_stat, parent)
+            current_root = lambda do
+              validate_current_directory_identity!(Pathname(parent_path).expand_path, parent)
+              drvfs_private_staging_child_manifest(parent, child_name) == root_manifest
+            rescue SystemCallError, IOError, UnsafePathError => error
+              RemoteResult::Failed.new(error)
+            end
 
-          native_unlinkat(parent.fileno, child_name, AT_REMOVEDIR)
-          sync_io(parent)
-          validate_current_directory_identity!(Pathname(parent_path).expand_path, parent)
-          :removed
-        ensure
-          child.close unless child.closed?
+            return refusal.call unless current_root.call
+
+            manifest = snapshot_pinned_drvfs_private_tree(child)
+            return refusal.call unless current_root.call
+
+            remove_pinned_drvfs_private_tree_contents!(
+              child,
+              manifest,
+              before_remove: current_root
+            )
+            return refusal.call unless current_root.call
+
+            native_unlinkat(parent.fileno, child_name, AT_REMOVEDIR)
+            sync_io(parent)
+            validate_current_directory_identity!(Pathname(parent_path).expand_path, parent)
+            :removed
+          ensure
+            child.close unless child.closed?
+          end
         end
+      rescue SystemCallError, IOError, UnsafePathError
+        refusal.call
       end
-    rescue SystemCallError, IOError, UnsafePathError
-      :retained
     end
 
     # Compare regular files through pinned descriptors. This is used by retry
@@ -1214,16 +1385,19 @@ class FileCopyService
       with_pinned_destination_parent(path, root: root) do |parent, basename, parent_path|
         expected_identity = nil
         expected_mode = nil
+        expected_links = nil
         with_pinned_regular_child(parent, basename) do |file|
           stat = file.stat
           expected_identity = file_identity(stat)
           expected_mode = stat.mode & 0o7777
-          result = expected_mode.in?(HARDLINK_FALLBACK_FILE_MODES) ||
-            (expected_mode.in?(LIBRARY_FILE_MODES) && synthetic_library_file_mode?(parent, expected_mode))
+          expected_links = stat.nlink
+          result = hardlink_fallback_file_reusable?(expected_mode, parent, stat)
         end
         with_pinned_regular_child(parent, basename) do |current|
           stat = current.stat
-          unless file_identity(stat) == expected_identity && (stat.mode & 0o7777) == expected_mode
+          unless file_identity(stat) == expected_identity &&
+              (stat.mode & 0o7777) == expected_mode &&
+              stat.nlink == expected_links
             raise Errno::ESTALE, "library file changed during mode validation"
           end
         end
@@ -1232,6 +1406,28 @@ class FileCopyService
       result
     rescue Errno::ENOENT, Errno::ELOOP, Errno::ENOTDIR, UnsafePathError => error
       RemoteResult::Failed.new(error)
+    end
+
+    # 0600 and 0640 are the modes a fallback copy is published with. A
+    # configured import mode is also evidence of that copy, but only while the
+    # inode has one link. A second link may still be retained download data,
+    # and this check must not chmod the candidate to find out.
+    def hardlink_fallback_file_reusable?(mode, parent, stat)
+      return true if mode.in?(HARDLINK_FALLBACK_FILE_MODES)
+
+      configured = configured_library_import_file_mode
+      if configured && mode == configured
+        return stat.nlink == 1
+      end
+
+      mode.in?(LIBRARY_FILE_MODES) && synthetic_library_file_mode?(parent, mode)
+    end
+
+    def configured_library_import_file_mode
+      text = SettingsService.get(:library_import_file_mode).to_s
+      return if text.empty?
+
+      Integer(text, 8, exception: false)
     end
 
     def same_io_content?(source, destination_path, root: nil)
@@ -1406,10 +1602,16 @@ class FileCopyService
 
     # Atomically quarantine a source file, verify the exact snapshotted entry,
     # and only then remove it. A raced replacement is restored or retained.
-    def remove_source_file(source_snapshot, destination_snapshot: nil)
+    def remove_source_file(source_snapshot, destination_snapshot: nil, destination_snapshots: nil)
       expanded = source_snapshot.path
-      destination_validator = if destination_snapshot
-        -> { file_snapshot_current?(destination_snapshot, require_durable: true) }
+      snapshots = Array(destination_snapshots)
+      snapshots = [ destination_snapshot, *snapshots ] if destination_snapshot
+      destination_validator = if snapshots.any?
+        lambda do
+          snapshots.all? do |snapshot|
+            file_snapshot_current?(snapshot, require_durable: true) == true
+          end
+        end
       end
 
       with_pinned_absolute_directory(source_snapshot.canonical_parent_path) do |parent|
@@ -1463,6 +1665,13 @@ class FileCopyService
     # is never recursively deleted. Some NFS servers reject RENAME_NOREPLACE
     # with EINVAL; operators may explicitly allow the weaker check-then-rename
     # compatibility path used by directory publication.
+    #
+    # The quarantine basename is derived from the snapshotted device and inode,
+    # so a killed worker can find it without a second database write. Partial
+    # progress inside that directory is resumed. A missing source with no
+    # owned quarantine left is already removed. A symlink or other
+    # non-directory at the original path is a replacement and is not followed.
+    # A directory that only reused the inode is left untouched.
     def remove_source_tree(
       source_root,
       allow_nonatomic: SettingsService.get(:allow_nonatomic_nfs_directory_publication)
@@ -1470,7 +1679,6 @@ class FileCopyService
       expanded = source_root.path
       parent_path = source_root.parent_path
       canonical_parent = source_root.canonical_parent_path
-      quarantine_basename = ".shelfarr-remove-#{SecureRandom.hex(16)}"
 
       with_pinned_absolute_directory(canonical_parent) do |parent|
         return false if hardlink_identity_unreliable?(parent)
@@ -1479,73 +1687,146 @@ class FileCopyService
           raise Errno::ESTALE, "source parent identity changed during cleanup"
         end
         validate_current_directory_identity!(parent_path, parent)
-        renamed = rename_entry_noreplace(
-          parent,
-          expanded.basename.to_s,
-          quarantine_basename,
-          allow_nonatomic: allow_nonatomic,
-          directory: true,
-          log_fallback: true
-        )
-        unless renamed
-          unless allow_nonatomic
-            Rails.logger.warn(
-              "[FileCopyService] Atomic source quarantine is unsupported; the source was retained"
-            )
-          end
-          return false
-        end
 
-        quarantined_identity = pinned_child_identity(parent, quarantine_basename, directory: true)
+        source_basename = expanded.basename.to_s
         expected_identity = [ source_root.device, source_root.inode ]
-        unless quarantined_identity == expected_identity
-          restore_quarantined_replacement(
+        source_identity = source_tree_directory_identity(parent, source_basename)
+        source_absent_or_replaced = source_identity == :missing || source_identity == :replaced
+        if source_identity == expected_identity
+          quarantine_and_remove_source_tree!(
             parent,
-            quarantine_basename,
-            expanded.basename.to_s,
+            source_basename,
+            source_root,
             allow_nonatomic: allow_nonatomic
           )
-          return false
-        end
-
-        with_pinned_relative_directory(
-          parent,
-          Pathname(quarantine_basename),
-          create: false
-        ) do |quarantine|
-          unless snapshot_pinned_regular_tree(quarantine) == source_root.entries
-            restore_quarantined_replacement(
+        else
+          quarantine_basename = owned_source_tree_quarantine(parent, expected_identity)
+          if quarantine_basename
+            removed = delete_quarantined_source_tree!(
               parent,
               quarantine_basename,
-              expanded.basename.to_s,
+              source_basename,
+              source_root,
+              allow_nonatomic: allow_nonatomic,
+              resume: true
+            )
+            if removed == :not_owned
+              source_absent_or_replaced
+            else
+              removed
+            end
+          elsif source_absent_or_replaced
+            true
+          else
+            quarantine_and_remove_source_tree!(
+              parent,
+              source_basename,
+              source_root,
               allow_nonatomic: allow_nonatomic
             )
-            return false
           end
-
-          remove_pinned_tree_contents!(
-            quarantine,
-            source_root.entries,
-            allow_nonatomic: allow_nonatomic
-          )
         end
-
-        validate_current_directory_identity!(parent_path, parent)
-        unless pinned_child_identity(parent, quarantine_basename, directory: true) == expected_identity
-          restore_quarantined_replacement(
-            parent,
-            quarantine_basename,
-            expanded.basename.to_s,
-            allow_nonatomic: allow_nonatomic
-          )
-          return false
-        end
-        native_unlinkat(parent.fileno, quarantine_basename, AT_REMOVEDIR)
-        sync_io(parent)
-        true
       end
     rescue Errno::ENOENT => error
       RemoteResult::Failed.new(error)
+    end
+
+    # Put an owned quarantine back when deletion is no longer allowed.
+    # Inode-matched child quarantine names are restored before the root is
+    # published. An entry already at the original path is left in place.
+    def restore_owned_source_tree(source_root, allow_nonatomic:)
+      with_pinned_absolute_directory(source_root.canonical_parent_path) do |parent|
+        unless file_identity(parent.stat) == [ source_root.parent_device, source_root.parent_inode ]
+          raise Errno::ESTALE, "source parent identity changed during cleanup"
+        end
+        validate_current_directory_identity!(source_root.parent_path, parent)
+
+        expected_identity = [ source_root.device, source_root.inode ]
+        quarantine_basename = owned_source_tree_quarantine(parent, expected_identity)
+        return :absent unless quarantine_basename
+
+        source_basename = source_root.path.basename.to_s
+        unless source_tree_directory_identity(parent, source_basename) == :missing
+          return RemoteResult::Failed.new(Errno::EEXIST.new("source path is occupied"))
+        end
+
+        restored_children = restore_quarantined_child_names!(
+          parent,
+          quarantine_basename,
+          source_root.entries,
+          allow_nonatomic: allow_nonatomic
+        )
+        return restored_children unless restored_children == true
+
+        restored = rename_entry_noreplace(
+          parent,
+          quarantine_basename,
+          source_basename,
+          allow_nonatomic: allow_nonatomic,
+          directory: true
+        )
+        unless restored && source_tree_directory_identity(parent, source_basename) == expected_identity
+          return RemoteResult::Failed.new(Errno::EEXIST.new("owned source quarantine could not be restored"))
+        end
+
+        sync_io(parent)
+        :restored
+      end
+    rescue Errno::ENOENT
+      :absent
+    rescue Errno::EEXIST => error
+      RemoteResult::Failed.new(error)
+    end
+
+    def owned_source_tree_quarantined?(source_root)
+      with_pinned_absolute_directory(source_root.canonical_parent_path) do |parent|
+        return false unless file_identity(parent.stat) == [ source_root.parent_device, source_root.parent_inode ]
+
+        validate_current_directory_identity!(source_root.parent_path, parent)
+        !owned_source_tree_quarantine(parent, [ source_root.device, source_root.inode ]).nil?
+      end
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR, Errno::ESTALE, UnsafePathError => error
+      RemoteResult::Failed.new(error)
+    end
+
+    # ENOENT is a deleted parent only when the snapshotted filesystem is mounted.
+    # A restart can leave the mountpoint behind on a different device.
+    def source_parent_missing?(source_root)
+      path = source_root.canonical_parent_path
+      visible_device = deepest_existing_directory_device(path)
+      return false unless visible_device == source_root.parent_device
+
+      with_pinned_absolute_directory(path) { false }
+    rescue Errno::ENOENT
+      true # rubocop:disable Shelfarr/RescueToEmpty -- ENOENT is a missing parent; callers compare with == true
+    end
+
+    def deepest_existing_directory_device(path)
+      path = Pathname(path).expand_path
+      device = nil
+      with_pinned_absolute_directory(File::SEPARATOR) do |root|
+        device = root.stat.dev
+        current = root
+        opened = []
+        begin
+          path.each_filename do |part|
+            next if part == File::SEPARATOR || part == "."
+            raise UnsafePathError, "parent traversal is not allowed" if part == ".."
+
+            child = begin
+              open_pinned_directory_child(current, part)
+            rescue Errno::ENOENT
+              break
+            end
+            opened << child
+            current = child
+            device = child.stat.dev
+          end
+        ensure
+          opened.reverse_each { |handle| handle.close unless handle.closed? }
+        end
+      end
+      device
     end
 
     def secure_library_file!(path, root: nil, require_durable: false)
@@ -1626,9 +1907,11 @@ class FileCopyService
             next unless source_stat.size == destination_stat.size
             if hardlink_mode && file_identity(source_stat) != file_identity(destination_stat)
               destination_mode = destination_stat.mode & 0o7777
-              retry_safe_mode = destination_mode.in?(HARDLINK_FALLBACK_FILE_MODES) ||
-                (destination_mode.in?(LIBRARY_FILE_MODES) &&
-                  synthetic_library_file_mode?(parent, destination_mode))
+              retry_safe_mode = hardlink_fallback_file_reusable?(
+                destination_mode,
+                parent,
+                destination_stat
+              )
               next unless retry_safe_mode == true
             end
 
@@ -1769,6 +2052,99 @@ class FileCopyService
       ).freeze
     end
 
+    # Directory cleanup has to round-trip the whole tree. Recovery compares
+    # this token to a fresh snapshot before it deletes anything.
+    def serialize_source_root(source_root)
+      {
+        "path" => source_root.path.to_s,
+        "parent_path" => source_root.parent_path.to_s,
+        "canonical_parent_path" => source_root.canonical_parent_path.to_s,
+        "device" => source_root.device,
+        "inode" => source_root.inode,
+        "parent_device" => source_root.parent_device,
+        "parent_inode" => source_root.parent_inode,
+        "entries" => source_root.entries.map { |relative, manifest|
+          serialize_source_tree_entry(relative, manifest)
+        }
+      }
+    end
+
+    def deserialize_source_root(attributes)
+      entries = {}
+      Array(attributes.fetch("entries")).each do |entry|
+        entries[entry.fetch("relative")] = deserialize_source_tree_entry(entry)
+      end
+      SourceRoot.new(
+        path: Pathname(attributes.fetch("path")).expand_path,
+        parent_path: Pathname(attributes.fetch("parent_path")).expand_path,
+        canonical_parent_path: Pathname(attributes.fetch("canonical_parent_path")).expand_path,
+        device: Integer(attributes.fetch("device")),
+        inode: Integer(attributes.fetch("inode")),
+        parent_device: Integer(attributes.fetch("parent_device")),
+        parent_inode: Integer(attributes.fetch("parent_inode")),
+        entries: entries.freeze
+      ).freeze
+    end
+
+    def serialize_source_tree_entry(relative, manifest)
+      type = manifest.fetch(2)
+      unless type == :file || type == :directory
+        raise ArgumentError, "unsupported source tree entry"
+      end
+
+      entry = {
+        "relative" => relative.to_s,
+        "device" => manifest.fetch(0),
+        "inode" => manifest.fetch(1),
+        "type" => type.to_s,
+        "size" => manifest.fetch(3),
+        "mtime_numerator" => manifest.fetch(4).numerator,
+        "mtime_denominator" => manifest.fetch(4).denominator,
+        "ctime_numerator" => manifest.fetch(5).numerator,
+        "ctime_denominator" => manifest.fetch(5).denominator
+      }
+      if type == :file
+        entry["mode"] = manifest.fetch(6)
+        entry["content_digest"] = manifest.fetch(7)
+      end
+      entry
+    end
+
+    def deserialize_source_tree_entry(entry)
+      type = case entry.fetch("type")
+      when "file"
+        :file
+      when "directory"
+        :directory
+      else
+        raise ArgumentError, "unsupported source tree entry"
+      end
+      manifest = [
+        Integer(entry.fetch("device")),
+        Integer(entry.fetch("inode")),
+        type,
+        Integer(entry.fetch("size")),
+        Rational(
+          Integer(entry.fetch("mtime_numerator")),
+          Integer(entry.fetch("mtime_denominator"))
+        ),
+        Rational(
+          Integer(entry.fetch("ctime_numerator")),
+          Integer(entry.fetch("ctime_denominator"))
+        )
+      ]
+      if type == :file
+        digest = entry.fetch("content_digest")
+        unless digest.is_a?(String) && digest.match?(/\A[0-9a-f]{64}\z/)
+          raise ArgumentError, "invalid source tree content digest"
+        end
+
+        manifest << Integer(entry.fetch("mode"))
+        manifest << digest.dup.freeze
+      end
+      manifest.freeze
+    end
+
     def content_digest_attribute(value)
       return nil if value.nil?
       raise ArgumentError, "invalid file snapshot content digest" unless value.is_a?(String) && value.match?(/\A[0-9a-f]{64}\z/)
@@ -1825,7 +2201,7 @@ class FileCopyService
       end
       true
     rescue Errno::ENOENT
-      true
+      true # rubocop:disable Shelfarr/RescueToEmpty -- a missing directory has no interrupted copies left
     end
 
     # Legacy staging-only copy from an already-open source descriptor. This
@@ -2196,7 +2572,8 @@ class FileCopyService
       source_validator: nil,
       accepted_modes: LIBRARY_FILE_MODES,
       require_durable: false,
-      source_digest: nil
+      source_digest: nil,
+      before_publish: nil
     )
       raise Errno::EINVAL, "source is not a regular file" unless source.stat.file?
       source_size = source.stat.size
@@ -2296,6 +2673,10 @@ class FileCopyService
                 source_validator&.call
               end
               identity_reliable = !hardlink_identity_unreliable?(parent)
+              if before_publish && identity_reliable
+                digest = source_digest || io_content_identity(temporary, heartbeat: heartbeat).last
+                before_publish.call(publication_file_proof(temporary.stat, parent, digest: digest))
+              end
 
               publication_method = if identity_reliable
                 publish_private_child_atomically_noreplace!(
@@ -2369,7 +2750,8 @@ class FileCopyService
       source_manifest,
       destination,
       root:,
-      require_durable: false
+      require_durable: false,
+      before_publish: nil
     )
       source_identity = source_manifest.first(2)
       expected_stable_manifest = stable_hardlink_snapshot_entry(source_manifest)
@@ -2435,10 +2817,11 @@ class FileCopyService
             end
 
             file_durable = false
+            private_link_stat = nil
             with_pinned_regular_child(parent, temporary_basename) do |temporary|
-              temporary_stat = temporary.stat
-              unless file_identity(temporary_stat) == temporary_identity &&
-                  stable_hardlink_manifest_entry(temporary_stat) == expected_stable_manifest
+              private_link_stat = temporary.stat
+              unless file_identity(private_link_stat) == temporary_identity &&
+                  stable_hardlink_manifest_entry(private_link_stat) == expected_stable_manifest
                 raise Errno::ESTALE, "private hardlink does not match the pinned source"
               end
               file_durable = sync_io(temporary)
@@ -2456,6 +2839,9 @@ class FileCopyService
               source_manifest
             )
             validate_current_directory_identity!(parent_path, parent)
+            before_publish&.call(
+              publication_file_proof(private_link_stat, parent, digest: file_manifest_digest(source_manifest))
+            )
 
             begin
               publication_method = publish_private_child_atomically_noreplace!(
@@ -2593,12 +2979,55 @@ class FileCopyService
         end
         unless cleanup.in?([ :removed, :missing ])
           if in_flight_error
-            Rails.logger.warn("[FileCopyService] Retained a hardlink identity probe after capability failure")
+            Rails.logger.warn(
+              "[FileCopyService] Retained a hardlink identity probe after capability failure: " \
+                "#{hardlink_probe_removal_failure(cleanup, cleanup_error)}"
+            )
           else
-            raise cleanup_error || UnsafePathError,
-              "hardlink identity probe could not be removed safely"
+            raise_unremoved_hardlink_probe!(cleanup, cleanup_error)
           end
         end
+      end
+    end
+
+    def raise_unremoved_hardlink_probe!(cleanup, cleanup_error)
+      message = "hardlink identity probe could not be removed safely: " \
+        "#{hardlink_probe_removal_failure(cleanup, cleanup_error)}"
+      unless cleanup_error
+        raise UnsafePathError, message
+      end
+
+      failure = cleanup_error.exception(message)
+      failure = cleanup_error.class.new(message) if failure.equal?(cleanup_error)
+      raise failure, cause: cleanup_error
+    end
+
+    def hardlink_probe_removal_failure(cleanup, error)
+      return cleanup.to_s unless error
+
+      case error
+      when UnsafeFilePermissionsError
+        "mode"
+      when Errno::ELOOP, Errno::ENOTDIR
+        "symlink/non-directory"
+      when SystemCallError
+        error.class.name
+      when UnsafePathError
+        hardlink_probe_path_failure(error.message.to_s)
+      else
+        error.class.name
+      end
+    end
+
+    def hardlink_probe_path_failure(message)
+      if message.include?("owned by another user")
+        "ownership"
+      elsif message.match?(/symbolic link|non-directory|non-regular|not a regular file/)
+        "symlink/non-directory"
+      elsif message.include?("mismatched cleanup entry was retained")
+        "retained cleanup entry"
+      else
+        "unsafe path"
       end
     end
 
@@ -2859,6 +3288,79 @@ class FileCopyService
       RemoteResult::Failed.new(error)
     ensure
       source.seek(source_position) if source_position
+    end
+
+    def publication_file_proof(stat, parent, digest:)
+      parent_stat = parent.stat
+      proof = {
+        "kind" => "file",
+        "device" => stat.dev,
+        "inode" => stat.ino,
+        "size" => stat.size,
+        "exclusive_inode" => stat.nlink == 1,
+        "parent_device" => parent_stat.dev,
+        "parent_inode" => parent_stat.ino
+      }
+      proof["digest"] = digest if digest
+      proof["mtime_ns"] = publication_mtime(stat) unless digest && unstable_file_timestamps?(parent) == true
+      proof
+    end
+
+    def publication_symlink_proof(target, parent)
+      parent_stat = parent.stat
+      {
+        "kind" => "symlink",
+        "target" => target.to_s,
+        "parent_device" => parent_stat.dev,
+        "parent_inode" => parent_stat.ino
+      }
+    end
+
+    # Every regular file keeps its inode when the staged tree is renamed, so
+    # each one is proven individually. A file added to the tree after
+    # publication has no proof and survives cancellation.
+    def directory_publication_proofs(source_root, source_directory, destination_parent)
+      entries = source_root.entries
+      unstable = unstable_file_timestamps?(destination_parent) == true
+      entries.each_with_object({}) do |(relative, manifest), proofs|
+        next unless manifest[2] == :file
+
+        parent = File.dirname(relative)
+        parent_identity = parent == "." ? [ source_root.device, source_root.inode ] : entries.fetch(parent).first(2)
+        proof = {
+          "kind" => "file",
+          "device" => manifest.fetch(0),
+          "inode" => manifest.fetch(1),
+          "size" => manifest.fetch(3),
+          "parent_device" => parent_identity.first,
+          "parent_inode" => parent_identity.last,
+          "digest" => file_manifest_digest(manifest)
+        }.compact
+        with_pinned_relative_directory(source_directory, Pathname(parent), create: false) do |directory|
+          file = File.for_fd(
+            native_openat(directory.fileno, File.basename(relative), File::RDONLY | File::NOFOLLOW | File::NONBLOCK, 0),
+            "rb", autoclose: true
+          )
+          begin
+            stat = file.stat
+            raise Errno::ESTALE, "publication file identity changed" unless file_identity(stat) == manifest.first(2)
+
+            proof["exclusive_inode"] = stat.nlink == 1
+          ensure
+            file.close
+          end
+        end
+        proof["mtime_ns"] = publication_time(manifest.fetch(4)) unless proof["digest"] && unstable
+        proofs[relative] = proof
+      end
+    end
+
+    def publication_mtime(stat)
+      publication_time(stat.mtime.to_r)
+    end
+
+    def publication_time(time)
+      (time * 1_000_000_000).to_i
     end
 
     def validate_published_child!(
@@ -3258,7 +3760,7 @@ class FileCopyService
       child.close
       false
     rescue Errno::ENOENT
-      true
+      true # rubocop:disable Shelfarr/RescueToEmpty -- ENOENT is a missing child; callers compare with == true
     rescue Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR => error
       RemoteResult::Failed.new(error)
     end
@@ -3882,30 +4384,40 @@ class FileCopyService
       manifest
     end
 
-    def remove_pinned_tree_contents!(directory, expected_entries, prefix = nil, allow_nonatomic: false)
-      children = pinned_directory_children(directory)
-      expected_children = expected_entries.keys.filter_map do |relative|
-        path = Pathname(relative)
-        next unless path.dirname == (prefix || Pathname("."))
+    def remove_pinned_tree_contents!(directory, expected_entries, prefix = nil, allow_nonatomic: false, resume: false)
+      steps = if resume
+        # Missing names and child-quarantine renames are leftover progress from
+        # a killed cleanup. Any other entry is a different tree.
+        classified = classify_source_tree_resume(directory, expected_entries, prefix)
+        unless classified
+          raise Errno::ESTALE, "quarantined source tree changed during cleanup"
+        end
 
-        path.basename.to_s
-      end.sort
-      unless children == expected_children
-        raise Errno::ESTALE, "quarantined source tree changed during cleanup"
+        classified
+      else
+        children = pinned_directory_children(directory)
+        expected_children = source_tree_child_names(expected_entries, prefix)
+        unless children == expected_children
+          raise Errno::ESTALE, "quarantined source tree changed during cleanup"
+        end
+
+        children.map { |entry| [ entry, nil ] }
       end
 
-      children.each do |entry|
+      steps.each do |entry, existing_quarantine|
         relative = prefix ? prefix.join(entry) : Pathname(entry)
         expected = expected_entries.fetch(relative.to_s)
-        quarantine = ".shelfarr-remove-child-#{SecureRandom.hex(16)}"
-        renamed = rename_entry_noreplace(
-          directory,
-          entry,
-          quarantine,
-          allow_nonatomic: allow_nonatomic,
-          directory: expected[2] == :directory
-        )
-        raise Errno::ESTALE, "source child changed during cleanup" unless renamed
+        quarantine = existing_quarantine || ".shelfarr-remove-child-#{SecureRandom.hex(16)}"
+        unless existing_quarantine
+          renamed = rename_entry_noreplace(
+            directory,
+            entry,
+            quarantine,
+            allow_nonatomic: allow_nonatomic,
+            directory: expected[2] == :directory
+          )
+          raise Errno::ESTALE, "source child changed during cleanup" unless renamed
+        end
 
         descriptor = native_openat(
           directory.fileno,
@@ -3930,7 +4442,8 @@ class FileCopyService
               child,
               expected_entries,
               relative,
-              allow_nonatomic: allow_nonatomic
+              allow_nonatomic: allow_nonatomic,
+              resume: resume
             )
             unless pinned_child_identity(directory, quarantine, directory: true) == expected.first(2)
               restore_quarantined_replacement(
@@ -3981,6 +4494,426 @@ class FileCopyService
       end
     end
 
+    def quarantine_and_remove_source_tree!(parent, source_basename, source_root, allow_nonatomic:)
+      quarantine_basename = source_tree_quarantine_basename(source_root.device, source_root.inode)
+      renamed = rename_entry_noreplace(
+        parent,
+        source_basename,
+        quarantine_basename,
+        allow_nonatomic: allow_nonatomic,
+        directory: true,
+        log_fallback: true
+      )
+      unless renamed
+        unless allow_nonatomic
+          Rails.logger.warn(
+            "[FileCopyService] Atomic source quarantine is unsupported; the source was retained"
+          )
+        end
+        return false
+      end
+
+      delete_quarantined_source_tree!(
+        parent,
+        quarantine_basename,
+        source_basename,
+        source_root,
+        allow_nonatomic: allow_nonatomic,
+        resume: false
+      )
+    end
+
+    def delete_quarantined_source_tree!(
+      parent,
+      quarantine_basename,
+      source_basename,
+      source_root,
+      allow_nonatomic:,
+      resume:
+    )
+      expected_identity = [ source_root.device, source_root.inode ]
+      quarantined_identity = pinned_child_identity(parent, quarantine_basename, directory: true)
+      unless quarantined_identity == expected_identity
+        if resume
+          raise Errno::ESTALE, "quarantined source tree changed during cleanup"
+        end
+
+        restore_quarantined_replacement(
+          parent,
+          quarantine_basename,
+          source_basename,
+          allow_nonatomic: allow_nonatomic
+        )
+        return false
+      end
+
+      with_pinned_relative_directory(
+        parent,
+        Pathname(quarantine_basename),
+        create: false
+      ) do |quarantine|
+        snapshot_matches = snapshot_pinned_regular_tree(quarantine) == source_root.entries
+        unless snapshot_matches || (resume && quarantined_tree_resume_safe?(quarantine, source_root.entries))
+          if resume && !source_tree_shares_snapshot_identity?(quarantine, source_root.entries)
+            return :not_owned
+          end
+
+          # The inode still proves this tree is ours. Publish child names
+          # before the root, or a content mismatch leaves them hidden.
+          restored_children = restore_quarantined_child_names!(
+            parent,
+            quarantine_basename,
+            source_root.entries,
+            allow_nonatomic: allow_nonatomic
+          )
+          # Leave the root quarantined when a child name cannot be put back.
+          # A truthy failure would look like a completed delete to other callers.
+          return false unless restored_children == true
+
+          restore_quarantined_replacement(
+            parent,
+            quarantine_basename,
+            source_basename,
+            allow_nonatomic: allow_nonatomic
+          )
+          return false
+        end
+
+        remove_pinned_tree_contents!(
+          quarantine,
+          source_root.entries,
+          allow_nonatomic: allow_nonatomic,
+          resume: resume && !snapshot_matches
+        )
+      end
+
+      validate_current_directory_identity!(source_root.parent_path, parent)
+      unless pinned_child_identity(parent, quarantine_basename, directory: true) == expected_identity
+        restore_quarantined_replacement(
+          parent,
+          quarantine_basename,
+          source_basename,
+          allow_nonatomic: allow_nonatomic
+        )
+        return false
+      end
+      native_unlinkat(parent.fileno, quarantine_basename, AT_REMOVEDIR)
+      sync_io(parent)
+      true
+    end
+
+    def restore_quarantined_child_names!(parent, quarantine_basename, expected_entries, allow_nonatomic:)
+      with_pinned_relative_directory(parent, Pathname(quarantine_basename), create: false) do |quarantine, _created|
+        restore_inode_matched_children!(
+          quarantine,
+          expected_entries,
+          allow_nonatomic: allow_nonatomic
+        )
+      end
+    rescue Errno::ENOENT, Errno::EEXIST => error
+      RemoteResult::Failed.new(error)
+    end
+
+    def restore_inode_matched_children!(directory, expected_entries, allow_nonatomic:, prefix: nil)
+      children = pinned_directory_children(directory)
+      expected_children = source_tree_child_names(expected_entries, prefix)
+      quarantined_names, plain_names = children.partition do |name|
+        SOURCE_TREE_CHILD_QUARANTINE_PATTERN.match?(name)
+      end
+      matches = match_child_quarantine_names(
+        directory,
+        quarantined_names,
+        expected_children,
+        expected_entries,
+        prefix,
+        plain_names
+      )
+      return child_restore_conflict unless matches
+
+      plain_names.each do |name|
+        result = restore_present_child_directory!(
+          directory,
+          name,
+          expected_children,
+          expected_entries,
+          prefix,
+          allow_nonatomic: allow_nonatomic
+        )
+        return result unless result == true
+      end
+
+      matches.each do |quarantine_name, original_name|
+        result = restore_matched_child_quarantine!(
+          directory,
+          quarantine_name,
+          original_name,
+          expected_entries,
+          prefix,
+          allow_nonatomic: allow_nonatomic
+        )
+        return result unless result == true
+      end
+
+      if pinned_directory_children(directory).any? { |name| SOURCE_TREE_CHILD_QUARANTINE_PATTERN.match?(name) }
+        return child_restore_conflict
+      end
+
+      sync_io(directory)
+      true
+    end
+
+    def restore_present_child_directory!(
+      directory,
+      name,
+      expected_children,
+      expected_entries,
+      prefix,
+      allow_nonatomic:
+    )
+      return true unless expected_children.include?(name)
+
+      relative = source_tree_relative(prefix, name)
+      expected = expected_entries.fetch(relative.to_s)
+      return true unless expected[2] == :directory && child_matches_snapshot?(directory, name, expected)
+
+      with_pinned_relative_directory(directory, Pathname(name), create: false) do |child, _created|
+        restore_inode_matched_children!(
+          child,
+          expected_entries,
+          allow_nonatomic: allow_nonatomic,
+          prefix: relative
+        )
+      end
+    end
+
+    def restore_matched_child_quarantine!(
+      directory,
+      quarantine_name,
+      original_name,
+      expected_entries,
+      prefix,
+      allow_nonatomic:
+    )
+      relative = source_tree_relative(prefix, original_name)
+      expected = expected_entries.fetch(relative.to_s)
+      if expected[2] == :directory
+        restored = with_pinned_relative_directory(directory, Pathname(quarantine_name), create: false) do |child, _created|
+          restore_inode_matched_children!(
+            child,
+            expected_entries,
+            allow_nonatomic: allow_nonatomic,
+            prefix: relative
+          )
+        end
+        return restored unless restored == true
+      end
+
+      renamed = rename_entry_noreplace(
+        directory,
+        quarantine_name,
+        original_name,
+        allow_nonatomic: allow_nonatomic,
+        directory: expected[2] == :directory
+      )
+      return child_restore_conflict unless renamed && child_matches_snapshot?(directory, original_name, expected)
+
+      true
+    end
+
+    def match_child_quarantine_names(
+      directory,
+      quarantined_names,
+      expected_children,
+      expected_entries,
+      prefix,
+      plain_names
+    )
+      used = {}
+      quarantined_names.map do |quarantine_name|
+        identity, type = pinned_child_type_and_identity(directory, quarantine_name)
+        match = expected_children.find do |name|
+          next if used[name] || plain_names.include?(name)
+
+          expected = expected_entries.fetch(source_tree_relative(prefix, name).to_s)
+          type && identity == expected.first(2) && type == expected[2]
+        end
+        return nil unless match
+
+        used[match] = true
+        [ quarantine_name, match ]
+      end
+    end
+
+    def child_matches_snapshot?(parent, basename, expected)
+      identity, type = pinned_child_type_and_identity(parent, basename)
+      type == expected[2] && identity == expected.first(2)
+    end
+
+    def child_restore_conflict
+      RemoteResult::Failed.new(Errno::EEXIST.new("source child quarantine could not be restored"))
+    end
+
+    def source_tree_quarantine_basename(device, inode)
+      ".shelfarr-remove-#{device.to_s(16)}-#{inode.to_s(16)}"
+    end
+
+    def owned_source_tree_quarantine(parent, expected_identity)
+      basename = source_tree_quarantine_basename(expected_identity[0], expected_identity[1])
+      identity = begin
+        pinned_child_identity(parent, basename, directory: true)
+      rescue Errno::ENOENT, Errno::ELOOP, UnsafePathError
+        :missing
+      end
+      return basename if identity == expected_identity
+
+      nil
+    end
+
+    # Inodes can be reused after a directory is fully removed. A quarantine is
+    # still ours only when a remaining entry has both its snapshotted name (or
+    # an in-progress child quarantine) and that entry's inode.
+    def source_tree_shares_snapshot_identity?(directory, expected_entries, prefix = nil)
+      expected_children = source_tree_child_names(expected_entries, prefix)
+      pinned_directory_children(directory).any? do |name|
+        snapshot_entry_still_present?(directory, name, expected_children, expected_entries, prefix)
+      end
+    end
+
+    def snapshot_entry_still_present?(directory, name, expected_children, expected_entries, prefix)
+      quarantine_name = SOURCE_TREE_CHILD_QUARANTINE_PATTERN.match?(name)
+      return false unless expected_children.include?(name) || quarantine_name
+
+      descriptor = native_openat(
+        directory.fileno,
+        name,
+        File::RDONLY | File::NOFOLLOW | File::NONBLOCK,
+        0
+      )
+      child = IO.new(descriptor, "rb", autoclose: true)
+      begin
+        identity = file_identity(child.stat)
+        candidates = if quarantine_name
+          expected_children
+        else
+          [ name ]
+        end
+        candidates.any? do |child_name|
+          expected = expected_entries.fetch(source_tree_relative(prefix, child_name).to_s)
+          expected.first(2) == identity
+        end
+      ensure
+        child.close unless child.closed?
+      end
+    end
+
+    def quarantined_tree_resume_safe?(directory, expected_entries, prefix = nil)
+      steps = classify_source_tree_resume(directory, expected_entries, prefix)
+      return false unless steps
+
+      steps.all? do |expected_name, current_name|
+        source_tree_resume_entry_matches?(
+          directory,
+          current_name || expected_name,
+          expected_entries,
+          prefix,
+          expected_name
+        )
+      end
+    end
+
+    def classify_source_tree_resume(directory, expected_entries, prefix = nil)
+      children = pinned_directory_children(directory)
+      expected_children = source_tree_child_names(expected_entries, prefix)
+      quarantined_names, plain_names = children.partition do |name|
+        SOURCE_TREE_CHILD_QUARANTINE_PATTERN.match?(name)
+      end
+      return nil if (plain_names - expected_children).any?
+
+      used = {}
+      claimed = []
+      quarantined_names.each do |quarantine_name|
+        identity, type = pinned_child_type_and_identity(directory, quarantine_name)
+        match = expected_children.find do |name|
+          next if plain_names.include?(name) || used[name]
+
+          expected = expected_entries.fetch(source_tree_relative(prefix, name).to_s)
+          type && expected.first(2) == identity && expected[2] == type
+        end
+        return nil unless match
+
+        used[match] = true
+        claimed << [ match, quarantine_name ]
+      end
+
+      present = expected_children.filter_map do |name|
+        [ name, nil ] if plain_names.include?(name)
+      end
+      present + claimed
+    end
+
+    def source_tree_resume_entry_matches?(directory, current_name, expected_entries, prefix, expected_name)
+      relative = source_tree_relative(prefix, expected_name)
+      expected = expected_entries.fetch(relative.to_s)
+      descriptor = native_openat(
+        directory.fileno,
+        current_name,
+        File::RDONLY | File::NOFOLLOW | File::NONBLOCK,
+        0
+      )
+      child = IO.new(descriptor, "rb", autoclose: true)
+      begin
+        stat = child.stat
+        if expected[2] == :directory
+          return false unless stat.directory? && file_identity(stat) == expected.first(2)
+
+          quarantined_tree_resume_safe?(child, expected_entries, relative)
+        else
+          current = file_manifest_entry(stat)
+          return false unless stat.file? && current.first(5) == expected.first(5)
+
+          digest = file_manifest_digest(expected)
+          digest.nil? || pinned_content_matches?(child, digest, expected.fetch(3))
+        end
+      ensure
+        child.close unless child.closed?
+      end
+    end
+
+    def pinned_child_type_and_identity(parent, basename)
+      descriptor = native_openat(
+        parent.fileno,
+        basename,
+        File::RDONLY | File::NOFOLLOW | File::NONBLOCK,
+        0
+      )
+      child = IO.new(descriptor, "rb", autoclose: true)
+      begin
+        stat = child.stat
+        type = if stat.directory?
+          :directory
+        elsif stat.file?
+          :file
+        end
+        [ file_identity(stat), type ]
+      ensure
+        child.close unless child.closed?
+      end
+    end
+
+    def source_tree_child_names(expected_entries, prefix)
+      base = prefix || Pathname(".")
+      expected_entries.keys.filter_map do |relative|
+        path = Pathname(relative)
+        next unless path.dirname == base
+
+        path.basename.to_s
+      end.sort
+    end
+
+    def source_tree_relative(prefix, name)
+      prefix ? prefix.join(name) : Pathname(name)
+    end
+
     def pinned_directory_children(directory, max_entries: nil)
       duplicate = directory.dup
       listing = Dir.for_fd(duplicate.fileno)
@@ -4001,11 +4934,9 @@ class FileCopyService
 
     def utf8_directory_entry(entry)
       # Dir.for_fd has no path or encoding argument, so Ruby returns raw
-      # filename bytes as ASCII-8BIT. Shelfarr paths and metadata are UTF-8;
-      # retag valid bytes without transcoding or changing syscall identity.
-      name = entry.dup.force_encoding(Encoding::UTF_8)
-      return name if name.valid_encoding?
-
+      # filename bytes as ASCII-8BIT.
+      FilenameBytes.utf8(entry)
+    rescue EncodingError
       raise UnsafePathError, "source tree contains a filename that is not valid UTF-8"
     end
 
@@ -4133,8 +5064,8 @@ class FileCopyService
         options = "#{mount.fetch(5)},#{mount.fetch(6)}".split(",")
         !options.include?("serverino")
       end
-    rescue ArgumentError, Encoding::CompatibilityError, IOError, SystemCallError
-      true
+    rescue ArgumentError, Encoding::CompatibilityError, IOError, SystemCallError => error
+      RemoteResult::Failed.new(error)
     end
 
     def drvfs_mount?(*filesystem_entries)
@@ -4217,6 +5148,16 @@ class FileCopyService
       "#{mount.fetch(5)},#{mount.fetch(6)}".split(",").any? do |option|
         option.match?(/\Aaname=drvfs(?:;|\z)/)
       end
+    end
+
+    # O_NOFOLLOW reports a symlink as ELOOP. That entry replaced the source
+    # directory; do not open its target.
+    def source_tree_directory_identity(parent, basename)
+      pinned_child_identity(parent, basename, directory: true)
+    rescue Errno::ENOENT
+      :missing
+    rescue Errno::ELOOP, Errno::ENOTDIR, UnsafePathError
+      :replaced
     end
 
     def pinned_child_identity(parent, basename, directory: false)
@@ -4472,6 +5413,10 @@ class FileCopyService
       raise Errno::ESTALE, "destination directory changed during publication"
     end
 
+    def removal_precondition_met?(before_remove)
+      before_remove.nil? || RemoteResult.succeeded?(before_remove.call)
+    end
+
     def remove_pinned_child_if_identity(
       parent,
       basename,
@@ -4528,7 +5473,7 @@ class FileCopyService
               if digest && !pinned_content_matches?(child, digest, expected_size)
                 restore_quarantined_child!(quarantine, parent, basename)
                 :mismatch
-              elsif before_remove && !before_remove.call
+              elsif !removal_precondition_met?(before_remove)
                 restore_quarantined_child!(quarantine, parent, basename)
                 :mismatch
               else
@@ -4697,7 +5642,7 @@ class FileCopyService
           end
           next unless matches
 
-          if before_remove && !before_remove.call
+          unless removal_precondition_met?(before_remove)
             restore_quarantined_child!(quarantine, parent, original_basename)
             remove_empty_cleanup_quarantine!(
               parent,

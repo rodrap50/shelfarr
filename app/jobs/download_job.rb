@@ -12,6 +12,7 @@ class DownloadJob < ApplicationJob
   # handling can classify them as transient without message matching.
   class DirectDownloadError < StandardError; end
   class BookAcquisitionConflictError < StandardError; end
+  PRESERVED_LIBRARY_FILE_MESSAGE = "This title already has a library file; the existing file was preserved"
 
   queue_as :default
 
@@ -28,7 +29,6 @@ class DownloadJob < ApplicationJob
   MAX_AUDIOBOOK_COMPANION_PROBE_DURATION = 1.minute
   MIN_AUDIOBOOK_FILE_BYTES = 1.kilobyte
   DIRECT_DOWNLOAD_HEARTBEAT_INTERVAL = 30.seconds
-  DIRECT_EBOOK_EXTENSIONS = %w[epub pdf mobi azw3].freeze
   DIRECT_AUDIOBOOK_ARCHIVE_EXTENSIONS = %w[zip].freeze
   DIRECT_AUDIOBOOK_FILE_EXTENSIONS = AudiobookBundleImportPlanner::KNOWN_AUDIO_EXTENSIONS
   DIRECT_AUDIOBOOK_PROBE_FORMATS = %w[aa aiff asf caf mov wav].freeze
@@ -41,6 +41,17 @@ class DownloadJob < ApplicationJob
   # Extensions that are also ordinary words ("Live at the Opus") and need
   # format-style context (".opus", "[opus]", "(opus)") in a title to count.
   AMBIGUOUS_AUDIOBOOK_EXTENSIONS = %w[opus].freeze
+  # Gutenberg paths use these tokens ahead of a qualifier: 1342.epub3.images,
+  # 2.kf8.images, 2.kindle.images.
+  EBOOK_PATH_EXTENSIONS = {
+    "azw3" => "azw3",
+    "epub" => "epub",
+    "epub3" => "epub",
+    "kf8" => "mobi",
+    "kindle" => "mobi",
+    "mobi" => "mobi",
+    "pdf" => "pdf"
+  }.freeze
 
   def perform(download_id)
     download = Download.find_by(id: download_id)
@@ -106,6 +117,20 @@ class DownloadJob < ApplicationJob
         track_request_event(download.request, "dispatch_failed", download: download, message: e.message, level: :error)
         download.update!(status: :failed)
         download.request.mark_for_attention_after_idle_failure!("Failed to connect to download client: #{e.message}")
+      end
+    rescue DownloadClients::Base::ConfigurationError => e
+      with_current_dispatch(download) do
+        Rails.logger.error "[DownloadJob] Download client configuration error: #{e.message}"
+        track_request_event(
+          download.request,
+          "dispatch_failed",
+          download: download,
+          message: e.message,
+          level: :error,
+          details: { configuration_error: true }
+        )
+        download.update!(status: :failed, configuration_failure: true)
+        download.request.mark_for_attention_after_idle_failure!(e.message)
       end
     rescue DownloadClients::Base::Error => e
       with_current_dispatch(download) do
@@ -177,7 +202,9 @@ class DownloadJob < ApplicationJob
     library_configuration_error = direct_library_configuration_error?(error)
     message = direct_library_failure_message if library_configuration_error
     message ||= "Direct download failed: #{error.message}"
-    if error.is_a?(BookAcquisitionConflictError) ||
+    if preserved_existing_library_file?(error)
+      download.request.mark_for_attention_after_idle_failure!(message)
+    elsif error.is_a?(BookAcquisitionConflictError) ||
         error.is_a?(DirectDownloadFileService::ConflictError) ||
         library_configuration_error ||
         transient_direct_download_error?(error)
@@ -185,6 +212,10 @@ class DownloadJob < ApplicationJob
     else
       download.request.handle_download_failure!(download, reason: message)
     end
+  end
+
+  def preserved_existing_library_file?(error)
+    error.is_a?(BookAcquisitionConflictError) && error.message == PRESERVED_LIBRARY_FILE_MESSAGE
   end
 
   def direct_library_configuration_error?(error)
@@ -362,7 +393,7 @@ class DownloadJob < ApplicationJob
     )
 
     Rails.logger.info "[DownloadJob] Downloading #{source_name} audiobook to: #{destination_dir}"
-    ensure_book_available_for_direct_download!(book)
+    ensure_book_available_for_direct_download!(book, download)
     mark_direct_download_active!(download)
     ensure_output_root!(base_path)
     file_service = DirectDownloadFileService.new(
@@ -444,11 +475,11 @@ class DownloadJob < ApplicationJob
       request: download.request,
       search_result: search_result
     )
-    filename = infer_audiobook_filename_from_url(download_url, search_result, extension)
+    filename = direct_library_filename(book, extension, request: download.request, search_result: search_result)
     destination_path = File.join(destination_dir, filename)
 
     Rails.logger.info "[DownloadJob] Downloading #{source_name} audiobook file to: #{destination_path}"
-    ensure_book_available_for_direct_download!(book)
+    ensure_book_available_for_direct_download!(book, download)
     mark_direct_download_active!(download)
     ensure_output_root!(base_path)
     # Flat output shares destination_dir across books; track the file itself.
@@ -516,11 +547,12 @@ class DownloadJob < ApplicationJob
       search_result: search_result
     )
 
-    filename = infer_filename_from_url(download_url, search_result)
+    extension = infer_extension(download_url, search_result)
+    filename = direct_library_filename(book, extension, request: download.request, search_result: search_result)
     destination_path = File.join(destination_dir, filename)
 
     Rails.logger.info "[DownloadJob] Downloading directly to: #{destination_path}"
-    ensure_book_available_for_direct_download!(book)
+    ensure_book_available_for_direct_download!(book, download)
     mark_direct_download_active!(download)
     ensure_output_root!(base_path)
     # Flat output shares destination_dir across books; track the file itself.
@@ -535,19 +567,18 @@ class DownloadJob < ApplicationJob
     )
     working_dir = file_service.create_staging!
 
-    expected_extension = infer_extension(download_url, search_result)
     staged = FileCopyService.create_private_file(
       working_dir,
       root: base_path,
       prefix: "ebook-",
-      suffix: ".#{expected_extension}"
+      suffix: ".#{extension}"
     )
     begin
       staged_file = staged.io
       staged_file.binmode
       download_file_via_http(search_result, download_url, staged_file, download: download)
       verify_anna_archive_digest!(staged_file, expected_md5) if expected_md5
-      verify_downloaded_ebook!(staged_file, expected_extension: expected_extension)
+      verify_downloaded_ebook!(staged_file, expected_extension: extension)
 
       refresh_direct_download_heartbeat!(download)
       finalized = file_service.publish_file_and_finalize!(staged_file)
@@ -573,27 +604,21 @@ class DownloadJob < ApplicationJob
     end
   end
 
-  def infer_filename_from_url(url, search_result)
-    uri = URI.parse(url)
-    filename_from_url = File.basename(uri.path)
-
-    # URL-decode the filename (converts %20 to space, %3A to colon, etc.)
-    filename_from_url = URI.decode_www_form_component(filename_from_url) if filename_from_url.present?
-
-    # If URL has a valid filename, use it after normalizing source-specific suffixes.
-    inferred_extension = infer_extension(url, search_result)
-    normalized_filename = normalize_url_filename(filename_from_url, inferred_extension)
-    return normalized_filename if normalized_filename.present?
-
-    # Fall back to constructing from search result
-    book = search_result.request.book
-    title = book.title.presence || "Unknown"
-    author = book.author.presence || "Unknown"
-
-    sanitize_filename("#{author} - #{title}.#{inferred_extension}")
+  # Source URLs rarely include series or series number. Publish with the
+  # same filename template post-processing uses for client downloads.
+  def direct_library_filename(book, extension, request:, search_result:)
+    PathTemplateService.build_filename(
+      book,
+      extension,
+      request: request,
+      search_result: search_result
+    )
   end
 
   def infer_extension(url, search_result)
+    extension = ebook_extension_from_url(url)
+    return extension if extension.is_a?(String)
+
     normalized_url = url.to_s.downcase
 
     return "epub" if normalized_url.include?("epub")
@@ -612,6 +637,20 @@ class DownloadJob < ApplicationJob
     "epub"
   end
 
+  def ebook_extension_from_url(url)
+    uri = URI.parse(normalize_direct_download_url(url))
+    path = uri.path.to_s
+    path = URI.decode_www_form_component(path) unless /%(?!\h\h)/.match?(path)
+    File.basename(path).downcase.split(".")[1..]&.reverse_each do |segment|
+      extension = EBOOK_PATH_EXTENSIONS[segment]
+      return extension if extension
+    end
+
+    nil
+  rescue URI::InvalidURIError => error
+    RemoteResult::Failed.new(error)
+  end
+
   def infer_audiobook_extension(url, search_result)
     extension = extension_from_url(url, DIRECT_AUDIOBOOK_EXTENSIONS)
     return extension if extension.present?
@@ -626,17 +665,6 @@ class DownloadJob < ApplicationJob
     return title.match?(/[\[\(.]#{escaped}[\]\)]?(\b|\z)/) if AMBIGUOUS_AUDIOBOOK_EXTENSIONS.include?(extension)
 
     title.match?(/\b#{escaped}\b/)
-  end
-
-  def infer_audiobook_filename_from_url(url, search_result, extension)
-    filename_from_url = filename_from_url(url)
-    return sanitize_filename(filename_from_url) if filename_from_url.present? &&
-      File.extname(filename_from_url).delete(".").downcase == extension
-
-    book = search_result.request.book
-    title = book.title.presence || "Unknown"
-    author = book.author.presence || "Unknown"
-    sanitize_filename("#{author} - #{title}.#{extension}")
   end
 
   def direct_audiobook_archive_destination(book, base_path, request: nil, search_result: nil)
@@ -672,43 +700,6 @@ class DownloadJob < ApplicationJob
     File.extname(URI.parse(url.to_s).path).casecmp?(".torrent")
   rescue URI::InvalidURIError => error
     RemoteResult::Failed.new(error)
-  end
-
-  def filename_from_url(url)
-    uri = URI.parse(normalize_direct_download_url(url))
-    filename = File.basename(uri.path)
-    URI.decode_www_form_component(filename) if filename.present?
-  rescue URI::InvalidURIError => error
-    RemoteResult::Failed.new(error)
-  end
-
-  def normalize_url_filename(filename, inferred_extension)
-    return nil if filename.blank?
-
-    current_extension = File.extname(filename).delete(".").downcase
-    return sanitize_filename(filename) if DIRECT_EBOOK_EXTENSIONS.include?(current_extension)
-    return nil unless filename.include?(".") && DIRECT_EBOOK_EXTENSIONS.include?(inferred_extension)
-    return nil unless url_filename_extension_hint?(filename, inferred_extension)
-
-    base = File.basename(filename, ".*")
-    base = base.sub(/\.epub3\z/i, "") if inferred_extension == "epub"
-    base = base.sub(/\.kf8\z/i, "") if inferred_extension == "mobi"
-    base = base.sub(/\.kindle\z/i, "") if inferred_extension == "mobi"
-    base = base.sub(/\.#{Regexp.escape(inferred_extension)}\z/i, "")
-    return nil if base.blank?
-
-    sanitize_filename("#{base}.#{inferred_extension}")
-  end
-
-  def url_filename_extension_hint?(filename, inferred_extension)
-    normalized = filename.to_s.downcase
-    extension = Regexp.escape(inferred_extension)
-
-    return true if normalized.match?(/\.#{extension}(\.|\z)/)
-    return true if inferred_extension == "epub" && normalized.match?(/\.epub3(\.|\z)/)
-    return true if inferred_extension == "mobi" && normalized.match?(/\.(kf8|kindle)(\.|\z)/)
-
-    false
   end
 
   def sanitize_filename(name)
@@ -1101,10 +1092,16 @@ class DownloadJob < ApplicationJob
       size = file.stat.size
       return false unless size.between?(1, MAX_AUDIOBOOK_TEXT_BYTES)
 
-      content = file.read(size).to_s.force_encoding(Encoding::UTF_8)
-      content.valid_encoding? && !content.include?("\0") && !content.match?(/[^\t\n\r[:print:]]/)
+      content = FilenameBytes.utf8(file.read(size).to_s)
+      !content.include?("\0") && !content.match?(/[^\t\n\r[:print:]]/)
     end
-  rescue EOFError, Errno::ENOENT, Errno::EACCES => error
+  rescue EOFError, Errno::ENOENT, Errno::EACCES, EncodingError => error
+    rejected_audiobook_text(error)
+  end
+
+  def rejected_audiobook_text(error)
+    return false if error.is_a?(EncodingError)
+
     RemoteResult::Failed.new(error)
   end
 
@@ -1308,7 +1305,7 @@ class DownloadJob < ApplicationJob
     file.rewind
   end
 
-  def ensure_book_available_for_direct_download!(book)
+  def ensure_book_available_for_direct_download!(book, download = nil)
     book.reload
 
     if book.acquisition_reserved? && !book.acquired?
@@ -1316,10 +1313,17 @@ class DownloadJob < ApplicationJob
       book.reload
     end
 
+    if book.acquired? && download&.replace_library_file?
+      return unless book.acquisition_reserved?
+
+      raise BookAcquisitionConflictError,
+        "Another acquisition still owns this title; no library file was replaced"
+    end
+
     return unless book.acquisition_blocked?
 
     message = if book.acquired?
-      "This title already has a library file; the existing file was preserved"
+      PRESERVED_LIBRARY_FILE_MESSAGE
     elsif book.acquisition_reservation_owner_type == "Download"
       "A previous direct download still owns this title while its recovery state is being verified"
     else
@@ -1493,12 +1497,25 @@ class DownloadJob < ApplicationJob
 
   def finalize_standard_dispatch!(download, search_result, client, client_record, external_id, download_type:)
     finalized = false
+    duplicate_rejected = false
 
     begin
       finalized = download.request.with_lock do
         next false unless current_standard_dispatch?(download, search_result)
 
-        check_for_duplicate_external_id(external_id, download.id)
+        existing = check_for_duplicate_external_id(
+          external_id,
+          download.id,
+          download_client_id: client_record.id
+        )
+        if existing
+          # Import can release this owner before ensure runs. Deleting the id
+          # then would remove the original torrent and its library data.
+          duplicate_rejected = true
+          reject_duplicate_external_id!(download, client_record, external_id, existing, download_type:)
+          next false
+        end
+
         download.update!(
           download_client: client_record,
           external_id: external_id,
@@ -1520,7 +1537,13 @@ class DownloadJob < ApplicationJob
     rescue ActiveRecord::RecordNotFound
       finalized = false
     ensure
-      remove_stale_client_dispatch(client, client_record, external_id, download.id) unless finalized
+      unless finalized || duplicate_rejected || other_download_with_external_id(
+        external_id,
+        download.id,
+        download_client_id: client_record.id
+      )
+        remove_stale_client_dispatch(client, client_record, external_id, download.id)
+      end
     end
 
     Rails.logger.info "[DownloadJob] Successfully added #{download_type} for download ##{download.id}, external_id: #{external_id}" if finalized
@@ -1603,20 +1626,47 @@ class DownloadJob < ApplicationJob
     Rails.logger.error "[DownloadJob] Failed to enqueue stale dispatch cleanup for download ##{download_id}: #{e.class}"
   end
 
-  def check_for_duplicate_external_id(external_id, current_download_id)
-    return if external_id.blank?
+  def check_for_duplicate_external_id(external_id, current_download_id, download_client_id:)
+    existing = other_download_with_external_id(
+      external_id,
+      current_download_id,
+      download_client_id: download_client_id
+    )
+    return if existing.blank?
 
-    existing = Download.where(external_id: external_id)
-                       .where.not(id: current_download_id)
-                       .where.not(status: :failed)
-                       .first
+    Rails.logger.error "[DownloadJob] DUPLICATE EXTERNAL_ID DETECTED! " \
+                       "Download ##{current_download_id} was not assigned external_id #{external_id} " \
+                       "because Download ##{existing.id} (request ##{existing.request_id}) already has it."
+    existing
+  end
 
-    if existing
-      Rails.logger.error "[DownloadJob] DUPLICATE EXTERNAL_ID DETECTED! " \
-                         "Download ##{current_download_id} is being assigned external_id #{external_id}, " \
-                         "but Download ##{existing.id} (request ##{existing.request_id}) already has this ID. " \
-                         "This indicates a potential race condition that should be investigated."
-    end
+  # Client handles such as NZBGet ids are only unique on that client.
+  # A finished import, cancellation, or replacement records the release on the
+  # download. Request status can change later and must not revive that id.
+  def other_download_with_external_id(external_id, current_download_id, download_client_id:)
+    Download.current_external_id_owner(
+      external_id,
+      download_client_id: download_client_id,
+      except_id: current_download_id
+    )
+  end
+
+  def reject_duplicate_external_id!(download, client_record, external_id, existing, download_type:)
+    track_request_event(
+      download.request,
+      "dispatch_failed",
+      download: download,
+      message: "External ID already belongs to another download",
+      level: :error,
+      details: {
+        client_name: client_record.name,
+        download_type: download_type,
+        external_id: external_id,
+        existing_download_id: existing.id
+      }
+    )
+    download.update!(status: :failed)
+    download.request.handle_download_failure!(download, reason: "External ID already belongs to another download")
   end
 
   def build_usenet_job_name(search_result)

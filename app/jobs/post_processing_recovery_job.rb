@@ -6,6 +6,7 @@
 #   could enqueue post-processing.
 # * PostProcessingJob claimed the Download (or published only part of an
 #   idempotent import) and its worker was killed before atomic finalization.
+# * A stored replacement cleanup finishes after the new file is attached.
 #
 # The Download owner is transferred before enqueue. If that enqueue itself is
 # interrupted, a later pass can transfer the stale owner again. Solid Queue is
@@ -39,7 +40,26 @@ class PostProcessingRecoveryJob < ApplicationJob
       Rails.logger.warn(
         "[PostProcessingRecoveryJob] Could not inspect jobs for download ##{download_id}: #{error.class}"
       )
-      true
+      RemoteResult::Failed.new(error)
+    end
+
+    # An unfinished Solid Queue row is the proof a PostProcessingJob has not
+    # returned. The library copy itself does not update the Download row.
+    # No such row means the owner is a finished import or a legacy id.
+    # A failed queue read is not proof, so every owner stays live.
+    def unfinished_active_job_ids(active_job_ids)
+      ids = Array(active_job_ids).filter_map { |id| id.to_s.presence }.uniq
+      return [] if ids.empty?
+
+      SolidQueue::Job
+        .where(class_name: PostProcessingJob.name, finished_at: nil, active_job_id: ids)
+        .where.missing(:failed_execution)
+        .pluck(:active_job_id)
+    rescue StandardError => error
+      Rails.logger.warn(
+        "[PostProcessingRecoveryJob] Could not prove import owners finished: #{error.class}"
+      )
+      ids
     end
 
     private
@@ -53,6 +73,7 @@ class PostProcessingRecoveryJob < ApplicationJob
   def perform
     cleanup_downloads.each { |download| recover_source_cleanup(download) }
     stale_downloads.each { |download| recover(download) }
+    LibraryReplacement.finish_pending_cleanups!
   end
 
   private
@@ -77,8 +98,27 @@ class PostProcessingRecoveryJob < ApplicationJob
   end
 
   def recover_source_cleanup(download)
-    cleanup_state = download.post_processing_cleanup_state
+    # The initial job holds this lock across source deletion.
+    PostProcessingJob.with_post_processing_lock(download.id) do
+      current = Download.find_by(id: download.id)
+      cleanup_state = current&.post_processing_cleanup_state
+      next if cleanup_state.blank?
+
+      recover_locked_source_cleanup(current, cleanup_state)
+    end
+  end
+
+  def recover_locked_source_cleanup(download, cleanup_state)
     payload = JSON.parse(cleanup_state)
+    if payload["imported_file_snapshots"]
+      recover_partial_directory_cleanup(download, payload, cleanup_state)
+      return
+    end
+    if payload["source_root"]
+      recover_directory_source_cleanup(download, payload, cleanup_state)
+      return
+    end
+
     source_snapshot = FileCopyService.deserialize_file_snapshot(payload.fetch("source"))
     destination_snapshot = FileCopyService.deserialize_file_snapshot(payload.fetch("destination"))
     removed = FileCopyService.remove_source_file(
@@ -99,15 +139,96 @@ class PostProcessingRecoveryJob < ApplicationJob
       end
     end
 
-    Download.where(
-      id: download.id,
-      post_processing_cleanup_state: cleanup_state
-    ).update_all(post_processing_cleanup_state: nil, updated_at: Time.current)
+    Download.clear_post_processing_cleanup!(download.id, cleanup_state)
   rescue StandardError => error
     Rails.logger.error(
       "[PostProcessingRecoveryJob] Source cleanup recovery failed for download ##{download.id}: #{error.class}"
     )
     Download.where(id: download.id).update_all(updated_at: Time.current)
+  end
+
+  # Recovery has to finish the stored tree deletion before the client id is released.
+  # A retained result is terminal only once no owned quarantine is still hidden.
+  # A cleanup failure is terminal only when the snapshotted parent directory is gone.
+  def recover_directory_source_cleanup(download, payload, cleanup_state)
+    removed = PostProcessingJob.remove_persisted_directory_source(payload)
+    if directory_cleanup_pending?(removed, payload)
+      if removed == false
+        Rails.logger.warn(
+          "[PostProcessingRecoveryJob] Source directory remains quarantined for download ##{download.id}; cleanup will retry"
+        )
+      end
+      Download.where(id: download.id, post_processing_cleanup_state: cleanup_state)
+        .update_all(updated_at: Time.current)
+      return
+    end
+
+    Download.clear_post_processing_cleanup!(download.id, cleanup_state)
+  end
+
+  def directory_cleanup_pending?(removed, payload)
+    return false if removed == true
+    return directory_quarantine_unresolved?(payload) if removed == false
+    return false if source_parent_confirmed_absent?(payload)
+
+    true
+  end
+
+  def source_parent_confirmed_absent?(payload)
+    source_root = FileCopyService.deserialize_source_root(payload.fetch("source_root"))
+    FileCopyService.source_parent_missing?(source_root) == true
+  end
+
+  def directory_quarantine_unresolved?(payload)
+    pending = PostProcessingJob.directory_source_quarantine_pending?(payload)
+    return false if pending == false
+    # ENOENT only means the quarantine is gone when that filesystem is mounted.
+    return false if RemoteResult.failed?(pending) &&
+      pending.error.is_a?(Errno::ENOENT) &&
+      source_parent_confirmed_absent?(payload)
+
+    true
+  end
+
+  def recover_partial_directory_cleanup(download, payload, cleanup_state)
+    removed = PostProcessingJob.remove_persisted_directory_source(payload)
+    if removed == :retry || RemoteResult.failed?(removed)
+      defer_cleanup_retry(download, cleanup_state)
+      return
+    end
+    unless removed == true
+      if PostProcessingJob.source_quarantine_unresolved?(PostProcessingJob.saved_cleanup_source_snapshots(payload))
+        Rails.logger.warn(
+          "[PostProcessingRecoveryJob] Partial source cleanup left a quarantined file for download ##{download.id}; the journal was kept"
+        )
+        defer_cleanup_retry(download, cleanup_state)
+        return
+      end
+
+      Rails.logger.warn(
+        "[PostProcessingRecoveryJob] Partial source cleanup was no longer safe for download ##{download.id}; it was retained"
+      )
+      clear_cleanup_state(download, cleanup_state)
+      return
+    end
+
+    if payload["client_cleanup"]
+      outcome = PostProcessingJob.resume_persisted_client_cleanup(download, payload["client_cleanup"])
+      unless PostProcessingJob.usenet_cleanup_confirmed?(outcome)
+        defer_cleanup_retry(download, cleanup_state)
+        return
+      end
+    end
+    clear_cleanup_state(download, cleanup_state)
+  end
+
+  def defer_cleanup_retry(download, cleanup_state)
+    Download.where(id: download.id, post_processing_cleanup_state: cleanup_state)
+      .update_all(updated_at: Time.current)
+  end
+
+  def clear_cleanup_state(download, cleanup_state)
+    Download.clear_post_processing_cleanup!(download.id, cleanup_state)
   end
 
   def recover(download)

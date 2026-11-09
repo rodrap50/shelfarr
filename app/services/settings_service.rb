@@ -50,9 +50,27 @@ class SettingsService
     PREFERRED_EAPI_HOSTS.map { |host| "https://#{host}" } + LEGACY_ZLIBRARY_URLS
   ).join("\n")
   ENV_OVERRIDE_PREFIX = "SHELFARR_SETTING_"
+  FILE_SIZE_LIMIT_KEYS = %i[
+    ebook_min_file_size ebook_max_file_size
+    audiobook_min_file_size audiobook_max_file_size
+  ].freeze
+  FILE_SIZE_LIMIT_PAIRS = [
+    %i[ebook_min_file_size ebook_max_file_size],
+    %i[audiobook_min_file_size audiobook_max_file_size]
+  ].freeze
+  FILE_SIZE_UNITS = {
+    "B" => 1,
+    "KB" => 1024,
+    "MB" => 1024 * 1024,
+    "GB" => 1024 * 1024 * 1024
+  }.freeze
+  FILE_SIZE_PATTERN = /\A(\d+(?:\.\d+)?)(?:\s*(KB|MB|GB|B))?\z/i
 
   DOWNLOAD_TYPES = %w[torrent usenet direct].freeze
   COMPLETED_DOWNLOAD_IMPORT_MODES = %w[copy move hardlink reference].freeze
+  LIBRARY_IMPORT_PERMISSION_KEYS = %i[library_import_file_mode library_import_folder_mode].freeze
+  LIBRARY_IMPORT_MODE_FORMAT = /\A[0-7]{3,4}\z/
+  LIBRARY_IMPORT_FOLDER_OWNER_BITS = 0o700
   LIBRARY_PLATFORMS = %w[audiobookshelf bookorbit grimmory].freeze
   INDEXER_SEARCH_SCOPES = %w[broad strict unrestricted custom].freeze
   INDEXER_SEARCH_SCOPE_OPTIONS = {
@@ -79,6 +97,13 @@ class SettingsService
     comicbook: [ 7030 ],
     all_books: [ 3030, 7020, 7000, 7030 ]
   }.freeze
+  DEFAULT_REQUEST_FORMATS = %w[ask audiobook ebook both].freeze
+  DEFAULT_REQUEST_FORMAT_OPTIONS = [
+    [ "Ask each time", "ask" ],
+    [ "Audiobook", "audiobook" ],
+    [ "Ebook", "ebook" ],
+    [ "Both", "both" ]
+  ].freeze
   DOWNLOAD_TYPE_OPTIONS = {
     "torrent" => {
       label: "Torrent",
@@ -115,6 +140,8 @@ class SettingsService
     download_enqueue_timeout_minutes: { type: "integer", default: 5, category: "download", description: "Minutes a download may stay queued in Shelfarr before being flagged as never dispatched to the download client" },
     post_processing_source_path_retries: { type: "integer", default: 10, category: "download", description: "Number of post-processing retries while waiting for completed download files to appear" },
     completed_download_import_mode: { type: "string", default: "copy", category: "download", description: "Choose Copy, Move, Hardlink, or Reference. Hardlink requires one container-visible filesystem; unsupported or cross-filesystem links fall back to copy. Reference creates a library symlink to the download path (for debrid/rclone mounts) and never copies bytes." },
+    library_import_file_mode: { type: "string", default: "", category: "download", description: "Optional octal mode for files Shelfarr copies or moves into the library, for example 0664. The mode must include owner read permission so Shelfarr can verify and serve the file. Leave blank to leave file permissions unchanged. Hardlinked imports are skipped because they share the download file's inode, so chmod would change that download too; any library file with more than one link is skipped for the same reason. Unsupported hardlinks that fall back to a copy still use this mode. Reference symlinks are left unchanged. A chmod failure, such as on NFS or SMB, is logged and does not fail the import." },
+    library_import_folder_mode: { type: "string", default: "", category: "download", description: "Optional octal mode for folders under the library root that contain an import, for example 0775. The mode must include owner read, write, and execute. It is applied after the import is published, not while directories are created. Leave blank to leave folder permissions unchanged. The configured library root is never changed. A chmod failure, such as on NFS or SMB, is logged and does not fail the import." },
     split_audiobook_bundle_imports: { type: "boolean", default: false, category: "download", description: "Split releases containing multiple self-contained M4B/AAX books into per-book folders. MP3, FLAC, and other chapter-based releases stay together." },
     remove_completed_usenet_downloads: { type: "boolean", default: true, category: "download", description: "Remove usenet downloads from client after successful import" },
     precreate_download_archives: { type: "boolean", default: false, category: "download", description: "Pre-create cached ZIP archives for eligible non-reference directory imports after library scan and completion notification so the first download is instant. When disabled, cached archives are created lazily in tmp/downloads. Reference-mode directory downloads cannot be cached and create a one-shot ZIP in the container's OS temp directory instead. Keep both locations disk-backed before downloading large books; tmpfs can OOM-kill the worker." },
@@ -152,12 +179,13 @@ class SettingsService
       default: false,
       category: "paths",
       env_overridable: true,
-      description: "Allow directory imports and source cleanup on NFS filesystems that reject atomic no-replace renames. Enable only when Shelfarr is the sole writer: a concurrently created empty destination or quarantine name could otherwise be replaced."
+      description: "Allow directory imports, source cleanup, and library deletion on NFS filesystems that reject atomic no-replace renames. Enable only when Shelfarr is the sole writer: a concurrently created empty destination or quarantine name could otherwise be replaced."
     },
 
     setup_wizard_completed: { type: "boolean", default: false, category: "setup", description: "The first-run setup wizard has been finished or skipped" },
     immediate_search_enabled: { type: "boolean", default: true, category: "queue", description: "Start searching immediately when a request is created (instead of waiting for queue cycle)" },
     auto_approve_requests: { type: "boolean", default: false, category: "queue", description: "Automatically enqueue search immediately for requests created by non-admin users" },
+    default_request_format: { type: "string", default: "ask", category: "queue", description: "Format pre-selected on the request form. Ask leaves the choice to the requester. Both selects the ebook and the audiobook." },
     queue_batch_size: { type: "integer", default: 5, category: "queue", description: "Number of requests to process per queue run" },
     rate_limit_delay: { type: "integer", default: 2, category: "queue", description: "Seconds between API calls" },
     max_retries: { type: "integer", default: 10, category: "queue", description: "Maximum retry attempts before flagging for attention" },
@@ -185,11 +213,15 @@ class SettingsService
     ebook_approved_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated ebook formats that may be auto-selected (leave blank to allow any detected format)" },
     ebook_rejected_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated ebook formats that should never be auto-selected" },
     ebook_preferred_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated ebook formats in preference order, from best to worst" },
+    ebook_min_file_size: { type: "string", default: "", category: "format_preferences", description: "Optional minimum ebook size. Leave blank to keep scoring unchanged. A number alone is megabytes; KB, MB, and GB also work. A smaller release is scored down and kept for manual review. Releases with no reported size are unchanged." },
+    ebook_max_file_size: { type: "string", default: "", category: "format_preferences", description: "Optional maximum ebook size. Leave blank to keep scoring unchanged. A number alone is megabytes; KB, MB, and GB also work. A larger release is scored down and kept for manual review. Releases with no reported size are unchanged." },
     audiobook_approved_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated audiobook formats that may be auto-selected (leave blank to allow any detected format)" },
     audiobook_rejected_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated audiobook formats that should never be auto-selected" },
     audiobook_preferred_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated audiobook formats in preference order, from best to worst" },
     audiobook_prefer_single_file: { type: "boolean", default: false, category: "format_preferences", description: "Prefer single-file audiobook releases (for example .m4b) over chapter-split releases when detected" },
     audiobook_prefer_higher_bitrate: { type: "boolean", default: false, category: "format_preferences", description: "Prefer higher bitrate audiobook releases when the bitrate can be inferred from the title" },
+    audiobook_min_file_size: { type: "string", default: "", category: "format_preferences", description: "Optional minimum audiobook size. Leave blank to keep scoring unchanged. A number alone is megabytes; KB, MB, and GB also work. A smaller release is scored down and kept for manual review. Releases with no reported size are unchanged." },
+    audiobook_max_file_size: { type: "string", default: "", category: "format_preferences", description: "Optional maximum audiobook size. Leave blank to keep scoring unchanged. A number alone is megabytes; KB, MB, and GB also work. A larger release is scored down and kept for manual review. Releases with no reported size are unchanged." },
 
     default_language: { type: "string", default: "en", category: "language", description: "Default language for new requests" },
     enabled_languages: { type: "json", default: '["en"]', category: "language", description: "Languages available for selection when creating requests" },
@@ -320,6 +352,13 @@ class SettingsService
     ebooks_com_country_code: "Buyer Country Code",
     ebooks_com_search_limit: "Offer Limit",
     allow_nonatomic_nfs_directory_publication: "Allow Non-Atomic NFS Directory Publication",
+    auto_select_confidence_threshold: "Auto-Select Confidence Threshold",
+    ebook_min_file_size: "Minimum Ebook Size",
+    ebook_max_file_size: "Maximum Ebook Size",
+    audiobook_min_file_size: "Minimum Audiobook Size",
+    audiobook_max_file_size: "Maximum Audiobook Size",
+    library_import_file_mode: "Library Import File Mode",
+    library_import_folder_mode: "Library Import Folder Mode",
     precreate_download_archives: "Pre-create Download Archives",
     audiobookshelf_audiobook_library_id: "Audiobook Library",
     audiobookshelf_ebook_library_id: "Ebook Library",
@@ -407,6 +446,12 @@ class SettingsService
       if key == :completed_download_import_mode
         return COMPLETED_DOWNLOAD_IMPORT_MODES.include?(value) ? value : "copy"
       end
+      return normalize_library_import_mode(key, value) if LIBRARY_IMPORT_PERMISSION_KEYS.include?(key)
+
+      if key == :default_request_format
+        normalized = value.to_s
+        return DEFAULT_REQUEST_FORMATS.include?(normalized) ? normalized : "ask"
+      end
 
       return [ value.to_i, MIN_HEALTH_CHECK_INTERVAL ].max if key == :health_check_interval && !value.nil?
       return value unless value.nil?
@@ -428,11 +473,35 @@ class SettingsService
         end
       end
 
+      value = library_import_mode_for_write!(key, value) if LIBRARY_IMPORT_PERMISSION_KEYS.include?(key)
+
+      if key == :default_request_format
+        value = value.to_s
+        unless DEFAULT_REQUEST_FORMATS.include?(value)
+          raise ArgumentError, "#{label_for(key)} must be one of: #{DEFAULT_REQUEST_FORMATS.join(', ')}"
+        end
+      end
+
       if key == :health_check_interval
         value = Integer(value, exception: false)
         if value.nil? || value < MIN_HEALTH_CHECK_INTERVAL
           raise ArgumentError,
             "#{label_for(key)} must be at least #{MIN_HEALTH_CHECK_INTERVAL} seconds"
+        end
+      end
+
+      if key == :auto_select_confidence_threshold
+        # Integer() without a radix reads a leading zero as octal.
+        value = Integer(value.to_s, 10, exception: false)
+        unless value&.between?(0, 100)
+          raise ArgumentError, "#{label_for(key)} must be an integer from 0 to 100"
+        end
+      end
+
+      if file_size_limit_key?(key)
+        value = canonical_file_size_setting(value)
+        if value.present? && parse_file_size_bytes(value).nil?
+          raise ArgumentError, "#{label_for(key)} must be a file size such as 200 KB, 50 MB, or 1.5 GB. A number alone means megabytes."
         end
       end
 
@@ -698,6 +767,18 @@ class SettingsService
       get(:auto_approve_requests, default: false)
     end
 
+    def default_request_formats
+      format = get(:default_request_format)
+      case format
+      when "audiobook", "ebook"
+        [ format ]
+      when "both"
+        %w[audiobook ebook]
+      else
+        []
+      end
+    end
+
     def preferred_download_types
       stored_preferred_types = Setting.find_by(key: "preferred_download_types")&.typed_value
       ordered_types = normalize_download_types(stored_preferred_types)
@@ -722,6 +803,44 @@ class SettingsService
         INDEXER_SEARCH_SCOPE_OPTIONS.fetch(scope)
           .merge(value: scope)
       end
+    end
+
+    def file_size_limit_key?(key)
+      FILE_SIZE_LIMIT_KEYS.include?(key.to_sym)
+    end
+
+    def canonical_file_size_setting(value)
+      text = value.to_s.strip.gsub(/\s+/, " ")
+      return "" if text.blank?
+
+      match = text.match(FILE_SIZE_PATTERN)
+      return text unless match
+      return text unless match[1].to_f.positive?
+
+      "#{match[1]} #{(match[2] || "MB").upcase}"
+    end
+
+    def parse_file_size_bytes(value)
+      match = value.to_s.strip.match(FILE_SIZE_PATTERN)
+      return nil unless match
+
+      amount = match[1].to_f
+      unit = (match[2] || "MB").upcase
+      bytes = amount * FILE_SIZE_UNITS.fetch(unit)
+      return nil unless bytes.finite?
+
+      bytes = bytes.round
+      bytes.positive? ? bytes : nil
+    end
+
+    def file_size_limits_for(book_type)
+      type = book_type.to_s
+      return { min_bytes: nil, max_bytes: nil } unless %w[ebook audiobook].include?(type)
+
+      {
+        min_bytes: parse_file_size_bytes(get("#{type}_min_file_size")),
+        max_bytes: parse_file_size_bytes(get("#{type}_max_file_size"))
+      }
     end
 
     def format_preferences_for(book_type)
@@ -833,6 +952,39 @@ class SettingsService
         normalized = value.to_s.strip.downcase
         normalized.presence
       end.uniq
+    end
+
+    public
+
+    def library_import_mode_acceptable?(key, value)
+      text = value.to_s.strip
+      return false unless text.match?(LIBRARY_IMPORT_MODE_FORMAT)
+      required = key.to_sym == :library_import_folder_mode ? LIBRARY_IMPORT_FOLDER_OWNER_BITS : 0o400
+      (Integer(text, 8) & required) == required
+    end
+
+    def library_import_mode_requirement(key)
+      if key.to_sym == :library_import_folder_mode
+        "must be a 3 or 4 digit octal mode that includes owner read, write, and execute (for example 0775), or blank"
+      else
+        "must be a 3 or 4 digit octal mode that includes owner read (for example 0664), or blank"
+      end
+    end
+
+    private
+
+    def normalize_library_import_mode(key, value)
+      text = value.to_s.strip
+      return "" if text.empty?
+
+      library_import_mode_acceptable?(key, text) ? text : ""
+    end
+
+    def library_import_mode_for_write!(key, value)
+      text = value.to_s.strip
+      return text if text.empty? || library_import_mode_acceptable?(key, text)
+
+      raise ArgumentError, "#{label_for(key)} #{library_import_mode_requirement(key)}"
     end
 
     def default_format_preferences

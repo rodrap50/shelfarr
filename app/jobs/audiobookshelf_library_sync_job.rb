@@ -5,12 +5,13 @@ class AudiobookshelfLibrarySyncJob < ApplicationJob
     KEYS = %w[
       AudiobookshelfLibrarySyncJob/audiobookshelf-library-sync
       HardcoverSyncSchedulerJob/hardcover-sync-scheduler
+      DownloadMonitorJob/download_monitor
     ].freeze
 
     module ExcludeClaimed
       def expired
         relation = super
-        keys = AudiobookshelfLibrarySyncJob::ConcurrencyLease.claimed_keys
+        keys = AudiobookshelfLibrarySyncJob::ConcurrencyLease.protected_keys
         keys.empty? ? relation : relation.where.not(key: keys)
       end
     end
@@ -23,11 +24,18 @@ class AudiobookshelfLibrarySyncJob < ApplicationJob
         @installed = true
       end
 
-      def claimed_keys
-        SolidQueue::ClaimedExecution.joins(:job)
-          .where(solid_queue_jobs: { concurrency_key: KEYS })
+      # Solid Queue stamps the semaphore expiry when it dispatches a job to
+      # ready, and claiming that job does not refresh the lease. Keep the
+      # semaphore until the ready or claimed execution is gone.
+      def protected_keys
+        SolidQueue::Job
+          .where(concurrency_key: KEYS, finished_at: nil)
+          .left_outer_joins(:ready_execution, :claimed_execution)
+          .where(
+            "solid_queue_ready_executions.id IS NOT NULL OR solid_queue_claimed_executions.id IS NOT NULL"
+          )
           .distinct
-          .pluck("solid_queue_jobs.concurrency_key")
+          .pluck(:concurrency_key)
       end
     end
   end
@@ -82,12 +90,38 @@ class AudiobookshelfLibrarySyncJob < ApplicationJob
         first_arg["scheduled"] != true &&
         first_arg["post_scan"] != true
     end
+
+    def post_scan_refresh_pending?
+      return false unless solid_queue_adapter?
+
+      SolidQueue::Job
+        .where(class_name: name, finished_at: nil)
+        .where.missing(:recurring_execution, :claimed_execution, :failed_execution)
+        .any? { |job| ready_or_scheduled_post_scan?(job) }
+    rescue ActiveRecord::ActiveRecordError, NameError => error
+      RemoteResult::Failed.new(error)
+    end
+
+    def ready_or_scheduled_post_scan?(job)
+      status = job.status
+      status = status.to_sym if status.respond_to?(:to_sym)
+      return false unless %i[ready scheduled].include?(status)
+
+      arguments = job.arguments.is_a?(Hash) ? Array(job.arguments["arguments"]) : []
+      keywords = arguments.find { |argument| argument.is_a?(Hash) } || {}
+      keywords["post_scan"] == true
+    end
+
+    def solid_queue_adapter?
+      ActiveJob::Base.queue_adapter.class.name == "ActiveJob::QueueAdapters::SolidQueueAdapter"
+    end
   end
 
   # Extra one-shot metadata accepts both the pre-migration schedule_next flag
   # and the explicit post_scan marker without letting either establish a new
   # recurring chain.
   def perform(scheduled: false, **_one_shot_metadata)
+    release_unconfigured_integration_connections!
     return unless LibraryPlatformClient.configured?
     return if scheduled && !sync_due?
 
@@ -96,9 +130,12 @@ class AudiobookshelfLibrarySyncJob < ApplicationJob
   end
 
   # Coalesce bulk imports: only one delayed full-inventory sync is scheduled
-  # per wait window, no matter how many files call this method.
+  # per wait window, no matter how many files call this method. A refresh that
+  # is already waiting keeps its deadline when a later import arrives after the
+  # cache reservation expires.
   def self.schedule_post_scan_refresh!
     return unless LibraryPlatformClient.configured?
+    return if post_scan_refresh_pending? == true
 
     claimed = Rails.cache.write(
       POST_SCAN_REFRESH_CACHE_KEY,
@@ -108,7 +145,12 @@ class AudiobookshelfLibrarySyncJob < ApplicationJob
     )
     return unless claimed
 
-    set(wait: POST_SCAN_REFRESH_WAIT).perform_later(post_scan: true)
+    SingleChain.enqueue(
+      self,
+      wait: POST_SCAN_REFRESH_WAIT,
+      scope: { post_scan: true },
+      post_scan: true
+    )
   end
 
   private
@@ -128,5 +170,13 @@ class AudiobookshelfLibrarySyncJob < ApplicationJob
 
   def record_scheduled_attempt!
     Rails.cache.write(LAST_SCHEDULED_ATTEMPT_AT_CACHE_KEY, Time.current)
+  end
+
+  def release_unconfigured_integration_connections!
+    LibraryPlatformClient.release_unconfigured_connections!
+    IndexerClient.release_unconfigured_connections!
+    FlaresolverrClient.release_unconfigured_connection!
+    GutenbergClient.release_unconfigured_connection!
+    LibrivoxClient.release_unconfigured_connection!
   end
 end

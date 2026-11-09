@@ -22,6 +22,7 @@ class SettingsServiceTest < ActiveSupport::TestCase
       oidc_link_existing_users oidc_auto_create_users oidc_default_role
       webhook_enabled webhook_url webhook_token webhook_events webhook_topic
       health_check_interval
+      default_request_format
     ]).delete_all
   end
 
@@ -190,6 +191,97 @@ class SettingsServiceTest < ActiveSupport::TestCase
 
     assert_equal "Completed Download Import Mode must be one of: copy, move, hardlink, reference", error.message
     assert_equal "move", SettingsService.get(:completed_download_import_mode)
+  end
+
+  test "library import modes default to blank and accept octal strings" do
+    assert_equal "", SettingsService.get(:library_import_file_mode)
+    assert_equal "", SettingsService.get(:library_import_folder_mode)
+
+    assert_equal "0664", SettingsService.set(:library_import_file_mode, " 0664 ")
+    assert_equal "775", SettingsService.set(:library_import_folder_mode, "775")
+    assert_equal "0664", Setting.find_by!(key: "library_import_file_mode").value
+    assert_equal "775", SettingsService.get(:library_import_folder_mode)
+
+    [ "668", "0o664", "999", "06640", "abc", "8" ].each do |invalid|
+      error = assert_raises(ArgumentError) do
+        SettingsService.set(:library_import_file_mode, invalid)
+      end
+      assert_match(/3 or 4 digit octal mode/, error.message)
+    end
+    assert_equal "", SettingsService.set(:library_import_folder_mode, "  ")
+    assert_equal "0664", SettingsService.get(:library_import_file_mode)
+    assert_equal "", SettingsService.get(:library_import_folder_mode)
+  end
+
+  test "file import modes must keep owner read permission" do
+    [ "0000", "0220", "200" ].each do |mode|
+      error = assert_raises(ArgumentError) do
+        SettingsService.set(:library_import_file_mode, mode)
+      end
+      assert_match(/owner read/, error.message)
+    end
+    assert_equal "0440", SettingsService.set(:library_import_file_mode, "0440")
+  end
+
+  test "corrupt library import modes are ignored" do
+    Setting.create!(
+      key: "library_import_file_mode",
+      value: "999",
+      value_type: "string",
+      category: "download"
+    )
+
+    assert_equal "", SettingsService.get(:library_import_file_mode)
+  end
+
+  test "folder import modes must keep owner read write and execute" do
+    assert_equal "0775", SettingsService.set(:library_import_folder_mode, "0775")
+    assert_equal "700", SettingsService.set(:library_import_folder_mode, "700")
+    assert_equal "2755", SettingsService.set(:library_import_folder_mode, "2755")
+    assert_equal "0664", SettingsService.set(:library_import_file_mode, "0664")
+
+    [ "0664", "664", "640", "600" ].each do |mode|
+      error = assert_raises(ArgumentError) do
+        SettingsService.set(:library_import_folder_mode, mode)
+      end
+      assert_match(/owner read, write, and execute/, error.message)
+    end
+    assert_equal "2755", SettingsService.get(:library_import_folder_mode)
+    assert_equal "0664", SettingsService.get(:library_import_file_mode)
+
+    Setting.find_by!(key: "library_import_folder_mode").update!(value: "0664")
+    assert_equal "", SettingsService.get(:library_import_folder_mode)
+  end
+
+  test "default request format asks each time until an admin chooses one" do
+    assert_equal "ask", SettingsService.get(:default_request_format)
+    assert_equal [], SettingsService.default_request_formats
+
+    {
+      "audiobook" => [ "audiobook" ],
+      "ebook" => [ "ebook" ],
+      "both" => %w[audiobook ebook],
+      "ask" => []
+    }.each do |choice, formats|
+      assert_equal choice, SettingsService.set(:default_request_format, choice)
+      assert_equal formats, SettingsService.default_request_formats
+    end
+  end
+
+  test "default request format rejects an unknown choice and ignores a corrupt saved value" do
+    SettingsService.set(:default_request_format, "ebook")
+
+    error = assert_raises(ArgumentError) do
+      SettingsService.set(:default_request_format, "everything")
+    end
+
+    assert_equal "Default Request Format must be one of: ask, audiobook, ebook, both", error.message
+    assert_equal "ebook", SettingsService.get(:default_request_format)
+
+    Setting.find_by!(key: "default_request_format").update!(value: "everything")
+
+    assert_equal "ask", SettingsService.get(:default_request_format)
+    assert_equal [], SettingsService.default_request_formats
   end
 
   test "completed download import mode safely resolves corrupt persisted values to copy" do
@@ -582,5 +674,45 @@ class SettingsServiceTest < ActiveSupport::TestCase
       assert_includes SettingsService.unrecognized_env_override_names, "SHELFARR_SETTING_oidc_enabled"
       assert_not SettingsService.env_managed?(:oidc_enabled)
     end
+  end
+
+  test "auto-select confidence threshold defaults to 90 and stays inside 0 to 100" do
+    Setting.where(key: "auto_select_confidence_threshold").delete_all
+
+    assert_equal 90, SettingsService::DEFINITIONS[:auto_select_confidence_threshold][:default]
+    assert_equal 90, SettingsService.get(:auto_select_confidence_threshold)
+
+    SettingsService.set(:auto_select_confidence_threshold, "70")
+    assert_equal 70, SettingsService.get(:auto_select_confidence_threshold)
+
+    error = assert_raises(ArgumentError) { SettingsService.set(:auto_select_confidence_threshold, 101) }
+    assert_match "0 to 100", error.message
+    assert_equal 70, SettingsService.get(:auto_select_confidence_threshold)
+
+    SettingsService.set(:auto_select_confidence_threshold, "075")
+    assert_equal 75, SettingsService.get(:auto_select_confidence_threshold)
+  end
+
+  test "file size limits are blank by default and parse optional units" do
+    assert_equal "", SettingsService.get(:ebook_min_file_size)
+    assert_equal "", SettingsService.get(:ebook_max_file_size)
+    assert_equal "", SettingsService.get(:audiobook_min_file_size)
+    assert_equal "", SettingsService.get(:audiobook_max_file_size)
+    assert_nil SettingsService.parse_file_size_bytes("")
+    assert_nil SettingsService.parse_file_size_bytes(nil)
+    assert_nil SettingsService.parse_file_size_bytes("0 MB")
+    assert_nil SettingsService.parse_file_size_bytes("lots")
+    assert_equal 200.kilobytes, SettingsService.parse_file_size_bytes("200 KB")
+    assert_equal 50.megabytes, SettingsService.parse_file_size_bytes("50")
+    assert_equal (1.5.gigabytes).round, SettingsService.parse_file_size_bytes("1.5 GB")
+
+    SettingsService.set(:audiobook_max_file_size, "2gb")
+    assert_equal "2 GB", SettingsService.get(:audiobook_max_file_size)
+    assert_equal({ min_bytes: nil, max_bytes: 2.gigabytes }, SettingsService.file_size_limits_for(:audiobook))
+    assert_equal({ min_bytes: nil, max_bytes: nil }, SettingsService.file_size_limits_for(:ebook))
+    assert_equal({ min_bytes: nil, max_bytes: nil }, SettingsService.file_size_limits_for(:comicbook))
+
+    assert_raises(ArgumentError) { SettingsService.set(:ebook_min_file_size, "lots") }
+    assert_equal "", SettingsService.get(:ebook_min_file_size)
   end
 end

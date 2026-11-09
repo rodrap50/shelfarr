@@ -200,7 +200,7 @@ class DirectoryRoutingFullFlowTest < ActionDispatch::IntegrationTest
       url:         "http://localhost:9999"
     )
     adapter = Minitest::Mock.new
-    adapter.expect(:add_torrent, torrent_hash, [String])
+    adapter.expect(:add_torrent, torrent_hash, [String, Hash])
     [client, adapter]
   end
 

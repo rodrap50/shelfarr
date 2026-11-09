@@ -3,6 +3,39 @@
 require "test_helper"
 
 class BookMatcherServiceTest < ActiveSupport::TestCase
+  test "matches Roman-looking prose regardless of title capitalization" do
+    [ "Il Libro di Famiglia", "Livre dix histoires", "Libro mi vida", "Book Mix" ].each do |title|
+      score = BookMatcherService.send(
+        :calculate_match_score,
+        query_title: title.upcase, book_title: title,
+        query_author: "An Author", book_author: "An Author"
+      )
+      assert_equal 100, score, title
+    end
+  end
+
+  test "does not bind different Roman volumes above one hundred" do
+    Book.create!(title: "One Piece Volume CI", author: "Eiichiro Oda", book_type: :ebook)
+
+    result = BookMatcherService.match(
+      title: "One Piece Volume CII", author: "Eiichiro Oda", book_type: :ebook
+    )
+
+    assert result.no_match?
+    assert_nil result.book
+  end
+
+  test "matches high Roman volumes with their translated Arabic markers" do
+    book = Book.create!(title: "One Piece Volume CI", author: "Eiichiro Oda", book_type: :ebook)
+
+    result = BookMatcherService.match(
+      title: "One Piece Tome 101", author: "Eiichiro Oda", book_type: :ebook
+    )
+
+    assert result.exact?
+    assert_equal book, result.book
+  end
+
   setup do
     @audiobook = Book.create!(
       title: "The Final Empire",
@@ -352,5 +385,234 @@ class BookMatcherServiceTest < ActiveSupport::TestCase
 
     assert result.exact?
     assert_equal existing_book, result.book
+  end
+
+  test "matches the same volume when the marker word is in another language" do
+    existing_book = Book.create!(
+      title: "The Witcher Part 2",
+      author: "Andrzej Sapkowski",
+      book_type: :ebook
+    )
+    baseline = BookMatcherService.match(
+      title: "The Witcher Part 2",
+      author: "Andrzej Sapkowski",
+      book_type: :ebook
+    )
+
+    assert baseline.exact?
+    [
+      "The Witcher Tome 2",
+      "The Witcher Partie 2",
+      "The Witcher Livre 2",
+      "The Witcher T2",
+      "The Witcher T.2",
+      "The Witcher T02",
+      "The Witcher Band 2",
+      "The Witcher Teil 2",
+      "The Witcher Buch 2",
+      "The Witcher Tomo 2",
+      "The Witcher Parte 2",
+      "The Witcher Libro 2",
+      "The Witcher Livro 2",
+      "The Witcher Volumen 2",
+      "The Witcher Deel 2",
+      "The Witcher Boek 2",
+      "The Witcher Tome II",
+      "The Witcher Part. 2",
+      "The Witcher Volume 2",
+      "The Witcher Book 2"
+    ].each do |title|
+      result = BookMatcherService.match(
+        title: title,
+        author: "Andrzej Sapkowski",
+        book_type: :ebook
+      )
+
+      assert_equal baseline.score, result.score, title
+      assert result.exact?, title
+      assert_equal existing_book, result.book, title
+    end
+  end
+
+  test "matches a split volume when both numbers agree across marker languages" do
+    existing_book = Book.create!(
+      title: "Chronicles of the Northern Sea Tome 3 Partie 1",
+      author: "Ada Lovelace",
+      book_type: :ebook
+    )
+
+    result = BookMatcherService.match(
+      title: "Chronicles of the Northern Sea Book 3 Part 1",
+      author: "Ada Lovelace",
+      book_type: :ebook
+    )
+
+    assert result.exact?, "got #{result.match_type} with score #{result.score}"
+    assert_equal existing_book, result.book
+  end
+
+  test "does not match a different volume number when the marker language changes" do
+    Book.create!(
+      title: "The Illustrated Chronicles of the Northern Sea and Its Many Islands Book 2",
+      author: "Ada Lovelace",
+      book_type: :ebook
+    )
+
+    result = BookMatcherService.match(
+      title: "The Illustrated Chronicles of the Northern Sea and Its Many Islands Tome 3",
+      author: "Ada Lovelace",
+      book_type: :ebook
+    )
+
+    assert result.no_match?, "got #{result.match_type} with score #{result.score}"
+    assert_nil result.book
+  end
+
+  test "does not match a different volume when the upload also names a part" do
+    existing_book = Book.create!(
+      title: "The Stormlight Archive Book 2",
+      author: "Brandon Sanderson",
+      book_type: :ebook
+    )
+
+    conflict = BookMatcherService.match(
+      title: "The Stormlight Archive Book 3 Part 1",
+      author: "Brandon Sanderson",
+      book_type: :ebook
+    )
+    same_volume = BookMatcherService.match(
+      title: "The Stormlight Archive Book 2 Part 1",
+      author: "Brandon Sanderson",
+      book_type: :ebook
+    )
+
+    assert conflict.no_match?, "got #{conflict.match_type} with score #{conflict.score}"
+    assert_nil conflict.book
+    assert_equal existing_book, same_volume.book
+    assert_not same_volume.no_match?
+  end
+
+  test "matches a hashed volume marker to the spelled volume" do
+    existing_book = Book.create!(
+      title: "Bleach Volume 2",
+      author: "Tite Kubo",
+      book_type: :ebook
+    )
+
+    result = BookMatcherService.match(
+      title: "Bleach Vol. #2",
+      author: "Tite Kubo",
+      book_type: :ebook
+    )
+
+    assert result.exact?, "got #{result.match_type} with score #{result.score}"
+    assert_equal existing_book, result.book
+  end
+
+  test "does not read a marker prefix inside an ordinary word" do
+    existing_book = Book.create!(
+      title: "Buchi neri",
+      author: "Carlo Rovelli",
+      book_type: :ebook
+    )
+
+    result = BookMatcherService.match(
+      title: "Buchi neri",
+      author: "Carlo Rovelli",
+      book_type: :ebook
+    )
+
+    assert result.exact?, "got #{result.match_type} with score #{result.score}"
+    assert_equal existing_book, result.book
+  end
+
+  test "matches a hyphenated part marker to the spaced part" do
+    existing_book = Book.create!(
+      title: "Dune Part 2",
+      author: "Frank Herbert",
+      book_type: :ebook
+    )
+
+    result = BookMatcherService.match(
+      title: "Dune Part-2",
+      author: "Frank Herbert",
+      book_type: :ebook
+    )
+
+    assert result.exact?, "got #{result.match_type} with score #{result.score}"
+    assert_equal existing_book, result.book
+  end
+
+  test "does not match pocket splits that share a tome and differ by part" do
+    Book.create!(
+      title: "Chronicles of the Northern Sea Tome 3 Partie 1",
+      author: "Ada Lovelace",
+      book_type: :ebook
+    )
+
+    result = BookMatcherService.match(
+      title: "Chronicles of the Northern Sea Tome 3 Partie 2",
+      author: "Ada Lovelace",
+      book_type: :ebook
+    )
+
+    assert result.no_match?, "got #{result.match_type} with score #{result.score}"
+    assert_nil result.book
+  end
+
+  test "matches dotted author initials without reading them as a volume" do
+    existing_book = Book.create!(
+      title: "The Red Book C. G. Jung",
+      author: "Carl Gustav Jung",
+      book_type: :ebook
+    )
+
+    result = BookMatcherService.match(
+      title: "The Red Book C.G. Jung",
+      author: "Carl Gustav Jung",
+      book_type: :ebook
+    )
+
+    assert result.fuzzy?, "got #{result.match_type} with score #{result.score}"
+    assert_equal existing_book, result.book
+  end
+
+  test "does not treat an unnumbered marker word as a volume" do
+    brothers = Book.create!(
+      title: "Band of Brothers",
+      author: "Stephen E. Ambrose",
+      book_type: :ebook
+    )
+    parte = Book.create!(
+      title: "La parte oscura del libro",
+      author: "Mariana Enriquez",
+      book_type: :ebook
+    )
+
+    brothers_match = BookMatcherService.match(
+      title: "Band of Brothers",
+      author: "Stephen E. Ambrose",
+      book_type: :ebook
+    )
+    parte_match = BookMatcherService.match(
+      title: "La parte oscura del libro",
+      author: "Mariana Enriquez",
+      book_type: :ebook
+    )
+
+    assert brothers_match.exact?
+    assert_equal brothers, brothers_match.book
+    assert parte_match.exact?
+    assert_equal parte, parte_match.book
+    assert BookMatcherService.match(
+      title: "Tome 2",
+      author: "Stephen E. Ambrose",
+      book_type: :ebook
+    ).no_match?
+    assert BookMatcherService.match(
+      title: "Libro 2",
+      author: "Mariana Enriquez",
+      book_type: :ebook
+    ).no_match?
   end
 end

@@ -7,22 +7,37 @@ class DownloadMonitorJob < ApplicationJob
   DIRECT_DOWNLOAD_STALE_TIMEOUT = 30.minutes
 
   queue_as :default
+  AudiobookshelfLibrarySyncJob::ConcurrencyLease.install!
   limits_concurrency key: CONCURRENCY_KEY, duration: 30.minutes
 
   class << self
     def ensure_running!
+      discard_legacy_pending_monitors!
+
       return unless monitoring_required?
-      return if monitor_job_pending?
 
-      interval = poll_interval_seconds
-      unless solid_queue_adapter?
-        next_run_at = Rails.cache.read(SCHEDULE_CACHE_KEY).to_i
-        return if next_run_at > Time.current.to_i
+      # config/recurring.yml is the clock. Enqueueing here starts a second chain.
+      monitor_job_pending?
+    end
+
+    # Argument-less successors persisted before the recurring clock survive a
+    # deploy and run with scheduled: false, which skips the interval gate.
+    def discard_legacy_pending_monitors!
+      return 0 unless solid_queue_adapter?
+
+      discarded = 0
+      legacy_pending_monitors.find_each do |job|
+        next unless legacy_monitor_arguments?(job.arguments)
+        next unless job.status.in?([ :ready, :scheduled ])
+
+        job.discard
+        discarded += 1
+      rescue SolidQueue::Execution::UndiscardableError, ActiveRecord::RecordNotFound
+        next
       end
-
-      reserve_schedule!(interval)
-      Rails.logger.info "[DownloadMonitorJob] Scheduling monitor chain"
-      perform_later
+      discarded
+    rescue ActiveRecord::ActiveRecordError, NameError => error
+      RemoteResult::Failed.new(error)
     end
 
     def monitoring_required?
@@ -54,14 +69,6 @@ class DownloadMonitorJob < ApplicationJob
 
     private
 
-    def reserve_schedule!(interval)
-      Rails.cache.write(
-        SCHEDULE_CACHE_KEY,
-        interval.seconds.from_now.to_i,
-        expires_in: schedule_ttl(interval)
-      )
-    end
-
     def poll_interval_seconds
       SettingsService.get(:download_check_interval, default: 60).to_i.clamp(1, 86_400)
     end
@@ -73,16 +80,38 @@ class DownloadMonitorJob < ApplicationJob
     def solid_queue_adapter?
       ActiveJob::Base.queue_adapter.class.name == "ActiveJob::QueueAdapters::SolidQueueAdapter"
     end
+
+    def legacy_pending_monitors
+      SolidQueue::Job
+        .where(class_name: name, finished_at: nil)
+        .where.missing(:recurring_execution, :claimed_execution, :failed_execution)
+    end
+
+    def legacy_monitor_arguments?(payload)
+      return false unless payload.is_a?(Hash)
+
+      arguments = Array(payload["arguments"])
+      arguments.none? { |argument| scheduled_argument?(argument) }
+    end
+
+    def scheduled_argument?(argument)
+      return false unless argument.is_a?(Hash)
+
+      argument["scheduled"] == true || argument[:scheduled] == true
+    end
   end
 
-  def perform
+  def perform(scheduled: false)
     unless self.class.monitoring_required?
       self.class.clear_schedule!
       return
     end
 
+    gated = scheduled || legacy_queue_delivery?
+    return if gated && !scheduled_monitor_due?
+
+    record_scheduled_attempt! if gated
     monitor_active_downloads
-    schedule_next_run
   end
 
   private
@@ -265,16 +294,31 @@ class DownloadMonitorJob < ApplicationJob
     RemoteResult::Failed.new(error)
   end
 
-  def schedule_next_run
-    return if self.class.monitor_job_pending?(excluding_active_job_id: job_id)
+  def legacy_queue_delivery?
+    return false if provider_job_id.blank?
 
+    arguments.none? { |argument| self.class.send(:scheduled_argument?, argument) }
+  end
+
+  def scheduled_monitor_due?
+    interval = self.class.send(:poll_interval_seconds)
+    last_attempt = Rails.cache.read(self.class::SCHEDULE_CACHE_KEY)
+    return last_attempt.to_i <= Time.current.to_i if last_attempt.is_a?(Numeric)
+    return true unless last_attempt.respond_to?(:beginning_of_minute)
+
+    interval = [ interval, 60 ].max
+    interval_minutes = (interval / 1.minute.to_f).ceil
+
+    last_attempt.beginning_of_minute <= interval_minutes.minutes.ago.beginning_of_minute
+  end
+
+  def record_scheduled_attempt!
     interval = self.class.send(:poll_interval_seconds)
     Rails.cache.write(
       self.class::SCHEDULE_CACHE_KEY,
-      interval.seconds.from_now.to_i,
+      Time.current,
       expires_in: self.class.send(:schedule_ttl, interval)
     )
-    DownloadMonitorJob.set(wait: interval.seconds).perform_later
   end
 
   def current_monitored_download?(download)

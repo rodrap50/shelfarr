@@ -3,6 +3,7 @@
 class ReleaseScorer
   COMIC_ISSUE_EXACT_BONUS = 15
   COMIC_ISSUE_UNKNOWN_MAX_SCORE = 49
+  FILE_SIZE_OUT_OF_RANGE_PENALTY = -40
   COMIC_ISSUE_VALUE_PATTERN = '\d+(?:\.\d+)?(?:[a-z]|-[a-z])?'
 
   WEIGHTS = {
@@ -13,7 +14,17 @@ class ReleaseScorer
     health: 5
   }.freeze
 
-  Result = Data.define(:total, :breakdown, :detected_languages, :detected_format) do
+  Result = Data.define(:total, :breakdown, :detected_languages, :detected_format, :total_before_file_size) do
+    def initialize(total:, breakdown:, detected_languages:, detected_format:, total_before_file_size: total)
+      super(
+        total: total,
+        breakdown: breakdown,
+        detected_languages: detected_languages,
+        detected_format: detected_format,
+        total_before_file_size: total_before_file_size
+      )
+    end
+
     def high_confidence?
       total >= 90
     end
@@ -39,10 +50,12 @@ class ReleaseScorer
   def score
     issue_status = @comic_issue_match&.fetch(:status, nil)
     format_score = calculate_format_score
+    size_limit = file_size_limit
     auto_select_allowed = @format_preferences.auto_select_allowed &&
       !explicit_format_conflict? &&
       !ambiguous_title_alias_match? &&
-      (@comic_issue_match.nil? || issue_status == :exact)
+      (@comic_issue_match.nil? || issue_status == :exact) &&
+      size_limit[:allowed]
     breakdown = {
       title: calculate_title_score,
       author: calculate_author_score,
@@ -50,6 +63,8 @@ class ReleaseScorer
       format: format_score,
       health: calculate_health_score,
       preference_adjustment: @format_preferences.score_adjustment,
+      file_size_adjustment: size_limit[:adjustment],
+      file_size_status: size_limit[:status],
       auto_select_allowed: auto_select_allowed,
       extension: @format_preferences.matched_extension,
       extensions: @format_preferences.detected_extensions,
@@ -69,21 +84,52 @@ class ReleaseScorer
       (breakdown[key] * weight) / 100.0
     end.round
 
-    total = (base_total + @format_preferences.score_adjustment + comic_issue_adjustment).clamp(0, 100)
-    total = [ total, COMIC_ISSUE_UNKNOWN_MAX_SCORE ].min if issue_status == :unknown
-    total = 0 if issue_status == :mismatch
+    match_total = base_total + @format_preferences.score_adjustment + comic_issue_adjustment
+    # Size comes off the capped score so a bonus above 100 cannot absorb the penalty.
+    total_before_file_size = bounded_release_total(match_total, issue_status)
+    total = bounded_release_total(total_before_file_size + size_limit[:adjustment], issue_status)
 
     Result.new(
       total: total,
       breakdown: breakdown,
       detected_languages: @parsed[:languages],
-      detected_format: @parsed[:format]
+      detected_format: @parsed[:format],
+      total_before_file_size: total_before_file_size
     )
   end
 
   class << self
     def score(search_result, request)
       new(search_result, request).score
+    end
+
+    def file_size_assessment(size_bytes, book_type)
+      limits = SettingsService.file_size_limits_for(book_type)
+      min_bytes = limits[:min_bytes]
+      max_bytes = limits[:max_bytes]
+      return { adjustment: 0, status: nil, allowed: true } if min_bytes.nil? && max_bytes.nil?
+
+      # Newznab and Jackett report enclosure length 0 when the size is unknown.
+      return { adjustment: 0, status: "unknown", allowed: true } if size_bytes.nil? || size_bytes.to_i <= 0
+
+      size = size_bytes.to_i
+      if min_bytes && size < min_bytes
+        out_of_range_file_size("below_min")
+      elsif max_bytes && size > max_bytes
+        out_of_range_file_size("above_max")
+      else
+        { adjustment: 0, status: "within", allowed: true }
+      end
+    end
+
+    private
+
+    def out_of_range_file_size(status)
+      {
+        adjustment: FILE_SIZE_OUT_OF_RANGE_PENALTY,
+        status: status,
+        allowed: false
+      }
     end
   end
 
@@ -92,10 +138,15 @@ class ReleaseScorer
   def calculate_title_score
     return 100 if @comic_issue_match&.fetch(:status, nil) == :exact
 
-    release_key = TitleKey.new(@search_result.title)
     title_variants = SearchTitleVariantService.call(@book.title)
-    book_titles = title_variants
-      .map { |title| TitleKey.new(title).canonical }
+    # Every marker is rewritten to "volume N", so trigrams cannot tell
+    # volume 2 from volume 3. A mismatched number is a different book.
+    comparable = title_variants.reject { |title| SequenceMarker.conflict?(title, prepared_release_title) }
+    return 0 if comparable.empty?
+
+    release_key = release_title_key
+    book_titles = comparable
+      .map { |title| TitleKey.new(SequenceMarker.neutralize(title)).canonical }
       .reject(&:blank?)
 
     return 0 if release_key.canonical.blank? || book_titles.empty?
@@ -103,7 +154,7 @@ class ReleaseScorer
     # Localized/original title aliases are equivalent only as complete phrases.
     # Very short inferred titles are too collision-prone unless they lead the
     # release name (for example, "It" must not match "The Institute").
-    if title_variants.any? { |title| exact_normalized_title_match?(title) }
+    if comparable.any? { |title| exact_normalized_title_match?(title) }
       100
     else
       book_titles.map { |title| trigram_similarity(release_key.canonical, title) }.max
@@ -119,13 +170,29 @@ class ReleaseScorer
   end
 
   def exact_normalized_title_match?(book_title)
-    book_key = TitleKey.new(book_title)
-    release_key = TitleKey.new(@search_result.title)
+    return false if SequenceMarker.conflict?(book_title, prepared_release_title)
+
+    book_key = TitleKey.new(SequenceMarker.neutralize(book_title))
+    release_key = release_title_key
     book_key.forms.any? do |title|
       release_key.forms.any? do |release_title|
         exact_title_phrase_match?(release_title, title, short_title: book_key.short?)
       end
     end
+  end
+
+  # The author credit is not part of the title, so initials cannot finish a
+  # marker ("The Red Book C. G. Jung").
+  def prepared_release_title
+    @prepared_release_title ||= SequenceMarker.without_author_credit(
+      @search_result.title.to_s,
+      author: @book.author,
+      protected_title: @book.title
+    )
+  end
+
+  def release_title_key
+    @release_title_key ||= TitleKey.new(SequenceMarker.neutralize(prepared_release_title))
   end
 
   def ambiguous_title_alias_match?
@@ -224,6 +291,17 @@ class ReleaseScorer
     @search_result.download_url.present? &&
       @search_result.magnet_url.blank? &&
       @search_result.seeders.nil?
+  end
+
+  def file_size_limit
+    self.class.file_size_assessment(@search_result.size_bytes, @book.book_type)
+  end
+
+  def bounded_release_total(value, issue_status)
+    total = value.clamp(0, 100)
+    total = [ total, COMIC_ISSUE_UNKNOWN_MAX_SCORE ].min if issue_status == :unknown
+    total = 0 if issue_status == :mismatch
+    total
   end
 
   def comic_issue_adjustment

@@ -126,6 +126,56 @@ class LibrivoxClientTest < ActiveSupport::TestCase
     assert_empty LibrivoxClient.search(title: "Not A Real Book")
   end
 
+  # The jobs process never sees the web process's reset_connection!.
+  test "search uses the corrected LibriVox URL without resetting the connection" do
+    SettingsService.set(:librivox_url, "https://old-librivox.example")
+    LibrivoxClient.reset_connection!
+
+    stub_request(:get, "https://old-librivox.example/api/feed/audiobooks/")
+      .with(query: hash_including("title" => "Pride"))
+      .to_return(status: 404, headers: { "Content-Type" => "application/json" }, body: "{}")
+      .times(1)
+
+    assert_empty LibrivoxClient.search(title: "Pride")
+
+    SettingsService.set(:librivox_url, "https://new-librivox.example")
+
+    corrected = stub_request(:get, "https://new-librivox.example/api/feed/audiobooks/")
+      .with(query: hash_including("title" => "Pride"))
+      .to_return(status: 404, headers: { "Content-Type" => "application/json" }, body: "{}")
+
+    results = LibrivoxClient.search(title: "Pride")
+    assert_requested corrected, times: 1
+    assert_empty results
+    assert_not_requested :get, %r{old-librivox\.example/api/feed/audiobooks/}, times: 2
+  end
+
+  # The jobs process never sees the web process's reset_connection!.
+  test "search drops the cached connection after the LibriVox URL is removed" do
+    SettingsService.set(:librivox_url, "https://old-librivox.example")
+    LibrivoxClient.reset_connection!
+
+    stub_request(:get, "https://old-librivox.example/api/feed/audiobooks/")
+      .with(query: hash_including("title" => "Pride"))
+      .to_return(status: 404, headers: { "Content-Type" => "application/json" }, body: "{}")
+
+    assert_empty LibrivoxClient.search(title: "Pride")
+
+    SettingsService.set(:librivox_url, "")
+
+    error = assert_raises LibrivoxClient::NotConfiguredError do
+      LibrivoxClient.search(title: "Pride")
+    end
+    assert_equal "LibriVox is not enabled", error.message
+    assert_raises LibrivoxClient::NotConfiguredError do
+      LibrivoxClient.send(:connection)
+    end
+    assert_requested :get, %r{old-librivox\.example/api/feed/audiobooks/}, times: 1
+    assert_not_requested :get, %r{https://librivox\.org/}
+    assert_nil LibrivoxClient.instance_variable_get(:@connection)
+    assert_nil LibrivoxClient.instance_variable_get(:@connection_settings_key)
+  end
+
   test "configured URL must be an origin" do
     SettingsService.set(:librivox_url, "https://librivox.org/api/feed")
 
