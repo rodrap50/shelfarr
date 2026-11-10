@@ -45,7 +45,7 @@
             "border-yellow-600/30 bg-yellow-950/10 hover:bg-yellow-950/20"
           end %>
 
-          <div class="<%= row_classes.join(' ') %>">
+          <div class="<%= row_classes.join(' ') %>" data-search-result-id="<%= result.id %>">
             <div class="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
               <div class="min-w-0 flex-grow">
                 <p class="text-sm font-medium leading-6 text-white break-words" title="<%= result.title %>"><%= result.title %></p>
@@ -90,6 +90,11 @@
                       Preference <%= result.preference_adjustment.positive? ? '+' : '' %><%= result.preference_adjustment %>
                     </span>
                   <% end %>
+                  <% if result.file_size_adjustment != 0 %>
+                    <span class="text-red-400" title="<%= result.file_size_limit_explanation %>">
+                      <%= result.file_size_adjustment_label %>
+                    </span>
+                  <% end %>
                   <% unless result.auto_select_allowed_by_preferences? %>
                     <span class="inline-flex items-center rounded-full bg-red-500/10 px-2 py-0.5 font-medium text-red-400 ring-1 ring-inset ring-red-500/20">
                       Manual review
@@ -111,9 +116,10 @@
                 <% if result.selected? %>
                   <span class="px-2 py-1 text-xs bg-green-600/20 text-green-400 rounded font-medium">Selected</span>
                 <% elsif result.downloadable? %>
-                  <%= button_to result.blocklisted? ? "Retry Anyway" : (result.rejected? ? "Select Instead" : "Select"), select_admin_request_search_result_path(@request, result),
-                      method: :post,
-                      class: "px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded font-medium transition" %>
+                  <%= render "requests/result_select_button",
+                      request: @request,
+                      result: result,
+                      button_class: "px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded font-medium transition" %>
                 <% elsif result.rejected? %>
                   <span class="px-2 py-1 text-xs bg-gray-700 text-gray-400 rounded">Skipped</span>
                 <% else %>

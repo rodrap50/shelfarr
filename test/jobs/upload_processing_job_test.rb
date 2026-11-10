@@ -20,10 +20,8 @@ class UploadProcessingJobTest < ActiveJob::TestCase
       value_type: "string",
       category: "paths"
     )
-    # Disable Audiobookshelf
     Setting.where(key: "audiobookshelf_url").destroy_all
 
-    # Create test file
     @test_file = File.join(@temp_source, "Brandon Sanderson - Mistborn.m4b")
     File.write(@test_file, "test audio content")
 
@@ -287,8 +285,7 @@ class UploadProcessingJobTest < ActiveJob::TestCase
     assert File.exist?(@test_file), "publication preserves the source until database completion"
     assert_equal "test audio content", File.binread(destination)
 
-    # The stale watchdog performs this single state transition before the
-    # replacement job begins.
+    # The stale watchdog performs this single state transition before the replacement job begins.
     @upload.update!(status: :pending)
     VCR.turned_off do
       stub_open_library_search("Mistborn Brandon Sanderson")
@@ -1516,13 +1513,16 @@ class UploadProcessingJobTest < ActiveJob::TestCase
     assert_equal 90, @upload.match_confidence
   end
 
-  test "fetch_metadata returns nil for blank title and service errors" do
+  test "fetch_metadata returns nil for a blank title and Failed when search errors" do
     job = UploadProcessingJob.new
 
     assert_nil job.send(:fetch_metadata, "", "Author")
 
-    MetadataService.stub(:search, ->(*) { raise MetadataService::Error, "offline" }) do
-      assert_nil job.send(:fetch_metadata, "Title", "Author")
+    error = MetadataService::Error.new("offline")
+    MetadataService.stub(:search, ->(*) { raise error }) do
+      result = job.send(:fetch_metadata, "Title", "Author")
+      assert_instance_of RemoteResult::Failed, result
+      assert_equal error, result.error
     end
   end
 
@@ -1670,8 +1670,6 @@ class UploadProcessingJobTest < ActiveJob::TestCase
         body: { items: [] }.to_json
       )
 
-    # Stub Open Library search to return empty results
-    # This allows tests to focus on file operations and book creation
     stub_request(:get, %r{https://openlibrary\.org/search\.json})
       .to_return(
         status: 200,

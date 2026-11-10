@@ -54,14 +54,17 @@ class BookOrbitClient
       query_page_size = [ page_size.to_i, 200 ].min
       query_page_size = 200 if query_page_size <= 0
       items = fetch_library_items(id, query_page_size)
-      return items if items.size <= query_page_size
+      return items if items.is_a?(RemoteResult::Failed)
+      return RemoteResult::Empty.new if items.empty?
+      return RemoteResult::Ok.new(items) if items.size <= query_page_size
 
       verified_items = fetch_library_items(id, query_page_size)
+      return verified_items if verified_items.is_a?(RemoteResult::Failed)
       if items.pluck("audiobookshelf_id").sort != verified_items.pluck("audiobookshelf_id").sort
         raise Error, "BookOrbit library inventory changed during synchronization"
       end
 
-      verified_items
+      RemoteResult::Ok.new(verified_items)
     end
 
     def delete_item_by_path(_path)
@@ -75,12 +78,16 @@ class BookOrbitClient
     def test_connection
       ensure_configured!
       libraries.any?
-    rescue Error
-      false
+    rescue Error => error
+      RemoteResult::Failed.new(error)
     end
 
     def reset_connection!
       CONNECTION_MUTEX.synchronize { clear_connection_cache! }
+    end
+
+    def release_unconfigured_connection!
+      reset_connection! unless configured?
     end
 
     private
@@ -100,7 +107,9 @@ class BookOrbitClient
           })
         end
         if (response.status == 404 || response.status == 410) && page == 0
-          return []
+          return RemoteResult::Failed.new(
+            Error.new("BookOrbit library #{id} returned status #{response.status}")
+          )
         end
 
         data = handle_response(response, success_statuses: [ 200, 201 ]) { |body| body }
@@ -128,7 +137,10 @@ class BookOrbitClient
     end
 
     def ensure_configured!
-      raise NotConfiguredError, "BookOrbit is not configured" unless configured?
+      return if configured?
+
+      reset_connection!
+      raise NotConfiguredError, "BookOrbit is not configured"
     end
 
     def request
@@ -152,6 +164,11 @@ class BookOrbitClient
 
     def connection
       CONNECTION_MUTEX.synchronize do
+        unless configured?
+          clear_connection_cache!
+          raise NotConfiguredError, "BookOrbit is not configured"
+        end
+
         configuration = current_connection_configuration
         rebuild_connection!(configuration) if @connection.nil? || @connection_configuration != configuration
         @connection

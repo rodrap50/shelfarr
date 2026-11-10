@@ -135,6 +135,58 @@ class RequestCreationServiceTest < ActiveSupport::TestCase
     assert_includes result.errors.join, "already has an active request"
   end
 
+  test "both creates the same ebook and audiobook requests as choosing each format" do
+    result = request_both_formats("OL_BOTH_SERVICE_NEW", title: "Read Along")
+
+    assert result.success?
+    assert_empty result.errors
+    assert_equal %w[audiobook ebook], result.created_requests.map { |request| request.book.book_type }.sort
+    assert_equal [ "Read Along" ], result.created_requests.map { |request| request.book.title }.uniq
+  end
+
+  test "both skips a format already in the library and requests the other" do
+    Book.create!(
+      title: "Owned Ebook",
+      author: "Owner",
+      book_type: :ebook,
+      open_library_work_id: "OL_BOTH_SERVICE_OWNED",
+      file_path: "/ebooks/owned.epub"
+    )
+
+    result = request_both_formats("OL_BOTH_SERVICE_OWNED", title: "Owned Ebook")
+
+    assert_equal [ "audiobook" ], result.created_requests.map { |request| request.book.book_type }
+    assert_includes result.errors.join, "already in your library"
+    assert_not_includes result.errors.join, "audiobook"
+  end
+
+  test "both skips a format that already has an active request" do
+    book = Book.create!(
+      title: "Pending Audiobook",
+      author: "Owner",
+      book_type: :audiobook,
+      open_library_work_id: "OL_BOTH_SERVICE_PENDING"
+    )
+    Request.create!(book: book, user: @user, status: :pending)
+
+    result = request_both_formats("OL_BOTH_SERVICE_PENDING", title: "Pending Audiobook")
+
+    assert_equal [ "ebook" ], result.created_requests.map { |request| request.book.book_type }
+    assert_includes result.errors.join, "already has an active request"
+  end
+
+  test "both does not request book formats for comics and manga" do
+    result = RequestCreationService.call(
+      user: @user,
+      work_id: "comic_vine:4000-both-graphic",
+      book_types: [ "both" ],
+      metadata_attrs: { title: "Graphic Both" }
+    )
+
+    assert_not result.success?
+    assert_equal [ "Audiobook and Ebook cannot be requested for Comics & Manga content" ], result.errors
+  end
+
   test "enqueues search when auto approve applies to non-admin user" do
     SettingsService.set(:auto_approve_requests, true)
 
@@ -423,9 +475,10 @@ class RequestCreationServiceTest < ActiveSupport::TestCase
   end
 
   test "collection request enqueues background expansion instead of expanding inline" do
+    expansion_job = nil
     ComicVineClient.stub(:configured?, true) do
       assert_no_difference [ "Book.count", "Request.count" ] do
-        assert_enqueued_with(job: CollectionRequestExpansionJob) do
+        expansion_job = assert_enqueued_with(job: CollectionRequestExpansionJob) do
           result = RequestCreationService.call(
             user: @user,
             work_id: "comic_vine:4050-99",
@@ -449,7 +502,7 @@ class RequestCreationServiceTest < ActiveSupport::TestCase
       end
     end
 
-    job_args = enqueued_jobs.last[:args].first
+    job_args = expansion_job.arguments.first.with_indifferent_access
     assert_equal [ "comic_vine:4000-101", "comic_vine:4000-102" ], job_args["collection_item_ids"]
     assert_equal "graphic", job_args.dig("metadata_attrs", "content_kind")
   end
@@ -619,5 +672,18 @@ class RequestCreationServiceTest < ActiveSupport::TestCase
     end
 
     assert_not routing_called, "Expected UserLibraryRoutingService.call NOT to be invoked for a fresh request"
+  end
+
+  private
+
+  def request_both_formats(work_id, title:)
+    MetadataService.stub(:book_details, nil) do
+      RequestCreationService.call(
+        user: @user,
+        work_id: work_id,
+        book_types: [ "both" ],
+        metadata_attrs: { title: title, author: "Both Author" }
+      )
+    end
   end
 end

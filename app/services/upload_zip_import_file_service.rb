@@ -62,7 +62,7 @@ class UploadZipImportFileService
       # A missing marker after the ZIP was truncated means an earlier cleanup
       # reached its final, idempotent filesystem step and died before clearing
       # cleanup_source_path in SQLite.
-      unless publication_already_verified || publication_complete?(upload, destination, root)
+      unless publication_already_verified || publication_complete?(upload, destination, root) == true
         return finish_interrupted_cleanup(upload, source, destination)
       end
 
@@ -70,20 +70,22 @@ class UploadZipImportFileService
       remove_verified_manifest!(upload, destination, root, already_verified: true)
       clear_cleanup_source!(upload)
       true
-    rescue Errno::ENOENT
+    rescue Errno::ENOENT => error
       # A source which was already unlinked by external retention cleanup is
       # safe to forget only while our complete publication still verifies.
-      return false unless publication_complete?(upload, destination, root)
+      unless publication_complete?(upload, destination, root) == true
+        return RemoteResult::Failed.new(error)
+      end
 
       remove_verified_manifest!(upload, destination, root, already_verified: true)
       clear_cleanup_source!(upload)
-      true
+      true # rubocop:disable Shelfarr/RescueToEmpty -- the missing source still has a verified publication
     rescue Error, FileCopyService::UnsafePathError, SystemCallError => error
       Rails.logger.error(
         "[UploadZipImportFileService] Could not finish ZIP upload ##{upload.id}: " \
           "#{error.class}: #{error.message}"
       )
-      false
+      RemoteResult::Failed.new(error)
     end
 
     # Kept as a small compatibility surface for focused extraction tests. It
@@ -121,6 +123,7 @@ class UploadZipImportFileService
           source_root: snapshot,
           allow_nonatomic: SettingsService.get(:allow_nonatomic_nfs_directory_publication)
         )
+        LibraryImportPermissions.apply_tree!(destination.to_s, root: root.to_s)
         remove_manifest_by_path!(destination, root)
         destination.to_s
       rescue Errno::EEXIST
@@ -155,8 +158,8 @@ class UploadZipImportFileService
         marker.fetch("source_sha256") == upload.content_sha256 &&
         marker.fetch("entries") == actual
     rescue Error, KeyError, JSON::ParserError, FileCopyService::UnsafePathError,
-      Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR, Errno::ESTALE
-      false
+      Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR, Errno::ESTALE => error
+      RemoteResult::Failed.new(error)
     end
 
     private
@@ -250,8 +253,8 @@ class UploadZipImportFileService
 
       clear_cleanup_source!(upload)
       true
-    rescue Errno::ENOENT, Error, FileCopyService::UnsafePathError, SystemCallError
-      false
+    rescue Errno::ENOENT, Error, FileCopyService::UnsafePathError, SystemCallError => error
+      RemoteResult::Failed.new(error)
     end
 
     def clear_cleanup_source!(upload)
@@ -291,7 +294,7 @@ class UploadZipImportFileService
     end
 
     def remove_verified_manifest!(upload, destination, root, already_verified: false)
-      unless already_verified || publication_complete?(upload, destination, root)
+      unless already_verified || publication_complete?(upload, destination, root) == true
         raise Error, "The ZIP publication changed before its recovery marker could be removed"
       end
 
@@ -311,8 +314,8 @@ class UploadZipImportFileService
         marker_remaining = begin
           FileCopyService.send(:pinned_child_identity, directory, MANIFEST_FILENAME)
           true
-        rescue Errno::ENOENT
-          false
+        rescue Errno::ENOENT => error
+          RemoteResult::Failed.new(error)
         end
         if marker_remaining
           raise Error, "The ZIP publication manifest could not be removed safely"
@@ -345,8 +348,8 @@ class UploadZipImportFileService
 
       snapshot = FileCopyService.snapshot_source_root(path)
       FileCopyService.remove_source_tree(snapshot)
-    rescue Errno::ENOENT
-      nil
+    rescue Errno::ENOENT => error
+      RemoteResult::Failed.new(error)
     end
   end
 
@@ -425,6 +428,11 @@ class UploadZipImportFileService
     end
   end
 
+  def finish_published_directory!(destination, root)
+    LibraryImportPermissions.apply_tree!(destination.to_s, root: root.to_s)
+    display_destination_path
+  end
+
   def publish!
     validate_reservation!
     root = self.class.send(:validated_reserved_root, upload)
@@ -433,9 +441,9 @@ class UploadZipImportFileService
     OwnedMediaImportFileService.with_lock(root, "destination-#{destination}") do
       upload.reload
       validate_reservation!
-      if self.class.publication_complete?(upload, destination, root)
+      if self.class.publication_complete?(upload, destination, root) == true
         @publication_verified = true
-        return display_destination_path
+        return finish_published_directory!(destination, root)
       end
 
       if File.exist?(destination) || File.symlink?(destination)
@@ -454,9 +462,9 @@ class UploadZipImportFileService
           allow_nonatomic: SettingsService.get(:allow_nonatomic_nfs_directory_publication)
         )
       rescue Errno::EEXIST
-        if self.class.publication_complete?(upload, destination, root)
+        if self.class.publication_complete?(upload, destination, root) == true
           @publication_verified = true
-          return display_destination_path
+          return finish_published_directory!(destination, root)
         end
 
         raise Error, "The reserved ZIP destination became occupied by another file or directory"
@@ -466,13 +474,13 @@ class UploadZipImportFileService
           "The ZIP publication path changed while it was being published: #{error.message}"
       end
 
-      unless self.class.publication_complete?(upload, destination, root)
+      unless self.class.publication_complete?(upload, destination, root) == true
         @retain_reservation = true
         raise AmbiguousPublicationError, "The published ZIP directory could not be reconciled"
       end
       @publication_verified = true
     end
-    display_destination_path
+    finish_published_directory!(destination, root)
   rescue OwnedMediaImportFileService::Error,
     FileCopyService::UnsafePathError,
     FileCopyService::AtomicPublicationUnsupportedError,
@@ -489,9 +497,9 @@ class UploadZipImportFileService
     OwnedMediaImportFileService.with_lock(root, "destination-#{destination}") do
       upload.reload
       return true if upload.completed?
-      return false unless source_valid?
+      return false unless source_valid? == true
 
-      if self.class.publication_complete?(upload, destination, root)
+      if self.class.publication_complete?(upload, destination, root) == true
         return false unless remove_verified_tree(destination)
       elsif File.exist?(destination) || File.symlink?(destination)
         return false
@@ -507,7 +515,7 @@ class UploadZipImportFileService
       "[UploadZipImportFileService] Could not restore ZIP upload ##{upload.id}: " \
         "#{error.class}: #{error.message}"
     )
-    false
+    RemoteResult::Failed.new(error)
   end
 
   def cleanup_source_after_completion!
@@ -632,7 +640,7 @@ class UploadZipImportFileService
   def ensure_complete_staging!(root)
     stage = staging_path(root)
     if File.exist?(stage) || File.symlink?(stage)
-      return if staging_complete?(stage, root)
+      return if staging_complete?(stage, root) == true
 
       remove_staging_tree(root)
     end
@@ -648,7 +656,7 @@ class UploadZipImportFileService
       max_bytes: @max_bytes,
       max_files: @max_files
     ).extract!
-    raise Error, "The extracted ZIP staging tree did not verify" unless staging_complete?(stage, root)
+    raise Error, "The extracted ZIP staging tree did not verify" unless staging_complete?(stage, root) == true
   rescue
     remove_staging_tree(root)
     raise
@@ -661,14 +669,14 @@ class UploadZipImportFileService
       marker.fetch("source_sha256") == upload.content_sha256 &&
       marker.fetch("entries") == actual
   rescue Error, KeyError, JSON::ParserError, FileCopyService::UnsafePathError,
-    Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR, Errno::ESTALE
-    false
+    Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR, Errno::ESTALE => error
+    RemoteResult::Failed.new(error)
   end
 
   def source_valid?
     self.class.send(:validate_source!, source_path, upload.file_size, upload.content_sha256)
-  rescue Error
-    false
+  rescue Error => error
+    RemoteResult::Failed.new(error)
   end
 
   def remove_staging_tree(root)
@@ -681,7 +689,7 @@ class UploadZipImportFileService
 
   def remove_verified_tree(destination)
     snapshot = FileCopyService.snapshot_source_root(destination)
-    return false unless self.class.publication_complete?(upload, destination, @root)
+    return false unless self.class.publication_complete?(upload, destination, @root) == true
 
     FileCopyService.remove_source_tree(snapshot)
   end

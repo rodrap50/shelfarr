@@ -15,8 +15,11 @@ class SettingsService
       audiobookshelf_ebook_scan_library_ids audiobookshelf_comicbook_scan_library_ids
     ],
     anna_archive: %w[anna_archive_enabled anna_archive_url anna_archive_api_key],
-    zlibrary: %w[zlibrary_enabled zlibrary_url zlibrary_email zlibrary_password],
-    hardcover: %w[hardcover_enabled hardcover_api_token],
+    zlibrary: %w[zlibrary_enabled zlibrary_url zlibrary_email zlibrary_password zlibrary_remix_userid zlibrary_remix_userkey],
+    hardcover: %w[
+      hardcover_enabled hardcover_api_token hardcover_oauth_client_id hardcover_oauth_client_secret
+      hardcover_oauth_redirect_uri hardcover_oauth_device_flow_enabled hardcover_allow_personal_access
+    ],
     google_books: %w[google_books_enabled google_books_api_key],
     comic_vine: %w[comic_vine_enabled comic_vine_api_key],
     discord: %w[discord_enabled discord_webhook_url],
@@ -34,11 +37,40 @@ class SettingsService
   }.freeze
   MANUAL_SAVE_SETTING_KEYS = MANUAL_SAVE_SETTING_GROUPS.values.flatten.uniq.freeze
   DEFAULT_ANNA_ARCHIVE_URL = "https://annas-archive.gl"
-  DEFAULT_ZLIBRARY_URLS = "https://z-library.sk\nhttps://z-library.bz\nhttps://z-library.rs"
+  PREFERRED_EAPI_HOSTS = %w[
+    z-lib.gd
+    z-lib.gl
+    z-library.ec
+    zlib.bz
+    article.sk
+    articles.sk
+  ].freeze
+  LEGACY_ZLIBRARY_URLS = %w[https://z-library.sk https://z-library.bz https://z-library.rs].freeze
+  DEFAULT_ZLIBRARY_URLS = (
+    PREFERRED_EAPI_HOSTS.map { |host| "https://#{host}" } + LEGACY_ZLIBRARY_URLS
+  ).join("\n")
   ENV_OVERRIDE_PREFIX = "SHELFARR_SETTING_"
+  FILE_SIZE_LIMIT_KEYS = %i[
+    ebook_min_file_size ebook_max_file_size
+    audiobook_min_file_size audiobook_max_file_size
+  ].freeze
+  FILE_SIZE_LIMIT_PAIRS = [
+    %i[ebook_min_file_size ebook_max_file_size],
+    %i[audiobook_min_file_size audiobook_max_file_size]
+  ].freeze
+  FILE_SIZE_UNITS = {
+    "B" => 1,
+    "KB" => 1024,
+    "MB" => 1024 * 1024,
+    "GB" => 1024 * 1024 * 1024
+  }.freeze
+  FILE_SIZE_PATTERN = /\A(\d+(?:\.\d+)?)(?:\s*(KB|MB|GB|B))?\z/i
 
   DOWNLOAD_TYPES = %w[torrent usenet direct].freeze
   COMPLETED_DOWNLOAD_IMPORT_MODES = %w[copy move hardlink reference].freeze
+  LIBRARY_IMPORT_PERMISSION_KEYS = %i[library_import_file_mode library_import_folder_mode].freeze
+  LIBRARY_IMPORT_MODE_FORMAT = /\A[0-7]{3,4}\z/
+  LIBRARY_IMPORT_FOLDER_OWNER_BITS = 0o700
   LIBRARY_PLATFORMS = %w[audiobookshelf bookorbit grimmory].freeze
   INDEXER_SEARCH_SCOPES = %w[broad strict unrestricted custom].freeze
   INDEXER_SEARCH_SCOPE_OPTIONS = {
@@ -65,6 +97,13 @@ class SettingsService
     comicbook: [ 7030 ],
     all_books: [ 3030, 7020, 7000, 7030 ]
   }.freeze
+  DEFAULT_REQUEST_FORMATS = %w[ask audiobook ebook both].freeze
+  DEFAULT_REQUEST_FORMAT_OPTIONS = [
+    [ "Ask each time", "ask" ],
+    [ "Audiobook", "audiobook" ],
+    [ "Ebook", "ebook" ],
+    [ "Both", "both" ]
+  ].freeze
   DOWNLOAD_TYPE_OPTIONS = {
     "torrent" => {
       label: "Torrent",
@@ -80,15 +119,13 @@ class SettingsService
     }
   }.freeze
 
-  # Define all expected settings with their defaults and types
   DEFINITIONS = {
-    # Indexer Integration
     indexer_provider: { type: "string", default: "", category: "indexer", description: "Active indexer provider. Leave unset on upgrades to keep legacy Prowlarr configuration." },
     indexer_search_scope: { type: "string", default: "broad", category: "indexer", description: "How broadly Shelfarr should search indexer categories." },
     indexer_custom_audiobook_categories: { type: "string", default: "", category: "indexer", description: "Audiobook category IDs separated by commas, spaces, or new lines. Used when search scope is Custom. Leave blank to use Shelfarr defaults." },
     indexer_custom_ebook_categories: { type: "string", default: "", category: "indexer", description: "Ebook category IDs separated by commas, spaces, or new lines. Used when search scope is Custom. Leave blank to use Shelfarr defaults." },
     indexer_custom_comicbook_categories: { type: "string", default: "", category: "indexer", description: "Comics & Manga category IDs separated by commas, spaces, or new lines. Used when search scope is Custom. Leave blank to use Shelfarr defaults." },
-    prowlarr_url: { type: "string", default: "", category: "indexer", description: "Base URL for Prowlarr instance (e.g., http://localhost:9696)" },
+    prowlarr_url: { type: "string", default: "", category: "indexer", description: "Base URL for the Prowlarr service. Use the Docker service name or a LAN IP (for example, http://prowlarr:9696)." },
     prowlarr_api_key: { type: "string", default: "", category: "indexer", description: "API key from Prowlarr Settings > General" },
     prowlarr_tags: { type: "string", default: "", category: "indexer", description: "Comma-separated tag IDs or names to filter Prowlarr indexers (leave empty for all indexers)" },
     jackett_url: { type: "string", default: "", category: "indexer", description: "Base URL for Jackett instance (e.g., http://localhost:9117)" },
@@ -103,13 +140,14 @@ class SettingsService
     download_enqueue_timeout_minutes: { type: "integer", default: 5, category: "download", description: "Minutes a download may stay queued in Shelfarr before being flagged as never dispatched to the download client" },
     post_processing_source_path_retries: { type: "integer", default: 10, category: "download", description: "Number of post-processing retries while waiting for completed download files to appear" },
     completed_download_import_mode: { type: "string", default: "copy", category: "download", description: "Choose Copy, Move, Hardlink, or Reference. Hardlink requires one container-visible filesystem; unsupported or cross-filesystem links fall back to copy. Reference creates a library symlink to the download path (for debrid/rclone mounts) and never copies bytes." },
+    library_import_file_mode: { type: "string", default: "", category: "download", description: "Optional octal mode for files Shelfarr copies or moves into the library, for example 0664. The mode must include owner read permission so Shelfarr can verify and serve the file. Leave blank to leave file permissions unchanged. Hardlinked imports are skipped because they share the download file's inode, so chmod would change that download too; any library file with more than one link is skipped for the same reason. Unsupported hardlinks that fall back to a copy still use this mode. Reference symlinks are left unchanged. A chmod failure, such as on NFS or SMB, is logged and does not fail the import." },
+    library_import_folder_mode: { type: "string", default: "", category: "download", description: "Optional octal mode for folders under the library root that contain an import, for example 0775. The mode must include owner read, write, and execute. It is applied after the import is published, not while directories are created. Leave blank to leave folder permissions unchanged. The configured library root is never changed. A chmod failure, such as on NFS or SMB, is logged and does not fail the import." },
     split_audiobook_bundle_imports: { type: "boolean", default: false, category: "download", description: "Split releases containing multiple self-contained M4B/AAX books into per-book folders. MP3, FLAC, and other chapter-based releases stay together." },
     remove_completed_usenet_downloads: { type: "boolean", default: true, category: "download", description: "Remove usenet downloads from client after successful import" },
     precreate_download_archives: { type: "boolean", default: false, category: "download", description: "Pre-create cached ZIP archives for eligible non-reference directory imports after library scan and completion notification so the first download is instant. When disabled, cached archives are created lazily in tmp/downloads. Reference-mode directory downloads cannot be cached and create a one-shot ZIP in the container's OS temp directory instead. Keep both locations disk-backed before downloading large books; tmpfs can OOM-kill the worker." },
 
-    # Library Platform Integration
     library_platform: { type: "string", default: "audiobookshelf", category: "audiobookshelf", description: "Library platform to sync and scan: audiobookshelf, bookorbit, or grimmory" },
-    audiobookshelf_url: { type: "string", default: "", category: "audiobookshelf", description: "Base URL for Audiobookshelf (e.g., http://localhost:13378)" },
+    audiobookshelf_url: { type: "string", default: "", category: "audiobookshelf", description: "Base URL for Audiobookshelf. Use the Docker service name or a LAN IP (for example, http://audiobookshelf:13378)." },
     audiobookshelf_api_key: { type: "string", default: "", category: "audiobookshelf", description: "API token from Audiobookshelf user settings" },
     bookorbit_url: { type: "string", default: "", category: "audiobookshelf", description: "Base URL for BookOrbit (e.g., http://localhost:3000)" },
     bookorbit_username: { type: "string", default: "", category: "audiobookshelf", description: "BookOrbit username with library access and scan permissions" },
@@ -125,7 +163,6 @@ class SettingsService
     audiobookshelf_comicbook_scan_library_ids: { type: "string", default: "", category: "audiobookshelf", description: "Additional library IDs to scan for Comics & Manga duplicate detection (comma-separated). Delivery still goes to the Comics & Manga Library above." },
     audiobookshelf_library_sync_interval: { type: "integer", default: 3600, category: "audiobookshelf", description: "Seconds between automatic library inventory sync jobs" },
 
-    # Output Paths
     audiobook_output_path: { type: "string", default: "/audiobooks", category: "paths", description: "Directory for completed audiobooks" },
     ebook_output_path: { type: "string", default: "/ebooks", category: "paths", description: "Directory for completed ebooks" },
     comicbook_output_path: { type: "string", default: "/comics", category: "paths", description: "Directory for completed Comics & Manga" },
@@ -142,61 +179,56 @@ class SettingsService
       default: false,
       category: "paths",
       env_overridable: true,
-      description: "Allow directory imports on NFS filesystems that reject atomic no-replace renames. Enable only when Shelfarr is the sole writer: a concurrently created empty destination directory could otherwise be replaced."
+      description: "Allow directory imports, source cleanup, and library deletion on NFS filesystems that reject atomic no-replace renames. Enable only when Shelfarr is the sole writer: a concurrently created empty destination or quarantine name could otherwise be replaced."
     },
 
-    # Queue Settings
-    immediate_search_enabled: { type: "boolean", default: false, category: "queue", description: "Start searching immediately when a request is created (instead of waiting for queue cycle)" },
+    setup_wizard_completed: { type: "boolean", default: false, category: "setup", description: "The first-run setup wizard has been finished or skipped" },
+    immediate_search_enabled: { type: "boolean", default: true, category: "queue", description: "Start searching immediately when a request is created (instead of waiting for queue cycle)" },
     auto_approve_requests: { type: "boolean", default: false, category: "queue", description: "Automatically enqueue search immediately for requests created by non-admin users" },
+    default_request_format: { type: "string", default: "ask", category: "queue", description: "Format pre-selected on the request form. Ask leaves the choice to the requester. Both selects the ebook and the audiobook." },
     queue_batch_size: { type: "integer", default: 5, category: "queue", description: "Number of requests to process per queue run" },
     rate_limit_delay: { type: "integer", default: 2, category: "queue", description: "Seconds between API calls" },
     max_retries: { type: "integer", default: 10, category: "queue", description: "Maximum retry attempts before flagging for attention" },
 
-    # Retry Settings
     retry_base_delay_hours: { type: "integer", default: 24, category: "queue", description: "Base delay in hours before retrying not_found requests" },
     retry_max_delay_days: { type: "integer", default: 7, category: "queue", description: "Maximum delay in days between retries" },
 
-    # Open Library
     open_library_enabled: { type: "boolean", default: true, category: "open_library", description: "Enable Open Library as a metadata provider" },
     open_library_search_limit: { type: "integer", default: 20, category: "open_library", description: "Maximum number of search results to return" },
 
-    # Google Books
     google_books_enabled: { type: "boolean", default: true, category: "google_books", description: "Enable Google Books as a metadata provider" },
     google_books_api_key: { type: "string", default: "", category: "google_books", description: "Optional Google Books API key. Leave blank to use anonymous public access; add a key for dedicated quota and more reliable requests." },
     google_books_search_limit: { type: "integer", default: 20, category: "google_books", description: "Maximum number of Google Books search results to return" },
 
-    # Comic Vine
     comic_vine_enabled: { type: "boolean", default: true, category: "comic_vine", description: "Enable Comic Vine as a Comics & Manga metadata provider when an API key is configured" },
     comic_vine_api_key: { type: "string", default: "", category: "comic_vine", description: "Comic Vine API key for Comics & Manga metadata" },
     comic_vine_search_limit: { type: "integer", default: 10, category: "comic_vine", description: "Maximum number of Comic Vine search results to return" },
 
-    # Health Monitoring
     health_check_interval: { type: "integer", default: 300, category: "health", description: "Seconds between system health checks (minimum: 60; default: 300)" },
 
-    # Auto-Selection
     auto_select_enabled: { type: "boolean", default: false, category: "auto_select", description: "Automatically select the best search result without admin intervention" },
     auto_select_min_seeders: { type: "integer", default: 1, category: "auto_select", description: "Minimum seeders required for auto-selection (torrent only)" },
     auto_select_confidence_threshold: { type: "integer", default: 90, category: "auto_select", description: "Minimum confidence score (0-100) for auto-selection" },
 
-    # Format Preferences
     ebook_approved_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated ebook formats that may be auto-selected (leave blank to allow any detected format)" },
     ebook_rejected_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated ebook formats that should never be auto-selected" },
     ebook_preferred_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated ebook formats in preference order, from best to worst" },
+    ebook_min_file_size: { type: "string", default: "", category: "format_preferences", description: "Optional minimum ebook size. Leave blank to keep scoring unchanged. A number alone is megabytes; KB, MB, and GB also work. A smaller release is scored down and kept for manual review. Releases with no reported size are unchanged." },
+    ebook_max_file_size: { type: "string", default: "", category: "format_preferences", description: "Optional maximum ebook size. Leave blank to keep scoring unchanged. A number alone is megabytes; KB, MB, and GB also work. A larger release is scored down and kept for manual review. Releases with no reported size are unchanged." },
     audiobook_approved_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated audiobook formats that may be auto-selected (leave blank to allow any detected format)" },
     audiobook_rejected_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated audiobook formats that should never be auto-selected" },
     audiobook_preferred_formats: { type: "json", default: "[]", category: "format_preferences", description: "Comma-separated audiobook formats in preference order, from best to worst" },
     audiobook_prefer_single_file: { type: "boolean", default: false, category: "format_preferences", description: "Prefer single-file audiobook releases (for example .m4b) over chapter-split releases when detected" },
     audiobook_prefer_higher_bitrate: { type: "boolean", default: false, category: "format_preferences", description: "Prefer higher bitrate audiobook releases when the bitrate can be inferred from the title" },
+    audiobook_min_file_size: { type: "string", default: "", category: "format_preferences", description: "Optional minimum audiobook size. Leave blank to keep scoring unchanged. A number alone is megabytes; KB, MB, and GB also work. A smaller release is scored down and kept for manual review. Releases with no reported size are unchanged." },
+    audiobook_max_file_size: { type: "string", default: "", category: "format_preferences", description: "Optional maximum audiobook size. Leave blank to keep scoring unchanged. A number alone is megabytes; KB, MB, and GB also work. A larger release is scored down and kept for manual review. Releases with no reported size are unchanged." },
 
-    # Language Settings
     default_language: { type: "string", default: "en", category: "language", description: "Default language for new requests" },
     enabled_languages: { type: "json", default: '["en"]', category: "language", description: "Languages available for selection when creating requests" },
     min_match_confidence: { type: "integer", default: 50, category: "language", description: "Minimum confidence score (0-100) for keeping results from category-less indexer searches. When nothing clears it, the best few low-confidence results are kept for manual review instead of returning an empty search." },
 
-    # Updates
     github_repo: { type: "string", default: "Pedro-Revez-Silva/shelfarr", category: "updates", description: "GitHub repository for update notifications" },
 
-    # Security
     auth_disabled: { type: "boolean", default: false, category: "security", description: "Disable password authentication (username-only login for trusted networks). Can also be set via DISABLE_AUTH env var." },
     session_max_age_days: { type: "integer", default: 30, category: "security", description: "Maximum session age in days before requiring re-login" },
     login_lockout_threshold: { type: "integer", default: 5, category: "security", description: "Failed login attempts before temporary lockout" },
@@ -212,45 +244,47 @@ class SettingsService
 
     # Z-Library
     zlibrary_enabled: { type: "boolean", default: false, category: "zlibrary", description: "Enable Z-Library as an additional ebook search and direct download source. This unofficial integration may break if the service changes." },
-    zlibrary_url: { type: "string", default: DEFAULT_ZLIBRARY_URLS, category: "zlibrary", description: "Z-Library base URLs to try. Shelfarr uses the first URL that accepts your login." },
+    zlibrary_url: { type: "string", default: DEFAULT_ZLIBRARY_URLS, category: "zlibrary", description: "Z-Library base URLs to try. Shelfarr probes each one and uses the first domain that serves the eAPI. Add or remove domains to match the mirrors that work for you." },
     zlibrary_email: { type: "string", default: "", category: "zlibrary", description: "Z-Library account email used for login" },
     zlibrary_password: { type: "string", default: "", category: "zlibrary", description: "Z-Library account password used for login" },
+    zlibrary_remix_userid: { type: "string", default: "", category: "zlibrary", description: "Optional saved session: the remix_userid cookie from a browser signed in to Z-Library. Used only when Email or Password is blank, so clear Email to switch from password login." },
+    zlibrary_remix_userkey: { type: "string", default: "", category: "zlibrary", description: "The remix_userkey cookie from the same browser session. Set it with the user ID to use the saved session." },
 
-    # LibriVox
     librivox_enabled: { type: "boolean", default: false, category: "librivox", description: "Enable LibriVox as a free public-domain audiobook source" },
     librivox_url: { type: "string", default: "https://librivox.org", category: "librivox", description: "LibriVox base URL" },
     librivox_search_limit: { type: "integer", default: 20, category: "librivox", description: "Maximum number of LibriVox audiobook results to return" },
 
-    # Project Gutenberg
     gutenberg_enabled: { type: "boolean", default: false, category: "gutenberg", description: "Enable Project Gutenberg as a free public-domain ebook source" },
     gutenberg_url: { type: "string", default: "https://www.gutenberg.org", category: "gutenberg", description: "Project Gutenberg OPDS catalog base URL" },
     gutenberg_search_limit: { type: "integer", default: 10, category: "gutenberg", description: "Maximum number of Project Gutenberg ebook results to return" },
 
-    # DRM-free Stores
     ebooks_com_enabled: { type: "boolean", default: false, category: "ebooks_com", description: "Show DRM-free eBooks.com offers (Beta). Checkout and payment stay on eBooks.com. Confirm affiliate or partner permission before production use." },
     ebooks_com_country_code: { type: "string", default: "", category: "ebooks_com", description: "ISO 3166-1 two-letter buyer country code used for territorial availability, currency, and localized pricing (for example US, GB, or PT)." },
     ebooks_com_search_limit: { type: "integer", default: 5, category: "ebooks_com", description: "Maximum number of matching eBooks.com offers to show per request (1-10)." },
 
-    # Hardcover Integration
     hardcover_enabled: { type: "boolean", default: true, category: "hardcover", description: "Enable Hardcover as a metadata provider when an API token is configured" },
     hardcover_api_token: { type: "string", default: "", category: "hardcover", description: "API token from Hardcover account settings (hardcover.app/account/api)" },
     metadata_source: { type: "string", default: "auto", category: "hardcover", description: "Legacy metadata source selector. Auto uses all enabled providers; selecting a provider restricts metadata search to that provider." },
     metadata_provider_priority: { type: "string", default: "hardcover,openlibrary,google_books,comic_vine", category: "hardcover", description: "Comma-separated metadata provider priority used when merging duplicate search results." },
     hardcover_search_limit: { type: "integer", default: 10, category: "hardcover", description: "Maximum number of search results from Hardcover" },
+    hardcover_oauth_client_id: { type: "string", default: "", category: "hardcover", description: "Client ID of the Hardcover developer app you registered for this Shelfarr instance. Lets each user connect their own Hardcover account for Want to Read and private lists.", env_overridable: true },
+    hardcover_oauth_client_secret: { type: "string", default: "", category: "hardcover", description: "Client secret for a \"Web app (server-side)\" Hardcover app. Leave blank for a \"Mobile, desktop, or CLI\" (public) app.", env_overridable: true },
+    hardcover_oauth_redirect_uri: { type: "string", default: "", category: "hardcover", description: "Optional. The exact redirect URI registered with Hardcover. Leave blank to use this Shelfarr address followed by /hardcover/connection/callback. Hardcover requires HTTPS except for localhost.", env_overridable: true },
+    hardcover_oauth_device_flow_enabled: { type: "boolean", default: false, category: "hardcover", description: "Offer sign-in with a code at hardcover.app/link. Enable only if Device Authorization Grant is turned on for your Hardcover app; useful when Shelfarr has no HTTPS address." },
+    hardcover_allow_personal_access: { type: "boolean", default: false, category: "hardcover", description: "Let users connect by pasting a personal Hardcover API key instead of signing in. Hardcover recommends OAuth for apps used by other people; only enable this for instances where every user trusts the administrator." },
+    hardcover_sync_interval_hours: { type: "integer", default: 6, category: "hardcover", description: "Hours between automatic checks of followed Hardcover lists, Want to Read shelves, and authors (1-168)." },
+    hardcover_max_requests_per_run: { type: "integer", default: 10, category: "hardcover", description: "Maximum automatic requests created for each user per sync interval, counting each format and all of the user's subscriptions. Additional books stay queued for the next interval; books users select themselves are not limited." },
 
-    # Webhook Notifications
     webhook_enabled: { type: "boolean", default: false, category: "webhook", description: "Send outbound webhook notifications for request lifecycle events", env_overridable: true },
     webhook_url: { type: "string", default: "", category: "webhook", description: "Webhook endpoint URL. Shelfarr sends a JSON payload for each enabled event.", env_overridable: true },
     webhook_token: { type: "string", default: "", category: "webhook", description: "Optional Bearer token for webhook authentication", env_overridable: true },
     webhook_events: { type: "string", default: "request_created,request_completed,request_failed,request_attention", category: "webhook", description: "Comma-separated webhook events to send", env_overridable: true },
     webhook_topic: { type: "string", default: "", category: "webhook", description: "Optional topic field included in webhook JSON payload (required by ntfy when posting to the server base URL)", env_overridable: true },
 
-    # Discord Notifications
     discord_enabled: { type: "boolean", default: false, category: "discord", description: "Send native Discord webhook notifications for request lifecycle events" },
     discord_webhook_url: { type: "string", default: "", category: "discord", description: "Incoming Discord webhook URL for the channel that should receive notifications" },
     discord_events: { type: "string", default: "request_created,request_completed,request_failed,request_attention", category: "discord", description: "Comma-separated Discord notification events to send" },
 
-    # Telegram Bot
     telegram_enabled: { type: "boolean", default: false, category: "telegram", description: "Enable the Telegram command integration" },
     telegram_update_mode: { type: "string", default: "polling", category: "telegram", description: "How Shelfarr receives Telegram updates. Polling works for local installs; webhook is optional for public HTTPS deployments." },
     telegram_bot_token: { type: "string", default: "", category: "telegram", description: "Bot token from BotFather. Required before accepting Telegram commands." },
@@ -260,7 +294,6 @@ class SettingsService
     telegram_request_username: { type: "string", default: "", category: "telegram", description: "Shelfarr username used as the owner for Telegram group requests. Defaults to the first admin." },
     telegram_notification_events: { type: "string", default: "request_completed,request_failed,request_attention", category: "telegram", description: "Comma-separated request lifecycle events sent back to the authorized Telegram group that created the request" },
 
-    # OIDC/SSO Authentication
     oidc_enabled: { type: "boolean", default: false, category: "oidc", description: "Enable OpenID Connect (OIDC) single sign-on authentication", env_overridable: true },
     oidc_auto_redirect: { type: "boolean", default: false, category: "oidc", description: "Automatically start OIDC sign-in for unauthenticated users. Use /session/new?local=1 to access the local login form.", env_overridable: true },
     oidc_provider_name: { type: "string", default: "SSO", category: "oidc", description: "Display name for the OIDC provider (shown on login button)", env_overridable: true },
@@ -297,10 +330,12 @@ class SettingsService
     "webhook" => "Webhook Notifications",
     "discord" => "Discord Notifications",
     "telegram" => "Telegram Bot",
-    "oidc" => "OIDC/SSO Authentication"
+    "oidc" => "OIDC/SSO Authentication",
+    "setup" => "Setup"
   }.freeze
 
   LABELS = {
+    setup_wizard_completed: "Setup Wizard Completed",
     prowlarr_url: "Prowlarr URL",
     jackett_url: "Jackett URL",
     newznab_url: "Newznab URL",
@@ -317,6 +352,13 @@ class SettingsService
     ebooks_com_country_code: "Buyer Country Code",
     ebooks_com_search_limit: "Offer Limit",
     allow_nonatomic_nfs_directory_publication: "Allow Non-Atomic NFS Directory Publication",
+    auto_select_confidence_threshold: "Auto-Select Confidence Threshold",
+    ebook_min_file_size: "Minimum Ebook Size",
+    ebook_max_file_size: "Maximum Ebook Size",
+    audiobook_min_file_size: "Minimum Audiobook Size",
+    audiobook_max_file_size: "Maximum Audiobook Size",
+    library_import_file_mode: "Library Import File Mode",
+    library_import_folder_mode: "Library Import Folder Mode",
     precreate_download_archives: "Pre-create Download Archives",
     audiobookshelf_audiobook_library_id: "Audiobook Library",
     audiobookshelf_ebook_library_id: "Ebook Library",
@@ -324,7 +366,16 @@ class SettingsService
     audiobookshelf_audiobook_scan_library_ids: "Additional Audiobook Libraries to Scan",
     audiobookshelf_ebook_scan_library_ids: "Additional Ebook Libraries to Scan",
     audiobookshelf_comicbook_scan_library_ids: "Additional Comics & Manga Libraries to Scan",
-    audiobookshelf_library_sync_interval: "Library Sync Interval"
+    audiobookshelf_library_sync_interval: "Library Sync Interval",
+    zlibrary_remix_userid: "Z-Library User ID",
+    zlibrary_remix_userkey: "Z-Library User Key",
+    hardcover_oauth_client_id: "Hardcover OAuth Client ID",
+    hardcover_oauth_client_secret: "Hardcover OAuth Client Secret",
+    hardcover_oauth_redirect_uri: "Hardcover OAuth Redirect URI",
+    hardcover_oauth_device_flow_enabled: "Allow Sign-in With a Code",
+    hardcover_allow_personal_access: "Allow Personal API Keys",
+    hardcover_sync_interval_hours: "Reading List Sync Interval (hours)",
+    hardcover_max_requests_per_run: "Automatic Requests per User per Run"
   }.freeze
 
   # Delivery/scan library settings keep ABS-era keys for compatibility, but the
@@ -379,14 +430,13 @@ class SettingsService
 
     def secret_setting_key?(key)
       key = key.to_s
-      key == "discord_webhook_url" || key.include?("password") || key.include?("api_key") || key.include?("token") || key.include?("secret")
+      key == "discord_webhook_url" || key.include?("password") || key.include?("api_key") || key.include?("token") || key.include?("secret") || key.include?("userkey")
     end
 
     def manual_save_setting_key?(key)
       secret_setting_key?(key) || MANUAL_SAVE_SETTING_KEYS.include?(key.to_s)
     end
 
-    # Primary getter with default fallback
     def get(key, default: nil)
       key = key.to_sym
       return env_override_value(key) if env_managed?(key)
@@ -396,6 +446,12 @@ class SettingsService
       if key == :completed_download_import_mode
         return COMPLETED_DOWNLOAD_IMPORT_MODES.include?(value) ? value : "copy"
       end
+      return normalize_library_import_mode(key, value) if LIBRARY_IMPORT_PERMISSION_KEYS.include?(key)
+
+      if key == :default_request_format
+        normalized = value.to_s
+        return DEFAULT_REQUEST_FORMATS.include?(normalized) ? normalized : "ask"
+      end
 
       return [ value.to_i, MIN_HEALTH_CHECK_INTERVAL ].max if key == :health_check_interval && !value.nil?
       return value unless value.nil?
@@ -404,7 +460,6 @@ class SettingsService
       definition ? definition[:default] : default
     end
 
-    # Primary setter
     def set(key, value)
       key = key.to_sym
       definition = DEFINITIONS[key]
@@ -418,11 +473,35 @@ class SettingsService
         end
       end
 
+      value = library_import_mode_for_write!(key, value) if LIBRARY_IMPORT_PERMISSION_KEYS.include?(key)
+
+      if key == :default_request_format
+        value = value.to_s
+        unless DEFAULT_REQUEST_FORMATS.include?(value)
+          raise ArgumentError, "#{label_for(key)} must be one of: #{DEFAULT_REQUEST_FORMATS.join(', ')}"
+        end
+      end
+
       if key == :health_check_interval
         value = Integer(value, exception: false)
         if value.nil? || value < MIN_HEALTH_CHECK_INTERVAL
           raise ArgumentError,
             "#{label_for(key)} must be at least #{MIN_HEALTH_CHECK_INTERVAL} seconds"
+        end
+      end
+
+      if key == :auto_select_confidence_threshold
+        # Integer() without a radix reads a leading zero as octal.
+        value = Integer(value.to_s, 10, exception: false)
+        unless value&.between?(0, 100)
+          raise ArgumentError, "#{label_for(key)} must be an integer from 0 to 100"
+        end
+      end
+
+      if file_size_limit_key?(key)
+        value = canonical_file_size_setting(value)
+        if value.present? && parse_file_size_bytes(value).nil?
+          raise ArgumentError, "#{label_for(key)} must be a file size such as 200 KB, 50 MB, or 1.5 GB. A number alone means megabytes."
         end
       end
 
@@ -445,14 +524,12 @@ class SettingsService
       end
     end
 
-    # Bulk getter for a category
     def for_category(category)
       DEFINITIONS.select { |_, v| v[:category] == category }.keys.each_with_object({}) do |key, hash|
         hash[key] = get(key)
       end
     end
 
-    # Check if a setting is configured (non-empty for strings)
     def configured?(key)
       value = get(key)
       return false if value.nil?
@@ -460,7 +537,6 @@ class SettingsService
       true
     end
 
-    # Get all settings organized by category
     def all_by_category
       DEFINITIONS.keys.group_by { |key| DEFINITIONS[key][:category] }.transform_values do |keys|
         keys.each_with_object({}) do |key, hash|
@@ -474,7 +550,6 @@ class SettingsService
       end
     end
 
-    # Initialize all settings with defaults (run on first setup)
     def seed_defaults!
       DEFINITIONS.each do |key, definition|
         next if Setting.exists?(key: key.to_s)
@@ -489,7 +564,6 @@ class SettingsService
       end
     end
 
-    # Check if integrations are configured
     def prowlarr_configured?
       configured?(:prowlarr_url) && configured?(:prowlarr_api_key)
     end
@@ -609,10 +683,11 @@ class SettingsService
     end
 
     def zlibrary_configured?
-      get(:zlibrary_enabled, default: false) &&
-        configured?(:zlibrary_url) &&
-        configured?(:zlibrary_email) &&
-        configured?(:zlibrary_password)
+      return false unless get(:zlibrary_enabled, default: false) && configured?(:zlibrary_url)
+
+      password_login = configured?(:zlibrary_email) && configured?(:zlibrary_password)
+      saved_session = configured?(:zlibrary_remix_userid) && configured?(:zlibrary_remix_userkey)
+      password_login || saved_session
     end
 
     def librivox_configured?
@@ -692,6 +767,18 @@ class SettingsService
       get(:auto_approve_requests, default: false)
     end
 
+    def default_request_formats
+      format = get(:default_request_format)
+      case format
+      when "audiobook", "ebook"
+        [ format ]
+      when "both"
+        %w[audiobook ebook]
+      else
+        []
+      end
+    end
+
     def preferred_download_types
       stored_preferred_types = Setting.find_by(key: "preferred_download_types")&.typed_value
       ordered_types = normalize_download_types(stored_preferred_types)
@@ -716,6 +803,44 @@ class SettingsService
         INDEXER_SEARCH_SCOPE_OPTIONS.fetch(scope)
           .merge(value: scope)
       end
+    end
+
+    def file_size_limit_key?(key)
+      FILE_SIZE_LIMIT_KEYS.include?(key.to_sym)
+    end
+
+    def canonical_file_size_setting(value)
+      text = value.to_s.strip.gsub(/\s+/, " ")
+      return "" if text.blank?
+
+      match = text.match(FILE_SIZE_PATTERN)
+      return text unless match
+      return text unless match[1].to_f.positive?
+
+      "#{match[1]} #{(match[2] || "MB").upcase}"
+    end
+
+    def parse_file_size_bytes(value)
+      match = value.to_s.strip.match(FILE_SIZE_PATTERN)
+      return nil unless match
+
+      amount = match[1].to_f
+      unit = (match[2] || "MB").upcase
+      bytes = amount * FILE_SIZE_UNITS.fetch(unit)
+      return nil unless bytes.finite?
+
+      bytes = bytes.round
+      bytes.positive? ? bytes : nil
+    end
+
+    def file_size_limits_for(book_type)
+      type = book_type.to_s
+      return { min_bytes: nil, max_bytes: nil } unless %w[ebook audiobook].include?(type)
+
+      {
+        min_bytes: parse_file_size_bytes(get("#{type}_min_file_size")),
+        max_bytes: parse_file_size_bytes(get("#{type}_max_file_size"))
+      }
     end
 
     def format_preferences_for(book_type)
@@ -827,6 +952,39 @@ class SettingsService
         normalized = value.to_s.strip.downcase
         normalized.presence
       end.uniq
+    end
+
+    public
+
+    def library_import_mode_acceptable?(key, value)
+      text = value.to_s.strip
+      return false unless text.match?(LIBRARY_IMPORT_MODE_FORMAT)
+      required = key.to_sym == :library_import_folder_mode ? LIBRARY_IMPORT_FOLDER_OWNER_BITS : 0o400
+      (Integer(text, 8) & required) == required
+    end
+
+    def library_import_mode_requirement(key)
+      if key.to_sym == :library_import_folder_mode
+        "must be a 3 or 4 digit octal mode that includes owner read, write, and execute (for example 0775), or blank"
+      else
+        "must be a 3 or 4 digit octal mode that includes owner read (for example 0664), or blank"
+      end
+    end
+
+    private
+
+    def normalize_library_import_mode(key, value)
+      text = value.to_s.strip
+      return "" if text.empty?
+
+      library_import_mode_acceptable?(key, text) ? text : ""
+    end
+
+    def library_import_mode_for_write!(key, value)
+      text = value.to_s.strip
+      return text if text.empty? || library_import_mode_acceptable?(key, text)
+
+      raise ArgumentError, "#{label_for(key)} #{library_import_mode_requirement(key)}"
     end
 
     def default_format_preferences

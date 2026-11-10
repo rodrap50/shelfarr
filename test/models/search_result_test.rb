@@ -10,8 +10,6 @@ class SearchResultTest < ActiveSupport::TestCase
     Setting.where(key: %w[preferred_download_types preferred_download_type]).delete_all
   end
 
-  # === Validations ===
-
   test "requires guid" do
     result = SearchResult.new(request: requests(:pending_request), title: "Test")
     assert_not result.valid?
@@ -43,8 +41,6 @@ class SearchResultTest < ActiveSupport::TestCase
     )
     assert result.valid?
   end
-
-  # === Scopes ===
 
   test "selectable returns only pending results" do
     selectable = SearchResult.selectable
@@ -214,8 +210,6 @@ class SearchResultTest < ActiveSupport::TestCase
 
     assert_equal [ usenet_result, torrent_result ], request.search_results.best_first.to_a
   end
-
-  # === Methods ===
 
   test "downloadable? returns true when magnet_url present" do
     assert @pending_result.downloadable?
@@ -417,6 +411,22 @@ class SearchResultTest < ActiveSupport::TestCase
     assert_equal :high, SearchResult.new(confidence_score: 90).confidence_level
     assert_equal :medium, SearchResult.new(confidence_score: 70).confidence_level
     assert_equal :low, SearchResult.new(confidence_score: 69).confidence_level
+  end
+
+  test "file size adjustment label explains an out of range release" do
+    large = SearchResult.new(score_breakdown: { file_size_adjustment: -40, file_size_status: "above_max" })
+    small = SearchResult.new(score_breakdown: { "file_size_adjustment" => -40, "file_size_status" => "below_min" })
+    neutral = SearchResult.new(score_breakdown: { file_size_adjustment: 0, file_size_status: "within" })
+
+    assert_equal(-40, large.file_size_adjustment)
+    assert_equal :above_max, large.file_size_limit_status
+    assert_equal "Size -40 (too large)", large.file_size_adjustment_label
+    assert_equal "Larger than the configured maximum file size", large.file_size_limit_explanation
+    assert_equal "Size -40 (too small)", small.file_size_adjustment_label
+    assert_equal "Smaller than the configured minimum file size", small.file_size_limit_explanation
+    assert_nil neutral.file_size_adjustment_label
+    assert_nil SearchResult.new.file_size_adjustment_label
+    assert_equal 0, SearchResult.new.file_size_adjustment
   end
 
   test "format helpers fall back when score metadata is absent" do

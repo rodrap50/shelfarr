@@ -32,7 +32,6 @@ class ProfilesControllerTest < ActionDispatch::IntegrationTest
   test "show displays stats" do
     get profile_path
     assert_response :success
-    # Check that stats are displayed (values depend on fixtures)
     assert_select ".bg-gray-800 p.text-2xl"
     assert_select ".bg-green-900\\/30 p.text-2xl"
     assert_select ".bg-yellow-900\\/30 p.text-2xl"
@@ -285,7 +284,6 @@ class ProfilesControllerTest < ActionDispatch::IntegrationTest
     SettingsService.set(:auth_disabled, false)
   end
 
-  # Two-factor authentication tests
   test "two_factor page displays setup when not enabled" do
     get two_factor_profile_path
     assert_response :success

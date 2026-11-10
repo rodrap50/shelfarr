@@ -4,7 +4,13 @@ module Admin
 
     def index
       @settings_by_category = SettingsService.all_by_category
-      @audiobookshelf_libraries = fetch_audiobookshelf_libraries
+      libraries = fetch_audiobookshelf_libraries
+      @audiobookshelf_libraries = case libraries
+      when RemoteResult::Failed
+        []
+      else
+        libraries
+      end
       load_telegram_chat_authorizations
       load_audiobookshelf_cache_summary
     end
@@ -43,13 +49,16 @@ module Admin
       entries = []
       params[:settings]&.each do |key, value|
         next if SettingsService.env_managed?(key)
-        next if autosave? && !autosave_setting_keys.include?(key.to_s)
+        # A named list is the fields this autosave may write. An empty list is not a manifest.
+        next if autosave? && autosave_key_list.any? && !autosave_key_list.include?(key.to_s)
         next if autosave? && SettingsService.manual_save_setting_key?(key)
-        next if manual_setting_manifest? && SettingsService.manual_save_setting_key?(key) && !manual_setting_keys.include?(key.to_s)
-        next if preserve_blank_secret?(key, value)
+        next if unchanged_secret?(key, value)
+        next if skip_unlisted_manual_setting?(key)
 
         value = normalize_setting_value(key, value)
         error = validate_setting_value(key, value)
+        next if error.nil? && !stored_setting_changed?(key, value)
+
         errors << "#{SettingsService.label_for(key)}: #{error}" if error
         entries << {
           key: key,
@@ -107,24 +116,27 @@ module Admin
     end
 
     def test_indexer
-      health = SystemHealth.for_service("indexer")
+      provider = probe_indexer_provider
+      name = indexer_probe_name(provider)
+      url, api_key = indexer_probe_credentials(provider)
+      health = probe_health("indexer", saved: saved_indexer_probe?(provider, url, api_key))
 
-      unless IndexerClient.configured?
-        health.mark_not_configured!
-        respond_with_flash(alert: "#{IndexerClient.display_name} is not configured. Select a provider and enter connection details first.")
+      unless url.present? && api_key.present?
+        health&.mark_not_configured!
+        respond_with_flash(alert: "#{name} is not configured. Select a provider and enter connection details first.")
         return
       end
 
-      if IndexerClient.test_connection
-        health.check_succeeded!(message: "Connection successful")
-        respond_with_flash(notice: "#{IndexerClient.display_name} connection successful!")
+      if RemoteResult.succeeded?(ConnectionProbe.indexer(provider: provider, url: url, api_key: api_key))
+        health&.check_succeeded!(message: "Connection successful")
+        respond_with_flash(notice: "#{name} connection successful!")
       else
-        health.check_failed!(message: "Failed to connect to #{IndexerClient.display_name}")
-        respond_with_flash(alert: "#{IndexerClient.display_name} connection failed.")
+        health&.check_failed!(message: "Failed to connect to #{name}")
+        respond_with_flash(alert: "#{name} connection failed.")
       end
     rescue IndexerClients::Base::Error => e
       health&.check_failed!(message: e.message)
-      respond_with_flash(alert: "#{IndexerClient.display_name} error: #{e.message}")
+      respond_with_flash(alert: "#{name} error: #{e.message}")
     end
 
     def test_prowlarr
@@ -132,24 +144,33 @@ module Admin
     end
 
     def test_audiobookshelf
-      health = SystemHealth.for_service("audiobookshelf")
+      platform = probe_library_platform
+      name = LibraryPlatformClient.display_name(platform)
+      url, api_key = library_probe_credentials(platform)
+      health = probe_health("audiobookshelf", saved: saved_library_probe?(platform, url, api_key))
 
-      unless LibraryPlatformClient.configured?
-        health.mark_not_configured!
-        respond_with_flash(alert: "#{LibraryPlatformClient.display_name} is not configured. Enter connection details first.")
+      unless library_probe_configured?(platform, url, api_key)
+        health&.mark_not_configured!
+        respond_with_flash(alert: "#{name} is not configured. Enter connection details first.")
         return
       end
 
-      if LibraryPlatformClient.test_connection
-        health.check_succeeded!(message: "Connection successful")
-        respond_with_flash(notice: "#{LibraryPlatformClient.display_name} connection successful!")
+      connected = if platform == "audiobookshelf"
+        ConnectionProbe.audiobookshelf(url: url, api_key: api_key)
       else
-        health.check_failed!(message: "Failed to connect to #{LibraryPlatformClient.display_name}")
-        respond_with_flash(alert: "#{LibraryPlatformClient.display_name} connection failed.")
+        LibraryPlatformClient.test_connection(platform: platform)
       end
-    rescue LibraryPlatformClient::Error => e
+
+      if RemoteResult.succeeded?(connected)
+        health&.check_succeeded!(message: "Connection successful")
+        respond_with_flash(notice: "#{name} connection successful!")
+      else
+        health&.check_failed!(message: "Failed to connect to #{name}")
+        respond_with_flash(alert: "#{name} connection failed.")
+      end
+    rescue LibraryPlatformClient::Error, AudiobookshelfClient::Error => e
       health&.check_failed!(message: e.message)
-      respond_with_flash(alert: "#{LibraryPlatformClient.display_name} error: #{e.message}")
+      respond_with_flash(alert: "#{name} error: #{e.message}")
     end
 
     def sync_audiobookshelf_library
@@ -169,7 +190,7 @@ module Admin
         return
       end
 
-      if FlaresolverrClient.test_connection
+      if RemoteResult.succeeded?(FlaresolverrClient.test_connection)
         respond_with_flash(notice: "FlareSolverr connection successful!")
       else
         respond_with_flash(alert: "FlareSolverr connection failed.")
@@ -187,7 +208,7 @@ module Admin
         return
       end
 
-      if HardcoverClient.test_connection
+      if RemoteResult.succeeded?(HardcoverClient.test_connection)
         MetadataProviderStatus.for_provider("hardcover").record_success!
         health.check_succeeded!(message: "Connection successful")
         respond_with_flash(notice: "Hardcover connection successful!")
@@ -210,7 +231,7 @@ module Admin
         return
       end
 
-      if GoogleBooksClient.test_connection
+      if RemoteResult.succeeded?(GoogleBooksClient.test_connection)
         MetadataProviderStatus.for_provider("google_books").record_success!
         respond_with_flash(notice: "Google Books connection successful!")
       else
@@ -226,7 +247,7 @@ module Admin
         return
       end
 
-      if OpenLibraryClient.test_connection
+      if RemoteResult.succeeded?(OpenLibraryClient.test_connection)
         MetadataProviderStatus.for_provider("openlibrary").record_success!
         respond_with_flash(notice: "Open Library connection successful!")
       else
@@ -242,7 +263,7 @@ module Admin
         return
       end
 
-      if ComicVineClient.test_connection
+      if RemoteResult.succeeded?(ComicVineClient.test_connection)
         MetadataProviderStatus.for_provider("comic_vine").record_success!
         respond_with_flash(notice: "Comic Vine connection successful!")
       else
@@ -273,7 +294,7 @@ module Admin
         return
       end
 
-      if LibrivoxClient.test_connection
+      if RemoteResult.succeeded?(LibrivoxClient.test_connection)
         respond_with_flash(notice: "LibriVox connection successful!")
       else
         respond_with_flash(alert: "LibriVox connection failed.")
@@ -286,7 +307,7 @@ module Admin
         return
       end
 
-      if GutenbergClient.test_connection
+      if RemoteResult.succeeded?(GutenbergClient.test_connection)
         respond_with_flash(notice: "Project Gutenberg connection successful!")
       else
         respond_with_flash(alert: "Project Gutenberg connection failed.")
@@ -299,7 +320,7 @@ module Admin
         return
       end
 
-      if EbooksComClient.test_connection
+      if RemoteResult.succeeded?(EbooksComClient.test_connection)
         respond_with_flash(notice: "eBooks.com catalog connection successful!")
       else
         respond_with_flash(alert: "eBooks.com catalog connection failed.")
@@ -435,8 +456,8 @@ module Admin
       params[:autosave] == "true"
     end
 
-    def autosave_setting_keys
-      @autosave_setting_keys ||= params[:autosave_keys].to_s.split(",")
+    def autosave_key_list
+      @autosave_key_list ||= params[:autosave_keys].to_s.split(",").reject(&:blank?)
     end
 
     def manual_setting_manifest?
@@ -460,12 +481,11 @@ module Admin
 
     def validate_autosave_setting_keys!
       return unless autosave?
+      return if autosave_key_list.empty?
 
       settings = params[:settings]
-      invalid = settings.nil? || autosave_setting_keys.empty? || autosave_setting_keys.any? do |key|
-        !SettingsService::DEFINITIONS.key?(key.to_sym) ||
-          SettingsService.manual_save_setting_key?(key) ||
-          !settings.key?(key)
+      invalid = settings.nil? || autosave_key_list.any? do |key|
+        !SettingsService::DEFINITIONS.key?(key.to_sym) || !settings.key?(key)
       end
       raise ArgumentError, "Invalid autosave setting manifest" if invalid
     end
@@ -520,7 +540,6 @@ module Admin
         run_service_health_check("audiobookshelf")
       end
       if changed_keys.any? { |k| indexer_setting_key?(k) }
-        IndexerClient.reset_all_connections!
         run_service_health_check("indexer")
       end
       if changed_keys.any? { |k| k == "flaresolverr_url" }
@@ -557,6 +576,9 @@ module Admin
       if changed_keys.any? { |k| k.start_with?("audiobook_output_path") || k.start_with?("ebook_output_path") }
         run_service_health_check_now("output_paths")
       end
+      if changed_keys.any? { |k| k.start_with?("download_local_path") || k.start_with?("download_remote_path") }
+        run_service_health_check_now("download_paths")
+      end
       nil
     rescue StandardError => e
       Rails.logger.error("[SettingsController] Settings saved but a follow-up action failed: #{e.class}: #{e.message}")
@@ -579,9 +601,50 @@ module Admin
     def validate_setting_value(key, value)
       validate_setting_type(key, value) ||
         validate_completed_download_import_mode(key, value) ||
+        validate_library_import_mode(key, value) ||
+        validate_default_request_format(key, value) ||
         validate_path_template(key, value) ||
         validate_indexer_url(key, value) ||
-        validate_ebooks_com_setting(key, value)
+        validate_ebooks_com_setting(key, value) ||
+        validate_auto_select_confidence_threshold(key, value) ||
+        validate_file_size_setting(key, value)
+    end
+
+    def validate_auto_select_confidence_threshold(key, value)
+      return nil unless key.to_s == "auto_select_confidence_threshold"
+
+      parsed = Integer(value.to_s, 10, exception: false)
+      return nil if parsed&.between?(0, 100)
+
+      "must be an integer from 0 to 100"
+    end
+
+    def validate_file_size_setting(key, value)
+      return nil unless SettingsService.file_size_limit_key?(key)
+
+      normalized = SettingsService.canonical_file_size_setting(value)
+      if normalized.present? && SettingsService.parse_file_size_bytes(normalized).nil?
+        return "must be a file size such as 200 KB, 50 MB, or 1.5 GB. A number alone means megabytes."
+      end
+
+      pair = SettingsService::FILE_SIZE_LIMIT_PAIRS.find { |min_key, max_key| [ min_key, max_key ].include?(key.to_sym) }
+      return nil unless pair
+
+      min_key, max_key = pair
+      min_bytes = SettingsService.parse_file_size_bytes(file_size_text_for_validation(min_key, key, normalized))
+      max_bytes = SettingsService.parse_file_size_bytes(file_size_text_for_validation(max_key, key, normalized))
+      return nil if min_bytes.nil? || max_bytes.nil? || min_bytes <= max_bytes
+
+      if key.to_sym == min_key
+        "must be less than or equal to #{SettingsService.label_for(max_key)}"
+      else
+        "must be greater than or equal to #{SettingsService.label_for(min_key)}"
+      end
+    end
+
+    def file_size_text_for_validation(limit_key, current_key, current_value)
+      raw = limit_key.to_sym == current_key.to_sym ? current_value : setting_value_for_validation(limit_key)
+      SettingsService.canonical_file_size_setting(raw)
     end
 
     def validate_setting_type(key, value)
@@ -605,6 +668,22 @@ module Admin
       return nil if SettingsService::COMPLETED_DOWNLOAD_IMPORT_MODES.include?(value.to_s)
 
       "must be one of: #{SettingsService::COMPLETED_DOWNLOAD_IMPORT_MODES.join(', ')}"
+    end
+
+    def validate_library_import_mode(key, value)
+      return nil unless SettingsService::LIBRARY_IMPORT_PERMISSION_KEYS.include?(key.to_sym)
+
+      text = value.to_s.strip
+      return nil if text.empty? || SettingsService.library_import_mode_acceptable?(key, text)
+
+      SettingsService.library_import_mode_requirement(key)
+    end
+
+    def validate_default_request_format(key, value)
+      return nil unless key.to_s == "default_request_format"
+      return nil if SettingsService::DEFAULT_REQUEST_FORMATS.include?(value.to_s)
+
+      "must be one of: #{SettingsService::DEFAULT_REQUEST_FORMATS.join(', ')}"
     end
 
     def validate_path_template(key, value)
@@ -661,10 +740,117 @@ module Admin
       setting_value_for_validation(:ebooks_com_country_code).to_s.strip
     end
 
+    INDEXER_PROBE_KEYS = {
+      "prowlarr" => [ :prowlarr_url, :prowlarr_api_key ],
+      "jackett" => [ :jackett_url, :jackett_api_key ],
+      "newznab" => [ :newznab_url, :newznab_api_key ]
+    }.freeze
+
+    def probe_indexer_provider
+      if settings_param_posted?(:indexer_provider)
+        posted = params[:settings][:indexer_provider].to_s.strip
+        return posted if %w[none prowlarr jackett newznab].include?(posted)
+      end
+
+      SettingsService.active_indexer_provider
+    end
+
+    def indexer_probe_name(provider)
+      IndexerClient::PROVIDERS[provider]&.display_name || "Indexer"
+    end
+
+    def indexer_probe_credentials(provider)
+      url_key, secret_key = INDEXER_PROBE_KEYS[provider]
+      return [ "", "" ] unless url_key
+
+      [ posted_or_saved_setting(url_key).to_s.strip, posted_or_saved_secret(secret_key).to_s ]
+    end
+
+    def probe_library_platform
+      if settings_param_posted?(:library_platform)
+        posted = params[:settings][:library_platform].to_s.strip
+        return posted if posted.present?
+      end
+
+      LibraryPlatformClient.active_platform
+    end
+
+    def library_probe_credentials(platform)
+      return [ nil, nil ] unless platform == "audiobookshelf"
+
+      [
+        posted_or_saved_setting(:audiobookshelf_url).to_s.strip,
+        posted_or_saved_secret(:audiobookshelf_api_key).to_s
+      ]
+    end
+
+    def library_probe_configured?(platform, url, api_key)
+      return url.present? && api_key.present? if platform == "audiobookshelf"
+
+      LibraryPlatformClient.configured?(platform: platform)
+    end
+
+    # Unsaved form values must not overwrite the dashboard's record of the saved connection.
+    def probe_health(service, saved:)
+      SystemHealth.for_service(service) if saved
+    end
+
+    def saved_indexer_probe?(provider, url, api_key)
+      url_key, secret_key = INDEXER_PROBE_KEYS[provider]
+      return provider == SettingsService.active_indexer_provider if url_key.nil?
+
+      provider == SettingsService.active_indexer_provider &&
+        url == SettingsService.get(url_key).to_s.strip &&
+        api_key == SettingsService.get(secret_key).to_s
+    end
+
+    def saved_library_probe?(platform, url, api_key)
+      return false unless platform == LibraryPlatformClient.active_platform
+      return true unless platform == "audiobookshelf"
+
+      url == SettingsService.get(:audiobookshelf_url).to_s.strip &&
+        api_key == SettingsService.get(:audiobookshelf_api_key).to_s
+    end
+
+    def settings_param_posted?(key)
+      params[:settings].respond_to?(:key?) && params[:settings].key?(key.to_s)
+    end
+
+    def posted_or_saved_setting(key)
+      return params[:settings][key.to_s] if settings_param_posted?(key)
+
+      SettingsService.get(key)
+    end
+
+    def posted_or_saved_secret(key)
+      value = posted_or_saved_setting(key)
+      return SettingsService.get(key) if value.blank?
+
+      value
+    end
+
     def setting_value_for_validation(key)
       settings = params[:settings]
-      submitted = settings&.key?(key.to_s) && (!autosave? || autosave_setting_keys.include?(key.to_s))
+      listed = autosave_key_list.empty? || autosave_key_list.include?(key.to_s)
+      submitted = settings&.key?(key.to_s) && (!autosave? || listed)
       submitted ? settings[key.to_s] : SettingsService.get(key)
+    end
+
+    def stored_setting_changed?(key, normalized_value)
+      definition = SettingsService::DEFINITIONS[key.to_sym]
+      return true unless definition
+
+      posted = Setting.new(value_type: definition[:type])
+      posted.typed_value = normalized_value
+      stored = Setting.find_by(key: key.to_s)
+      if stored
+        # "1" and "true" are one boolean row, so a matching typed value is not a write.
+        posted.value != stored.value && posted.typed_value != stored.typed_value
+      else
+        default_setting = Setting.new(value_type: definition[:type])
+        default_setting.typed_value = definition[:default]
+        posted.value != default_setting.value && posted.typed_value != default_setting.typed_value
+      end
     end
 
     def indexer_url_validation_message(error)
@@ -677,6 +863,8 @@ module Admin
     end
 
     def normalize_setting_value(key, value)
+      return SettingsService.canonical_file_size_setting(value) if SettingsService.file_size_limit_key?(key)
+
       case key.to_s
       when "ebooks_com_country_code"
         value.to_s.strip.upcase
@@ -693,7 +881,7 @@ module Admin
       LibraryPlatformClient.libraries
     rescue LibraryPlatformClient::Error => e
       Rails.logger.warn "[SettingsController] Failed to fetch #{LibraryPlatformClient.display_name} libraries: #{e.message}"
-      []
+      RemoteResult::Failed.new(e)
     end
 
     def sync_telegram_transport
@@ -739,6 +927,20 @@ module Admin
 
     def preserve_blank_secret?(key, value)
       secret_setting_key?(key) && value.blank? && SettingsService.get(key).present?
+    end
+
+    def unchanged_secret?(key, value)
+      return false unless secret_setting_key?(key)
+
+      value.blank? || value.to_s == SettingsService.get(key).to_s
+    end
+
+    def skip_unlisted_manual_setting?(key)
+      return false unless manual_setting_manifest?
+      return false unless SettingsService.manual_save_setting_key?(key)
+      return false if secret_setting_key?(key)
+
+      !manual_setting_keys.include?(key.to_s)
     end
 
     def secret_setting_key?(key)

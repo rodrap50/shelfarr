@@ -16,7 +16,11 @@ class OwnedMediaBackupJob < ApplicationJob
   JOB_CONCURRENCY_LEASE = 30.minutes
   COMPANION_DATA_ROOT = Pathname("/data").freeze
   DEFAULT_IMPORT_ROOT = "/imports/libation"
-  AUDIO_EXTENSIONS = %w[.m4b .m4a .mp3].freeze
+  PREFERRED_AUDIO_EXTENSIONS = %w[m4b m4a mp3].freeze
+  AUDIO_EXTENSIONS = (
+    (PREFERRED_AUDIO_EXTENSIONS & AudiobookBundleImportPlanner::KNOWN_AUDIO_EXTENSIONS) +
+    (AudiobookBundleImportPlanner::KNOWN_AUDIO_EXTENSIONS - PREFERRED_AUDIO_EXTENSIONS)
+  ).map { |extension| ".#{extension}" }.freeze
   LIBATION_COLLISION_SUFFIX = / \(([1-9][0-9]{0,8})\)\z/
   MAX_DIRECTORY_ENTRIES = 10_000
 
@@ -42,7 +46,7 @@ class OwnedMediaBackupJob < ApplicationJob
         "[OwnedMediaBackupJob] Could not inspect upload-processing jobs for " \
           "upload ##{upload_id}: #{error.class}"
       )
-      true
+      RemoteResult::Failed.new(error)
     end
 
     private
@@ -306,7 +310,6 @@ class OwnedMediaBackupJob < ApplicationJob
 
       # Re-resolve both paths after opening, then prove the pathname still
       # identifies the held descriptor. The descriptor remains authoritative
-      # if the shared path is changed after this point.
       current_root = import_root.realpath
       resolved_path = candidate.realpath
       path_stat = resolved_path.stat
@@ -607,7 +610,13 @@ class OwnedMediaBackupJob < ApplicationJob
 
   def schedule_poll(media_import, wait: POLL_INTERVAL)
     next_token = OwnedMediaImport.next_poll_token(@poll_token)
-    job = self.class.set(wait: wait).perform_later(media_import.id, next_token)
+    job = SingleChain.enqueue(
+      self.class,
+      media_import.id,
+      next_token,
+      wait: wait,
+      scope: media_import.id
+    )
     unless job.respond_to?(:successfully_enqueued?) && job.successfully_enqueued?
       raise BackupError, "Shelfarr could not queue the next Libation backup check"
     end
@@ -641,7 +650,7 @@ class OwnedMediaBackupJob < ApplicationJob
       "[OwnedMediaBackupJob] Upload processing enqueue for upload ##{upload.id} " \
         "failed with #{error.class}; the durable backup poll will retry"
     )
-    false
+    RemoteResult::Failed.new(error)
   end
 
   def backup_expired?(media_import)

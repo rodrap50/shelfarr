@@ -11,10 +11,7 @@ class RequestRetryTest < ActiveSupport::TestCase
     @max_retries_exceeded = requests(:max_retries_exceeded)
   end
 
-  # === Scopes ===
-
   test "processable returns pending requests ordered by created_at" do
-    # Create two pending requests with specific order
     older_book = Book.create!(title: "Older Processable", book_type: :ebook, open_library_work_id: "OL_OLDER_P")
     newer_book = Book.create!(title: "Newer Processable", book_type: :ebook, open_library_work_id: "OL_NEWER_P")
 
@@ -45,7 +42,6 @@ class RequestRetryTest < ActiveSupport::TestCase
     assert_not_includes retry_due, requests(:pending_request)
   end
 
-  # === schedule_retry! ===
 
   test "schedule_retry! sets not_found status with exponential backoff" do
     request = Request.create!(
@@ -70,14 +66,12 @@ class RequestRetryTest < ActiveSupport::TestCase
   test "schedule_retry! doubles delay with each retry" do
     base_delay_hours = SettingsService.get(:retry_base_delay_hours)
 
-    # First retry: base_delay
     request1 = Request.create!(book: books(:ebook_pending), user: users(:one), status: :searching, retry_count: 0)
     freeze_time do
       request1.schedule_retry!
       assert_in_delta Time.current + base_delay_hours.hours, request1.next_retry_at, 1.second
     end
 
-    # Second retry: base_delay * 2
     request2 = Request.create!(book: books(:audiobook_acquired), user: users(:one), status: :searching, retry_count: 1)
     freeze_time do
       request2.schedule_retry!
@@ -124,7 +118,6 @@ class RequestRetryTest < ActiveSupport::TestCase
     assert_includes request.issue_description, "Maximum retry attempts"
   end
 
-  # === requeue! ===
 
   test "requeue! moves not_found back to pending" do
     request = requests(:not_found_retry_due)
@@ -138,7 +131,6 @@ class RequestRetryTest < ActiveSupport::TestCase
     assert_equal previous_generation + 1, request.search_generation
   end
 
-  # === retry_now! ===
 
   test "retry_now! resets request for immediate processing when no selected result" do
     request = @max_retries_exceeded
@@ -248,7 +240,6 @@ class RequestRetryTest < ActiveSupport::TestCase
       issue_description: "Download failed"
     )
 
-    # Create a selected search result
     search_result = request.search_results.create!(
       guid: "test-guid-retry",
       title: "Test Result",
@@ -264,7 +255,6 @@ class RequestRetryTest < ActiveSupport::TestCase
       download_url: "http://example.com/test-next.nzb"
     )
 
-    # Create a failed download
     request.downloads.create!(
       name: "Test Download",
       search_result: search_result,
@@ -347,6 +337,252 @@ class RequestRetryTest < ActiveSupport::TestCase
     assert_not old_result.reload.blocklisted?
   end
 
+  test "retry_now! keeps replace_library_file when the same result failed configuration" do
+    book = Book.create!(
+      title: "Confirmed Replacement",
+      book_type: :ebook,
+      file_path: "/ebooks/confirmed-replacement.epub",
+      open_library_work_id: "OL_RETRY_REPLACE"
+    )
+    request = Request.create!(
+      book: book,
+      user: users(:one),
+      status: :not_found,
+      attention_needed: true,
+      issue_description: "Download client configuration error"
+    )
+    selected = request.search_results.create!(
+      guid: "retry-replace-same",
+      title: "Confirmed Replacement",
+      status: :selected,
+      download_url: "http://example.com/confirmed.nzb"
+    )
+    failed = request.downloads.create!(
+      name: selected.title,
+      search_result: selected,
+      status: :failed,
+      configuration_failure: true,
+      replace_library_file: true
+    )
+
+    assert_enqueued_with(job: DownloadJob) do
+      request.retry_now!
+    end
+
+    retried = request.downloads.order(:id).last
+    assert_not_equal failed.id, retried.id
+    assert retried.queued?
+    assert retried.replace_library_file?
+    assert_equal selected.id, retried.search_result_id
+    assert request.reload.downloading?
+  end
+
+  test "retry_now! keeps replace_library_file when auto-select falls back to another result" do
+    SettingsService.set(:auto_select_enabled, true)
+    SettingsService.set(:auto_select_confidence_threshold, 50)
+    SettingsService.set(:auto_select_min_seeders, 1)
+    SettingsService.set(:ebook_approved_formats, [])
+    SettingsService.set(:ebook_rejected_formats, [])
+    SettingsService.set(:ebook_preferred_formats, [])
+    book = Book.create!(
+      title: "Fallback Replacement",
+      book_type: :ebook,
+      file_path: "/ebooks/fallback-replacement.epub",
+      open_library_work_id: "OL_RETRY_REPLACE_NEXT"
+    )
+    request = Request.create!(
+      book: book,
+      user: users(:one),
+      status: :downloading,
+      attention_needed: true,
+      issue_description: "Download failed"
+    )
+    selected = request.search_results.create!(
+      guid: "retry-replace-failed",
+      title: "Fallback Replacement",
+      status: :selected,
+      confidence_score: 95,
+      detected_language: "en",
+      download_url: "http://example.com/failed.nzb"
+    )
+    fallback = request.search_results.create!(
+      guid: "retry-replace-next",
+      title: "Fallback Replacement Next",
+      status: :rejected,
+      confidence_score: 95,
+      detected_language: "en",
+      download_url: "http://example.com/next.nzb"
+    )
+    request.downloads.create!(
+      name: selected.title,
+      search_result: selected,
+      status: :failed,
+      replace_library_file: true
+    )
+
+    assert_enqueued_with(job: DownloadJob) do
+      request.retry_now!
+    end
+
+    assert selected.reload.blocklisted?
+    assert fallback.reload.selected?
+    retried = request.downloads.order(:id).last
+    assert_equal fallback.id, retried.search_result_id
+    assert retried.replace_library_file?
+  end
+
+  test "retry_now! does not mark a retry as a replacement when the failed download was not one" do
+    SettingsService.set(:auto_select_enabled, false)
+    book = Book.create!(
+      title: "Ordinary Retry",
+      book_type: :ebook,
+      file_path: "/ebooks/ordinary-retry.epub",
+      open_library_work_id: "OL_RETRY_NOT_REPLACE"
+    )
+    request = Request.create!(
+      book: book,
+      user: users(:one),
+      status: :not_found,
+      attention_needed: true,
+      issue_description: "Download client configuration error"
+    )
+    selected = request.search_results.create!(
+      guid: "retry-not-replace",
+      title: "Ordinary Retry",
+      status: :selected,
+      download_url: "http://example.com/ordinary.nzb"
+    )
+    request.downloads.create!(
+      name: selected.title,
+      search_result: selected,
+      status: :failed,
+      configuration_failure: true,
+      replace_library_file: false
+    )
+
+    assert_enqueued_with(job: DownloadJob) do
+      request.retry_now!
+    end
+
+    assert_not request.downloads.order(:id).last.replace_library_file?
+  end
+
+  test "retry after an exhausted replacement keeps consent when no result stays selected" do
+    SettingsService.set(:auto_select_enabled, true)
+    SettingsService.set(:auto_select_confidence_threshold, 50)
+    SettingsService.set(:auto_select_min_seeders, 1)
+    SettingsService.set(:preferred_download_types, %w[torrent usenet direct])
+    SettingsService.set(:audiobook_approved_formats, [])
+    SettingsService.set(:audiobook_rejected_formats, [])
+    SettingsService.set(:audiobook_preferred_formats, [])
+    book = Book.create!(
+      title: "Confirmed Replacement Audiobook",
+      author: "Test Author",
+      book_type: :audiobook,
+      file_path: "/audiobooks/Test Author/Confirmed Replacement Audiobook",
+      open_library_work_id: "OL_RETRY_REPLACE_SEARCH"
+    )
+    request = Request.create!(
+      book: book,
+      user: users(:one),
+      status: :downloading,
+      language: "en"
+    )
+    selected = request.search_results.create!(
+      guid: "failed-replacement-torrent",
+      title: "Confirmed Replacement Audiobook Test Author M4B",
+      status: :selected,
+      confidence_score: 95,
+      detected_language: "en",
+      seeders: 20,
+      magnet_url: "magnet:?xt=urn:btih:failedreplacementtorrent"
+    )
+    failed = request.downloads.create!(
+      name: selected.title,
+      search_result: selected,
+      status: :downloading,
+      replace_library_file: true
+    )
+
+    assert_equal :exhausted, request.handle_download_failure!(failed, reason: "Download failed in client")
+    assert request.reload.not_found?
+    assert_not request.search_results.selected.exists?
+    assert failed.reload.replace_library_file?
+
+    request.retry_now!
+    assert request.pending?
+    assert_not request.search_results.selected.exists?
+
+    fresh = request.search_results.create!(
+      guid: "fresh-replacement-torrent",
+      title: "Confirmed Replacement Audiobook Test Author M4B",
+      status: :pending,
+      confidence_score: 95,
+      detected_language: "en",
+      seeders: 20,
+      magnet_url: "magnet:?xt=urn:btih:freshreplacementtorrent"
+    )
+
+    assert_enqueued_with(job: DownloadJob) do
+      SearchJob.new.send(:attempt_auto_select, request)
+    end
+
+    chosen = request.downloads.order(:id).last
+    assert_not_equal failed.id, chosen.id
+    assert_equal fresh.id, chosen.search_result_id
+    assert chosen.replace_library_file?
+    assert request.reload.downloading?
+  end
+
+  test "retry after an exhausted ordinary failure does not become a library replacement" do
+    SettingsService.set(:auto_select_enabled, true)
+    SettingsService.set(:auto_select_confidence_threshold, 50)
+    SettingsService.set(:auto_select_min_seeders, 1)
+    SettingsService.set(:preferred_download_types, %w[torrent usenet direct])
+    SettingsService.set(:audiobook_approved_formats, [])
+    SettingsService.set(:audiobook_rejected_formats, [])
+    SettingsService.set(:audiobook_preferred_formats, [])
+    book = Book.create!(
+      title: "Ordinary Exhausted Audiobook",
+      author: "Test Author",
+      book_type: :audiobook,
+      file_path: "/audiobooks/Test Author/Ordinary Exhausted Audiobook",
+      open_library_work_id: "OL_RETRY_ORDINARY_SEARCH"
+    )
+    request = Request.create!(book: book, user: users(:one), status: :downloading, language: "en")
+    selected = request.search_results.create!(
+      guid: "failed-ordinary-torrent",
+      title: "Ordinary Exhausted Audiobook Test Author M4B",
+      status: :selected,
+      confidence_score: 95,
+      detected_language: "en",
+      seeders: 20,
+      magnet_url: "magnet:?xt=urn:btih:failedordinarytorrent"
+    )
+    request.downloads.create!(
+      name: selected.title,
+      search_result: selected,
+      status: :downloading,
+      replace_library_file: false
+    )
+
+    request.handle_download_failure!(request.downloads.sole, reason: "Download failed in client")
+    request.retry_now!
+    request.search_results.create!(
+      guid: "fresh-ordinary-torrent",
+      title: "Ordinary Exhausted Audiobook Test Author M4B",
+      status: :pending,
+      confidence_score: 95,
+      detected_language: "en",
+      seeders: 20,
+      magnet_url: "magnet:?xt=urn:btih:freshordinarytorrent"
+    )
+
+    SearchJob.new.send(:attempt_auto_select, request)
+
+    assert_not request.downloads.order(:id).last.replace_library_file?
+  end
+
   test "retry_now! restarts search when there is a selected result but no failed download" do
     book = Book.create!(title: "Test Book 2", book_type: :ebook, open_library_work_id: "OL_RETRY_SEARCH")
     request = Request.create!(
@@ -357,7 +593,6 @@ class RequestRetryTest < ActiveSupport::TestCase
       issue_description: "Something went wrong"
     )
 
-    # Create a selected search result but no download at all
     request.search_results.create!(
       guid: "test-guid-search",
       title: "Test Result",
@@ -371,7 +606,6 @@ class RequestRetryTest < ActiveSupport::TestCase
     assert request.pending?, "Should restart search when no failed download exists"
   end
 
-  # === cancel! ===
 
   test "cancel! marks request as failed" do
     request = @pending
@@ -383,7 +617,6 @@ class RequestRetryTest < ActiveSupport::TestCase
     assert_nil request.issue_description
   end
 
-  # === complete! ===
 
   test "complete! clears attention_needed and issue_description" do
     request = Request.create!(
@@ -402,7 +635,6 @@ class RequestRetryTest < ActiveSupport::TestCase
     assert request.completed_at.present?
   end
 
-  # === select_result! ===
 
   test "select_result! clears attention_needed and issue_description" do
     book = Book.create!(title: "Select Test Book", book_type: :ebook, open_library_work_id: "OL_SELECT_TEST")
@@ -434,14 +666,12 @@ class RequestRetryTest < ActiveSupport::TestCase
     assert download.queued?
   end
 
-  # === can_retry? ===
 
   test "can_retry? returns true for pending, not_found, and failed" do
     assert @pending.can_retry?
     assert @not_found_waiting.can_retry?
     assert requests(:failed_request).can_retry?
 
-    # Create a downloading request
     downloading = Request.create!(
       book: books(:audiobook_acquired),
       user: users(:one),
@@ -460,7 +690,6 @@ class RequestRetryTest < ActiveSupport::TestCase
     )
     assert_not downloading.can_retry?
 
-    # But with attention_needed it can be retried
     downloading.update!(attention_needed: true)
     assert downloading.can_retry?
   end
@@ -475,7 +704,6 @@ class RequestRetryTest < ActiveSupport::TestCase
     assert_not completed.can_retry?
   end
 
-  # === needs_manual_selection? ===
 
   test "needs_manual_selection? returns true when searching with pending results" do
     book = Book.create!(title: "Manual Select Book", book_type: :ebook, open_library_work_id: "OL_MANUAL_SEL")
@@ -485,10 +713,8 @@ class RequestRetryTest < ActiveSupport::TestCase
       status: :searching
     )
 
-    # No results yet
     assert_not request.needs_manual_selection?
 
-    # Add a pending search result
     request.search_results.create!(
       guid: "manual-sel-guid",
       title: "Test Result",
@@ -535,15 +761,12 @@ class RequestRetryTest < ActiveSupport::TestCase
     assert_not request.needs_manual_selection?
   end
 
-  # === retry_due? ===
 
   test "retry_due? returns true when next_retry_at is past" do
     assert requests(:not_found_retry_due).retry_due?
     assert_not @not_found_waiting.retry_due?
-    assert_not @pending.retry_due? # No next_retry_at
+    assert_not @pending.retry_due?
   end
-
-  # === next_retry_in_words ===
 
   test "next_retry_in_words returns human-readable time" do
     request = Request.create!(
@@ -570,7 +793,6 @@ class RequestRetryTest < ActiveSupport::TestCase
     assert_nil requests(:not_found_retry_due).next_retry_in_words
   end
 
-  # === can_be_cancelled? ===
 
   test "can_be_cancelled? returns true for pending requests" do
     assert @pending.can_be_cancelled?
@@ -672,7 +894,6 @@ class RequestRetryTest < ActiveSupport::TestCase
       status: :downloading
     )
 
-    # Create an active download
     download = request.downloads.create!(
       name: "Test Download",
       status: :downloading,
@@ -771,7 +992,6 @@ class RequestRetryTest < ActiveSupport::TestCase
       status: :downloading
     )
 
-    # Create a paused download
     paused_download = request.downloads.create!(
       name: "Paused Download",
       status: :paused,

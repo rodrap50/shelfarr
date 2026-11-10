@@ -42,7 +42,28 @@ class AudiobookshelfLibrarySyncService
     library_platform = initial_platform
     library_ids.each do |library_id|
       begin
-        items = LibraryPlatformClient.library_items(library_id, platform: library_platform)
+        result = LibraryPlatformClient.library_items(library_id, platform: library_platform)
+        case result
+        when RemoteResult::Failed
+          errors << "#{library_id}: #{result.error.message}"
+          Rails.logger.warn "[AudiobookshelfLibrarySyncService] Failed to sync #{LibraryPlatformClient.display_name(library_platform)} library #{library_id}: #{result.error.message}"
+          next
+        when RemoteResult::Empty
+          items = []
+        when RemoteResult::Ok
+          items = result.value
+          if items.respond_to?(:empty?) && items.empty?
+            errors << "#{library_id}: empty inventory was not an explicit empty success"
+            next
+          end
+        else
+          if result.nil? || result == false || result == []
+            errors << "#{library_id}: empty inventory was not an explicit empty success"
+            next
+          end
+
+          items = result
+        end
         synced_count = sync_library_items(library_platform, library_id, items, synced_at: now)
         libraries_synced += 1
         items_synced += synced_count

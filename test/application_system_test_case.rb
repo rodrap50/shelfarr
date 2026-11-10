@@ -1,4 +1,5 @@
 require "test_helper"
+require_relative "support/capybara_server_port_retry"
 
 module ChromeStaleNodeRetry
   def synchronize(...)
@@ -19,6 +20,12 @@ class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
   driven_by :selenium, using: :headless_chrome, screen_size: [ 1400, 1400 ],
     options: { native_displayed: true } do |options|
     options.add_argument("--no-sandbox") if Process.uid.zero?
+  end
+
+  setup do
+    # Selenium reuses its browser after reset_sessions!, including the window
+    # size left by a mobile test. Give each test the declared desktop viewport.
+    page.current_window.resize_to(1400, 1400)
   end
 
   def sign_in_as(user)

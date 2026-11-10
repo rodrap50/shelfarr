@@ -21,7 +21,7 @@ class AudiobookProbeServiceTest < ActiveSupport::TestCase
 
   test "fails closed when ffprobe is unavailable" do
     with_path(Dir.mktmpdir) do
-      assert_not AudiobookProbeService.valid?("/tmp/book.mp3")
+      assert RemoteResult.failed?(AudiobookProbeService.valid?("/tmp/book.mp3"))
     end
   end
 
@@ -40,6 +40,17 @@ class AudiobookProbeServiceTest < ActiveSupport::TestCase
       assert generated, "Test audio file should be created"
       assert AudiobookProbeService.valid?(audio_file),
              "AudiobookProbeService should validate a real audio file with the actual ffprobe binary"
+
+      File.open(audio_file, "rb") do |original|
+        File.rename(audio_file, "#{audio_file}.held")
+        File.write(audio_file, "not the original audio")
+        held = File.for_fd(original.fileno, "rb", autoclose: false)
+        held.seek(5)
+
+        assert_nil held.path
+        assert AudiobookProbeService.valid?(held), "Probe the held audio, even when its pathname was replaced"
+        assert_equal 5, held.pos
+      end
     end
   end
 

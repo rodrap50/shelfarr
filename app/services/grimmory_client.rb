@@ -1,7 +1,8 @@
 # frozen_string_literal: true
 
-# Client for Grimmory's documented /api/v1 endpoints.
 class GrimmoryClient
+  CONNECTION_MUTEX = Mutex.new
+
   class Error < StandardError; end
   class ConnectionError < Error; end
   class AuthenticationError < Error; end
@@ -25,6 +26,10 @@ class GrimmoryClient
     end
   end
 
+  AUDIOBOOK_FORMATS = (
+    AudiobookBundleImportPlanner::KNOWN_AUDIO_EXTENSIONS + %w[audiobook]
+  ).freeze
+
   class << self
     def libraries
       ensure_configured!
@@ -47,7 +52,8 @@ class GrimmoryClient
 
       response = authenticated_request { connection.get("/api/v1/libraries/#{id}/book") }
       handle_response(response) do |data|
-        extract_collection(data, "books").filter_map { |item| parse_item(item) }
+        items = extract_collection(data, "books").filter_map { |item| parse_item(item) }
+        items.empty? ? RemoteResult::Empty.new : RemoteResult::Ok.new(items)
       end
     end
 
@@ -69,19 +75,25 @@ class GrimmoryClient
     def test_connection
       ensure_configured!
       libraries.any?
-    rescue Error
-      false
+    rescue Error => error
+      RemoteResult::Failed.new(error)
     end
 
     def reset_connection!
-      @connection = nil
-      @access_token = nil
+      CONNECTION_MUTEX.synchronize { clear_connection_cache! }
+    end
+
+    def release_unconfigured_connection!
+      reset_connection! unless configured?
     end
 
     private
 
     def ensure_configured!
-      raise NotConfiguredError, "Grimmory is not configured" unless configured?
+      return if configured?
+
+      reset_connection!
+      raise NotConfiguredError, "Grimmory is not configured"
     end
 
     def request
@@ -98,19 +110,56 @@ class GrimmoryClient
       request { yield }
     end
 
+    # Faraday keeps the URL and bearer token it was built with. A job process
+    # does not see reset_connection! from the web process, so rebuild when the
+    # settings that produced them change.
     def connection
-      @connection ||= Faraday.new(url: base_url) do |f|
+      CONNECTION_MUTEX.synchronize do
+        unless configured?
+          clear_connection_cache!
+          raise NotConfiguredError, "Grimmory is not configured"
+        end
+
+        settings_key = connection_settings_key
+        rebuild_connection!(settings_key) if @connection.nil? || @connection_settings_key != settings_key
+        @connection
+      end
+    end
+
+    def clear_connection_cache!
+      @connection = nil
+      @access_token = nil
+      @connection_settings_key = nil
+    end
+
+    def rebuild_connection!(settings_key)
+      clear_connection_cache!
+      connection = authorized_connection(settings_key)
+      @connection = connection
+      @connection_settings_key = settings_key
+    end
+
+    def connection_settings_key
+      [
+        base_url,
+        SettingsService.get(:grimmory_username).to_s,
+        SettingsService.get(:grimmory_password).to_s
+      ]
+    end
+
+    def authorized_connection(settings_key)
+      Faraday.new(url: settings_key.fetch(0)) do |f|
         f.request :json
         f.response :json, parser_options: { symbolize_names: false }
         f.adapter Faraday.default_adapter
-        f.headers["Authorization"] = "Bearer #{access_token}"
+        f.headers["Authorization"] = "Bearer #{access_token(settings_key)}"
         f.options.timeout = 15
         f.options.open_timeout = 5
       end
     end
 
-    def auth_connection
-      Faraday.new(url: base_url) do |f|
+    def auth_connection(settings_key)
+      Faraday.new(url: settings_key.fetch(0)) do |f|
         f.request :json
         f.response :json, parser_options: { symbolize_names: false }
         f.adapter Faraday.default_adapter
@@ -119,12 +168,12 @@ class GrimmoryClient
       end
     end
 
-    def access_token
+    def access_token(settings_key)
       @access_token ||= begin
         response = request do
-          auth_connection.post("/api/v1/auth/login", {
-            username: SettingsService.get(:grimmory_username),
-            password: SettingsService.get(:grimmory_password)
+          auth_connection(settings_key).post("/api/v1/auth/login", {
+            username: settings_key.fetch(1),
+            password: settings_key.fetch(2)
           })
         end
         handle_response(response) do |data|
@@ -174,10 +223,8 @@ class GrimmoryClient
       return "grimmory" if formats.empty?
 
       ebook_formats = %w[azw azw3 cbx cbz cbr epub fb2 lit lrf mobi pdf txt]
-      audiobook_formats = %w[aac aiff alac audiobook flac m4a m4b mp3 ogg opus wav wma]
-
       has_ebooks = formats.any? { |format| ebook_formats.include?(format) }
-      has_audiobooks = formats.any? { |format| audiobook_formats.include?(format) }
+      has_audiobooks = formats.any? { |format| AUDIOBOOK_FORMATS.include?(format) }
 
       return "audiobook" if has_audiobooks && !has_ebooks
       return "ebook" if has_ebooks && !has_audiobooks

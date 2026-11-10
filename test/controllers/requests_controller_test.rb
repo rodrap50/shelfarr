@@ -68,7 +68,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     sign_out
     sign_in_as(@admin)
 
-    # Create requests with different statuses
     completed_request = Request.create!(
       book: books(:audiobook_acquired),
       user: @user,
@@ -78,7 +77,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     get requests_path(status: "completed")
     assert_response :success
 
-    # Should only show completed requests
     assert_select "h3", completed_request.book.title
   end
 
@@ -86,7 +84,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     sign_out
     sign_in_as(@admin)
 
-    # Create unique books for this test
     active_book = Book.create!(
       title: "Active Test Book Unique",
       book_type: :ebook,
@@ -98,7 +95,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
       open_library_work_id: "OL_ATTENTION_FILTER_TEST"
     )
 
-    # Create an active request without attention needed
     active_request = Request.create!(
       book: active_book,
       user: @user,
@@ -106,7 +102,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
       attention_needed: false
     )
 
-    # Create an active request with attention needed
     attention_request = Request.create!(
       book: attention_book,
       user: @user,
@@ -117,7 +112,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     get requests_path(status: "active")
     assert_response :success
 
-    # Active filter should exclude requests needing attention
     assert_select "h3", text: "Active Test Book Unique"
     assert_select "h3", text: "Attention Test Book Unique", count: 0
   end
@@ -126,7 +120,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     sign_out
     sign_in_as(@admin)
 
-    # Create a request needing attention
     attention_request = Request.create!(
       book: books(:audiobook_acquired),
       user: @user,
@@ -138,7 +131,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     get requests_path(attention: "true")
     assert_response :success
 
-    # Should show requests needing attention
     assert_select "h3", attention_request.book.title
   end
 
@@ -195,7 +187,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     get requests_path
     assert_response :success
 
-    # Should have filter tabs rendered
     assert_select "a", text: /Need Attention/
     assert_select "a", text: /Active/
   end
@@ -204,10 +195,8 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     sign_out
     sign_in_as(@admin)
 
-    # Delete existing requests to have a clean count
     Request.destroy_all
 
-    # Create 30 requests
     30.times do |i|
       book = Book.create!(
         title: "Book #{i}",
@@ -221,7 +210,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
       )
     end
 
-    # First page should show 25 requests (descending order, so Book 29 to Book 5)
     get requests_path(page: 1)
     assert_response :success
     assert_select "h3", count: 25
@@ -229,7 +217,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     assert_select "h3", text: "Book 5"
     assert_select "h3", text: "Book 4", count: 0
 
-    # Second page should show the remaining 5 requests (Book 4 to Book 0)
     get requests_path(page: 2)
     assert_response :success
     assert_select "h3", count: 5
@@ -243,7 +230,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
 
     Request.destroy_all
 
-    # Create 30 requests -> 2 pages
     30.times do |i|
       book = Book.create!(
         title: "Book #{i}",
@@ -257,7 +243,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
       )
     end
 
-    # Requesting page 999 should be clamped to page 2 and show the remaining 5 requests
     get requests_path(page: 999)
     assert_response :success
     assert_select "h3", count: 5
@@ -503,6 +488,76 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     }
     assert_response :success
     assert_select "h2", "Test Book"
+  end
+
+  test "new offers both formats and leaves the choice unselected" do
+    get new_request_path, params: book_request_params("OL_BOTH_FORM")
+
+    assert_response :success
+    assert_select "button[type='button'][data-select-both-formats]", text: "Both"
+    assert_select "input[name='book_types[]'][value='audiobook'][checked]", count: 0
+    assert_select "input[name='book_types[]'][value='ebook'][checked]", count: 0
+    assert_equal "ask", SettingsService.get(:default_request_format)
+  end
+
+  test "new does not offer both for comics and manga" do
+    get new_request_path, params: {
+      work_id: "comic_vine:4000-both-hidden",
+      title: "Issue One",
+      content_kind: "graphic"
+    }
+
+    assert_response :success
+    assert_select "input[name='book_types[]'][value='comicbook'][checked]"
+    assert_select "button[data-select-both-formats]", count: 0
+  end
+
+  test "new selects both formats when that is the default request format" do
+    SettingsService.set(:default_request_format, "both")
+
+    get new_request_path, params: book_request_params("OL_BOTH_DEFAULT")
+
+    assert_response :success
+    assert_select "input[name='book_types[]'][value='audiobook'][checked]:not([disabled])"
+    assert_select "input[name='book_types[]'][value='ebook'][checked]:not([disabled])"
+  end
+
+  test "new selects only the configured default format" do
+    SettingsService.set(:default_request_format, "ebook")
+
+    get new_request_path, params: book_request_params("OL_EBOOK_DEFAULT")
+
+    assert_response :success
+    assert_select "input[name='book_types[]'][value='ebook'][checked]:not([disabled])"
+    assert_select "input[name='book_types[]'][value='audiobook'][checked]", count: 0
+  end
+
+  test "new keeps an explicit format choice ahead of the default" do
+    SettingsService.set(:default_request_format, "both")
+
+    get new_request_path, params: book_request_params("OL_EXPLICIT_FORMAT").merge(book_type: "audiobook")
+
+    assert_response :success
+    assert_select "input[name='book_types[]'][value='audiobook'][checked]:not([disabled])"
+    assert_select "input[name='book_types[]'][value='ebook'][checked]", count: 0
+  end
+
+  test "new does not preselect a default format the user already has" do
+    Book.create!(
+      title: "Already Owned",
+      author: "Owner",
+      book_type: :ebook,
+      open_library_work_id: "OL_DEFAULT_OWNED",
+      file_path: "/ebooks/already-owned.epub"
+    )
+    SettingsService.set(:default_request_format, "both")
+
+    get new_request_path, params: book_request_params("OL_DEFAULT_OWNED", title: "Already Owned")
+
+    assert_response :success
+    assert_select "input[name='book_types[]'][value='audiobook'][checked]:not([disabled])"
+    assert_select "input[name='book_types[]'][value='ebook'][disabled]"
+    assert_select "input[name='book_types[]'][value='ebook'][checked]", count: 0
   end
 
   test "new shows a nonblocking BookOrbit warning only for the matching format" do
@@ -992,6 +1047,61 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     assert_select "input[name='book_types[]'][value='ebook']", count: 0
   end
 
+  test "create with both creates an ebook request and an audiobook request" do
+    assert_difference "Book.count", 2 do
+      assert_difference "Request.count", 2 do
+        post_both_formats("OL_BOTH_CREATE", title: "Read and Listen")
+      end
+    end
+
+    assert_redirected_to requests_path
+    assert_match "2 requests created for Read and Listen", flash[:notice]
+    assert_equal %w[audiobook ebook], Book.where(open_library_work_id: "OL_BOTH_CREATE").pluck(:book_type).sort
+  end
+
+  test "create with both skips a format the user already requested" do
+    book = Book.create!(
+      title: "Half Requested",
+      author: "Owner",
+      book_type: :audiobook,
+      open_library_work_id: "OL_BOTH_SKIP_ACTIVE"
+    )
+    Request.create!(book: book, user: @user, status: :pending)
+
+    assert_difference "Request.count", 1 do
+      post_both_formats("OL_BOTH_SKIP_ACTIVE", title: "Half Requested")
+    end
+
+    created = Request.order(:id).last
+    assert_equal "ebook", created.book.book_type
+    assert_redirected_to request_path(created)
+    assert_match "Request created for Half Requested by Owner", flash[:notice]
+    assert_match "already has an active request", flash[:alert]
+  end
+
+  test "create requests each selected format and skips one already in the library" do
+    Book.create!(
+      title: "Library Ebook",
+      author: "Owner",
+      book_type: :ebook,
+      open_library_work_id: "OL_BOTH_SELECTED",
+      file_path: "/ebooks/library.epub"
+    )
+
+    assert_difference "Request.count", 1 do
+      MetadataService.stub(:book_details, nil) do
+        post requests_path, params: book_request_params("OL_BOTH_SELECTED", title: "Library Ebook").merge(
+          book_types: %w[audiobook ebook]
+        )
+      end
+    end
+
+    created = Request.order(:id).last
+    assert_equal "audiobook", created.book.book_type
+    assert_redirected_to request_path(created)
+    assert_match "already in your library", flash[:alert]
+  end
+
   test "create creates book and request" do
     assert_difference [ "Book.count", "Request.count" ], 1 do
       post requests_path, params: {
@@ -1198,6 +1308,7 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "create does not auto-approve admin requests when only auto approve requests is enabled" do
+    SettingsService.set(:immediate_search_enabled, false)
     SettingsService.set(:auto_approve_requests, true)
     sign_out
     sign_in_as(@admin)
@@ -1648,6 +1759,68 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     assert_select "form[action='#{manual_nzb_request_path(@pending_request)}']", count: 0
   end
 
+  test "admin can replace a completed library file with a manual magnet or NZB" do
+    book = Book.create!(
+      title: "Already shelved",
+      author: "Ada Lovelace",
+      book_type: :ebook,
+      file_path: "/ebooks/already-shelved.epub"
+    )
+    request = Request.create!(book: book, user: @user, status: :completed)
+    sign_out
+    sign_in_as(@admin)
+
+    get request_path(request)
+
+    assert_response :success
+    assert_select "form[action='#{manual_magnet_request_path(request)}']"
+    assert_select "form[action='#{manual_nzb_request_path(request)}']"
+    assert_select "input[name='replace_library_file'][value='1']", count: 2
+
+    assert_no_difference "Download.count" do
+      post manual_magnet_request_path(request), params: {
+        magnet_url: "magnet:?xt=urn:btih:#{'a' * 40}"
+      }
+    end
+    assert_equal "Cannot add a magnet link to a completed request", flash[:alert]
+    assert request.reload.completed?
+
+    assert_enqueued_with(job: DownloadJob) do
+      post manual_magnet_request_path(request), params: {
+        magnet_url: "magnet:?xt=urn:btih:#{'b' * 40}",
+        replace_library_file: "1"
+      }
+    end
+    magnet_download = request.downloads.order(:id).last
+    assert_redirected_to request_path(request)
+    assert_equal "Magnet link queued for download.", flash[:notice]
+    assert request.reload.downloading?
+    assert magnet_download.replace_library_file?
+
+    nzb_request = Request.create!(book: book, user: @user, status: :completed)
+    assert_enqueued_with(job: DownloadJob) do
+      post manual_nzb_request_path(nzb_request), params: {
+        nzb_url: "https://downloads.example/already-shelved.nzb",
+        replace_library_file: "1"
+      }
+    end
+    nzb_download = nzb_request.downloads.order(:id).last
+    assert_equal "NZB URL queued for download.", flash[:notice]
+    assert nzb_request.reload.downloading?
+    assert nzb_download.replace_library_file?
+
+    blocked = Request.create!(book: book, user: @user, status: :completed)
+    blocked.downloads.create!(name: "Dispatch", status: :downloading, external_id: nil)
+    assert_no_difference "Download.count" do
+      post manual_nzb_request_path(blocked), params: {
+        nzb_url: "https://downloads.example/other.nzb",
+        replace_library_file: "1"
+      }
+    end
+    assert_equal "Cannot replace a download while dispatch is in progress", flash[:alert]
+    assert blocked.reload.completed?
+  end
+
   test "show hides manual download forms for processing request" do
     @pending_request.update!(status: :processing)
     sign_out
@@ -1713,7 +1886,7 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     sign_in_as(@admin)
 
     request = @pending_request
-    request.define_singleton_method(:add_manual_magnet!) do |_magnet_url|
+    request.define_singleton_method(:add_manual_magnet!) do |_magnet_url, **|
       raise ActiveRecord::RecordNotUnique, "duplicate"
     end
     finder = Object.new
@@ -1787,7 +1960,7 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     sign_in_as(@admin)
 
     request = @pending_request
-    request.define_singleton_method(:add_manual_nzb!) do |_nzb_url|
+    request.define_singleton_method(:add_manual_nzb!) do |_nzb_url, **|
       raise ActiveRecord::RecordNotUnique, "duplicate"
     end
     finder = Object.new
@@ -1820,16 +1993,16 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     assert_response :not_found
   end
 
-  test "destroy rejects non-cancellable status" do
-    # Only completed requests cannot be cancelled
+  test "destroy deletes completed history without allowing cancellation" do
     @pending_request.update!(status: :completed)
 
-    assert_no_difference "Request.count" do
+    assert_not @pending_request.can_be_cancelled?
+    assert_difference "Request.count", -1 do
       delete request_path(@pending_request)
     end
 
-    assert_redirected_to request_path(@pending_request)
-    assert_includes flash[:alert], "Cannot cancel"
+    assert_redirected_to requests_path
+    assert_equal "Request deleted. Library files were kept.", flash[:notice]
   end
 
   test "user cannot cancel another user's request" do
@@ -1844,9 +2017,7 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     assert_response :not_found
   end
 
-  # Retry tests
   test "retry requires admin" do
-    # Regular user should be rejected
     post retry_request_path(@failed_request)
 
     assert_response :redirect
@@ -1901,7 +2072,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     sign_out
     sign_in_as(@admin)
 
-    # Set referer header to simulate coming from requests index
     post retry_request_path(@failed_request), headers: { "HTTP_REFERER" => requests_path }
 
     assert_redirected_to requests_path
@@ -1922,7 +2092,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
-  # Download tests
   test "download requires authentication" do
     sign_out
     book = books(:audiobook_acquired)
@@ -1955,7 +2124,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     temp_file = File.join(temp_dir, "test_audiobook.m4b")
     File.write(temp_file, "test audio content")
 
-    # Set output path to temp dir for path validation
     SettingsService.set(:audiobook_output_path, temp_dir)
 
     book = Book.create!(
@@ -2213,6 +2381,9 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     File.binwrite(target, "archived debrid audio")
     File.symlink(target, File.join(book_directory, "book.m4b"))
     File.binwrite(File.join(book_directory, "cover.txt"), "regular sidecar")
+    companion = File.join(temp_dir, "companion.epub")
+    File.binwrite(companion, "companion ebook outside audio provenance")
+    File.symlink(companion, File.join(book_directory, "companion.epub"))
     content_root_stat = File.lstat(content_root)
     SettingsService.set(:audiobook_output_path, output_root)
     book = Book.create!(
@@ -2577,7 +2748,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     File.write(File.join(book_dir, "part1.m4b"), "audio part 1")
     File.write(File.join(book_dir, "part2.m4b"), "audio part 2")
 
-    # Set output path to temp dir for path validation
     SettingsService.set(:audiobook_output_path, temp_dir)
 
     book = Book.create!(
@@ -2862,7 +3032,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     temp_file = File.join(temp_dir, "test.m4b")
     File.write(temp_file, "content")
 
-    # Set output path to temp dir for path validation
     SettingsService.set(:audiobook_output_path, temp_dir)
 
     book = Book.create!(
@@ -2888,7 +3057,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     temp_file = File.join(temp_dir, "test.m4b")
     File.write(temp_file, "content")
 
-    # Set output path to temp dir for path validation
     SettingsService.set(:audiobook_output_path, temp_dir)
 
     book = Book.create!(
@@ -2909,7 +3077,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     sign_out
     sign_in_as(@admin)
 
-    # 1. Test auto-discovery (all settings blank)
     SettingsService.set(:audiobookshelf_audiobook_library_id, "")
     SettingsService.set(:audiobookshelf_ebook_library_id, "")
     SettingsService.set(:audiobookshelf_comicbook_library_id, "")
@@ -2920,7 +3087,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     book = Book.create!(title: "Discovery Book", author: "Discovery Author", book_type: :ebook)
     Request.create!(book: book, user: @user)
 
-    # Create a library item that matches
     LibraryItem.create!(
       library_platform: "audiobookshelf",
       library_id: "discovered-lib-id",
@@ -2937,7 +3103,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     assert_equal 1, matches[book.id].size
     assert_equal "Discovery Book", matches[book.id].first.item.title
 
-    # 2. Test comic fallback to ebook library when no comic library configured
     SettingsService.set(:audiobookshelf_audiobook_library_id, "lib-audio")
     SettingsService.set(:audiobookshelf_ebook_library_id, "lib-ebook")
     SettingsService.set(:audiobookshelf_comicbook_library_id, "")
@@ -2945,7 +3110,6 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     comic_book = Book.create!(title: "Comic Title", author: "Comic Author", book_type: :comicbook)
     Request.create!(book: comic_book, user: @user)
 
-    # Create matching library item in lib-ebook library
     LibraryItem.create!(
       library_platform: "audiobookshelf",
       library_id: "lib-ebook",
@@ -2960,6 +3124,29 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
     matches = @controller.instance_variable_get(:@library_matches_by_book)
     assert_equal 1, matches[comic_book.id].size
     assert_equal "Comic Title", matches[comic_book.id].first.item.title
+  end
+
+  test "request page explains an out of range file size the same way as other score adjustments" do
+    sign_out
+    sign_in_as(@admin)
+    search_results(:pending_result).update!(
+      confidence_score: 55,
+      score_breakdown: {
+        preference_adjustment: -6,
+        file_size_adjustment: -40,
+        file_size_status: "below_min",
+        auto_select_allowed: false
+      }
+    )
+
+    get request_path(@pending_request)
+
+    assert_response :success
+    assert_match "Score: 55%", response.body
+    assert_match "Pref -6", response.body
+    assert_match "Size -40 (too small)", response.body
+    assert_match "Smaller than the configured minimum file size", response.body
+    assert_match "Manual review", response.body
   end
 
   private
@@ -3000,6 +3187,20 @@ class RequestsControllerTest < ActionDispatch::IntegrationTest
       acquisition_reservation_owner_id: download.id
     )
     download.update!(direct_reservation_token: token)
+  end
+
+  def book_request_params(work_id, title: "Both Formats")
+    {
+      work_id: work_id,
+      title: title,
+      author: "Owner"
+    }
+  end
+
+  def post_both_formats(work_id, title:)
+    MetadataService.stub(:book_details, nil) do
+      post requests_path, params: book_request_params(work_id, title: title).merge(book_type: "both")
+    end
   end
 
   def create_store_offer

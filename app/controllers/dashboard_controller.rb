@@ -6,7 +6,6 @@ class DashboardController < ApplicationController
     @attention_needed = Current.user.admin? ? Request.needs_attention.count : Request.for_user(Current.user).needs_attention.count
     @system_health = SystemHealth.all.index_by(&:service)
 
-    # Recent activity for dashboard cards
     @recent_books = Book.acquired.order(updated_at: :desc).limit(10)
     @routed_book_ids = if Current.user.routing_configured?
       Current.user.user_book_paths.where(book_id: @recent_books.map(&:id)).pluck(:book_id).to_set

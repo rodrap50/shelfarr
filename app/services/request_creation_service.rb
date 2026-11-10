@@ -23,7 +23,7 @@ class RequestCreationService
     end
   end
 
-  def initialize(user:, work_id:, book_types:, metadata_attrs: {}, notes: nil, language: nil, origin: {}, source_work_ids: nil, collection_item_ids: nil, expand_collection: false)
+  def initialize(user:, work_id:, book_types:, metadata_attrs: {}, notes: nil, language: nil, origin: {}, source_work_ids: nil, collection_item_ids: nil, expand_collection: false, lookup_metadata: true)
     @user = user
     @work_id = work_id.to_s.strip
     @source_work_ids = BookMetadataLookupService.normalize_work_ids([ @work_id, *Array(source_work_ids) ])
@@ -35,6 +35,9 @@ class RequestCreationService
     @origin = origin.to_h.symbolize_keys
     @collection_item_ids = Array(collection_item_ids).compact_blank.map(&:to_s).uniq
     @expand_collection = expand_collection
+    # Callers that already hold provider metadata (e.g. Hardcover imports)
+    # skip the per-book detail lookup to avoid spending API budget twice.
+    @lookup_metadata = lookup_metadata
   end
 
   def call
@@ -120,10 +123,17 @@ class RequestCreationService
   end
 
   def normalize_book_types(value)
-    Array(value).flatten.filter_map do |book_type|
+    Array(value).flatten.flat_map { |book_type| expand_requested_book_type(book_type) }.filter_map do |book_type|
       normalized = book_type.to_s.strip
       normalized if Book.book_types.key?(normalized)
     end.uniq
+  end
+
+  # "both" is an ebook request and an audiobook request, not a third format.
+  def expand_requested_book_type(book_type)
+    return %w[audiobook ebook] if book_type.to_s.strip == "both"
+
+    book_type
   end
 
   def normalize_metadata_attrs(attrs, fallback_content_kind: nil, source_ids: source_work_ids)
@@ -212,7 +222,7 @@ class RequestCreationService
       work_id: input.work_id,
       source_work_ids: input.source_work_ids,
       fallback_attrs: fallback_attrs(input.metadata_attrs),
-      lookup_details: !collection_request?
+      lookup_details: @lookup_metadata && !collection_request?
     )
 
     book

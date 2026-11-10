@@ -22,7 +22,6 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
 
   test "add_torrent adds magnet and returns id" do
     VCR.turned_off do
-      # Login (auth.login)
       stub_request(:post, "http://localhost:8112/json")
         .with(body: /"auth.login"/)
         .to_return(
@@ -31,7 +30,6 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
           body: { result: true, error: nil, id: 1 }.to_json
         )
 
-      # session state before add
       stub_request(:post, "http://localhost:8112/json")
         .with(body: /"core.get_session_state"/)
         .to_return(
@@ -40,7 +38,6 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
           body: { result: [ "known_torrent_id" ], error: nil, id: 1 }.to_json
         )
 
-      # add_torrent_magnet returns id directly
       stub_request(:post, "http://localhost:8112/json")
         .with(body: /"core.add_torrent_magnet"/)
         .to_return(
@@ -421,7 +418,6 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
 
   test "list_torrents returns array of TorrentInfo" do
     VCR.turned_off do
-      # Login (auth.login)
       stub_request(:post, "http://localhost:8112/json")
         .with(body: /"auth.login"/)
         .to_return(
@@ -430,7 +426,6 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
           body: { result: true, error: nil, id: 1 }.to_json
         )
 
-      # session state for test_connection + status call
       stub_request(:post, "http://localhost:8112/json")
         .with(body: /"core.get_torrents_status"/)
         .to_return(
@@ -440,7 +435,7 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
             result: {
               "existing_torrent" => {
                 "name" => "Test Torrent",
-                "progress" => 0.5,
+                "progress" => 50.0,
                 "state" => "Downloading",
                 "total_size" => 1073741824,
                 "save_path" => "/downloads/Test Torrent"
@@ -451,7 +446,6 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
           }.to_json
         )
 
-      # test_connection calls get_session_state indirectly
       stub_request(:post, "http://localhost:8112/json")
         .with(body: /"core.get_session_state"/)
         .to_return(
@@ -475,7 +469,6 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
 
   test "test_connection returns true on success" do
     VCR.turned_off do
-      # Login (auth.login)
       stub_request(:post, "http://localhost:8112/json")
         .with(body: /"auth.login"/)
         .to_return(
@@ -658,7 +651,7 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
       stub_deluge_rpc("core.get_enabled_plugins", [])
       stub_deluge_rpc("core.get_available_plugins", [])
 
-      assert_not client.test_connection
+      assert RemoteResult.failed?(client.test_connection)
     end
   end
 
@@ -713,7 +706,7 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
             result: {
               "known_torrent" => {
                 "name" => "Info Torrent",
-                "progress" => 1.0,
+                "progress" => 100.0,
                 "state" => "Seeding",
                 "total_size" => 2048,
                 "download_location" => "/downloads",
@@ -734,10 +727,72 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
     end
   end
 
+  test "torrent_info treats finished paused and stopped torrents as completed" do
+    VCR.turned_off do
+      stub_deluge_login
+
+      {
+        "seeding-hash" => [ "Seeding", 100 ],
+        "paused-hash" => [ "Paused", 100 ],
+        "stopped-hash" => [ "Stopped", 100 ],
+        "paused-download-hash" => [ "PausedDownload", 100 ],
+        "paused-upload-hash" => [ "PausedUpload", 100 ]
+      }.each do |torrent_id, (state, progress)|
+        stub_deluge_torrent_status(torrent_id, state: state, progress: progress)
+
+        info = @client.torrent_info(torrent_id)
+
+        assert_not_nil info, "#{state} at #{progress}% should return torrent info"
+        assert info.completed?, "#{state} at #{progress}% should be completed, got #{info.state}"
+        assert_equal :completed, info.state
+        assert_equal 100, info.progress
+      end
+    end
+  end
+
+  test "torrent_info does not treat incomplete paused or error torrents as completed" do
+    VCR.turned_off do
+      stub_deluge_login
+
+      {
+        "paused-partial-hash" => [ "Paused", 50, :paused ],
+        "stopped-partial-hash" => [ "Stopped", 42, :paused ],
+        "error-hash" => [ "Error", 100, :failed ],
+        "error-pause-hash" => [ "ErrorPause", 100, :failed ]
+      }.each do |torrent_id, (state, progress, expected_state)|
+        stub_deluge_torrent_status(torrent_id, state: state, progress: progress)
+
+        info = @client.torrent_info(torrent_id)
+
+        assert_not_nil info, "#{state} at #{progress}% should return torrent info"
+        assert_not info.completed?, "#{state} at #{progress}% should not be completed"
+        assert_equal expected_state, info.state
+      end
+    end
+  end
+
   test "torrent download path appends a name matching the download root basename" do
     data = { "download_location" => "/downloads/shelfarr", "name" => "shelfarr" }
 
     assert_equal "/downloads/shelfarr/shelfarr", @client.send(:torrent_download_path, data)
+  end
+
+  test "torrent_info keeps incomplete paused percentages below completion even when display rounds up" do
+    VCR.turned_off do
+      stub_deluge_login
+
+      %w[Paused PausedDownload PausedUpload Stopped].each do |state|
+        [ 0.5, 1.0, 99.49, 99.5, 99.99 ].each do |progress|
+          stub_deluge_torrent_status("partial", state: state, progress: progress)
+
+          info = @client.torrent_info("partial")
+
+          assert_equal :paused, info.state, "#{state} at #{progress}% must remain paused"
+          assert_equal progress.round, info.progress
+          assert_not info.completed?
+        end
+      end
+    end
   end
 
   test "remove_torrent returns true on success" do
@@ -880,6 +935,39 @@ class DownloadClients::DelugeTest < ActiveSupport::TestCase
   end
 
   private
+
+  def stub_deluge_login
+    stub_request(:post, "http://localhost:8112/json")
+      .with(body: /"auth.login"/)
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json", "Set-Cookie" => "sessionid=test_session_id; Path=/" },
+        body: { result: true, error: nil, id: 1 }.to_json
+      )
+  end
+
+  def stub_deluge_torrent_status(torrent_id, state:, progress:)
+    stub_request(:post, "http://localhost:8112/json")
+      .with(body: /"core.get_torrents_status"/)
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: {
+          result: {
+            torrent_id => {
+              "name" => "Finished Book",
+              "progress" => progress,
+              "state" => state,
+              "total_size" => 2048,
+              "download_location" => "/downloads",
+              "save_path" => "/legacy-downloads"
+            }
+          },
+          error: nil,
+          id: 1
+        }.to_json
+      )
+  end
 
   def stub_deluge_rpc(method, result, params: nil, error: nil)
     stub_request(:post, "http://localhost:8112/json")

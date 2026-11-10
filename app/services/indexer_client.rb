@@ -25,7 +25,11 @@ class IndexerClient
     end
 
     def test_connection
-      current&.test_connection || false
+      result = current&.test_connection
+      return false if result.nil?
+      return result if RemoteResult.failed?(result)
+
+      result || false
     end
 
     def reset_connection!
@@ -34,6 +38,10 @@ class IndexerClient
 
     def reset_all_connections!
       PROVIDERS.values.each(&:reset_connection!)
+    end
+
+    def release_unconfigured_connections!
+      PROVIDERS.each_value(&:release_unconfigured_connection!)
     end
 
     def display_name

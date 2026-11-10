@@ -338,6 +338,55 @@ class RequestTest < ActiveSupport::TestCase
     assert_nothing_raised { request.destroy! }
   end
 
+  test "reopening a completed request drops a legacy import owner" do
+    book = Book.create!(title: "Legacy reopen", book_type: :ebook, file_path: "/ebooks/legacy-reopen")
+    request = Request.create!(book: book, user: users(:one), status: :completed)
+    download = request.downloads.create!(
+      name: "Legacy reopen",
+      status: :completed,
+      post_processing_job_id: "legacy-success-owner"
+    )
+    result = request.search_results.create!(
+      guid: "legacy-reopen",
+      title: "Legacy reopen other format",
+      download_url: "https://example.com/legacy-reopen.epub",
+      status: :pending
+    )
+
+    request.select_result!(result)
+
+    assert_nil download.reload.post_processing_job_id
+    assert request.reload.downloading?
+    assert_not request.post_processing_recovery_pending?
+    assert_not book.reload.post_processing_recovery_pending?
+  end
+
+  test "reopening a completed request keeps a source cleanup claim" do
+    book = Book.create!(title: "Cleanup reopen", book_type: :ebook, file_path: "/ebooks/cleanup-reopen")
+    request = Request.create!(book: book, user: users(:one), status: :completed)
+    download = request.downloads.create!(
+      name: "Cleanup reopen",
+      status: :completed,
+      post_processing_job_id: "cleanup-owner",
+      post_processing_cleanup_state: '{"version":1}'
+    )
+    result = request.search_results.create!(
+      guid: "cleanup-reopen",
+      title: "Cleanup reopen other format",
+      download_url: "https://example.com/cleanup-reopen.epub",
+      status: :pending
+    )
+
+    request.select_result!(result)
+
+    download.reload
+    assert_equal "cleanup-owner", download.post_processing_job_id
+    assert_equal '{"version":1}', download.post_processing_cleanup_state
+    assert request.reload.downloading?
+    assert request.post_processing_recovery_pending?
+    assert book.reload.post_processing_recovery_pending?
+  end
+
   test "completed source cleanup state blocks request destruction" do
     request = Request.create!(
       book: Book.create!(title: "Completed cleanup", book_type: :ebook),
@@ -434,5 +483,192 @@ class RequestTest < ActiveSupport::TestCase
 
     assert_match(/completed status/i, error.message)
     assert request.reload.completed?
+  end
+
+  test "a live library copy blocks result selection and keeps the importer owner" do
+    book = Book.create!(title: "Live Import", author: "Ada Lovelace", book_type: :ebook)
+    request = Request.create!(book: book, user: users(:one), status: :downloading)
+    source = nil
+    library = nil
+    owner_id = nil
+    queue_job = nil
+    reached_copy = false
+    original_queue_config = SolidQueue::Record.connection_db_config
+
+    Dir.mktmpdir do |root|
+      download_root = File.join(root, "downloads")
+      source = File.join(download_root, "source")
+      library = File.join(root, "library")
+      FileUtils.mkdir_p(source)
+      FileUtils.mkdir_p(library)
+      File.binwrite(File.join(source, "Example.pdf"), "%PDF-1.7\n%live import\n")
+
+      SettingsService.set(:completed_download_import_mode, "copy")
+      SettingsService.set(:download_local_path, download_root)
+      SettingsService.set(:ebook_output_path, library)
+      SettingsService.set(:ebook_path_template, "")
+      SettingsService.set(:ebook_filename_template, "{author} - {title}")
+      SettingsService.set(:audiobookshelf_url, "")
+
+      pdf = request.search_results.create!(
+        guid: "torrent:live-import-pdf",
+        title: "Live Import [PDF]",
+        indexer: "Test",
+        download_url: "https://example.test/live-import.torrent",
+        seeders: 4,
+        size_bytes: 5_000_000,
+        status: :selected
+      )
+      epub = request.search_results.create!(
+        guid: "gutenberg:live-import",
+        title: "Live Import [EPUB]",
+        indexer: "Project Gutenberg",
+        source: SearchResult::SOURCE_GUTENBERG,
+        download_url: "https://www.gutenberg.org/ebooks/1.epub3.images?download=1",
+        size_bytes: 80_000,
+        status: :pending
+      )
+      download = request.downloads.create!(
+        name: pdf.title,
+        search_result: pdf,
+        status: :completed,
+        download_path: source,
+        size_bytes: pdf.size_bytes,
+        progress: 100
+      )
+      real_copy = FileCopyService.method(:cp_noreplace)
+      pausing_copy = lambda do |src, dest, **options|
+        unless reached_copy
+          reached_copy = true
+          download.reload
+          request.reload
+          owner_id = download.post_processing_job_id
+          assert request.processing?
+          assert owner_id.present?
+
+          # The copy does not touch the download row. The worker's Solid Queue
+          # record stays unfinished until that worker returns.
+          SolidQueue::Record.establish_connection(:queue)
+          queue_job = SolidQueue::Job.create!(
+            active_job_id: owner_id,
+            class_name: "PostProcessingJob",
+            queue_name: "default",
+            arguments: { "job_class" => "PostProcessingJob", "arguments" => [] },
+            priority: 0,
+            scheduled_at: Time.current
+          )
+
+          error = assert_raises(ArgumentError, "live import must reject result selection") do
+            request.select_result!(epub)
+          end
+          assert_match(/library import is still running/i, error.message)
+          assert_equal owner_id, download.reload.post_processing_job_id
+          assert request.reload.processing?
+          assert_equal 1, request.downloads.count
+
+          request.update!(status: :completed, completed_at: Time.current)
+          assert request.post_processing_recovery_pending?
+          assert book.reload.post_processing_recovery_pending?
+
+          error = assert_raises(ArgumentError, "reopening must not retire a live importer") do
+            request.select_result!(epub)
+          end
+          assert_match(/library import is still running/i, error.message)
+          assert_equal owner_id, download.reload.post_processing_job_id
+          assert_equal 1, request.downloads.count
+
+          destroyed = assert_raises(ActiveRecord::RecordNotDestroyed) { request.destroy! }
+          assert_match(/post-processing/i, destroyed.record.errors.full_messages.to_sentence)
+          assert Download.exists?(download.id)
+
+          request.reload.update!(status: :processing, completed_at: nil)
+        end
+        real_copy.call(src, dest, **options)
+      end
+
+      LibraryPlatformClient.stub(:configured?, false) do
+        NotificationService.stub(:request_completed, ->(_request) { true }) do
+          FileCopyService.stub(:cp_noreplace, pausing_copy) do
+            PostProcessingJob.perform_now(download.id)
+          end
+        end
+      end
+
+      assert reached_copy, "import never reached the library copy: #{request.reload.issue_description}"
+      assert request.reload.completed?
+      assert_nil download.reload.post_processing_job_id
+      assert_equal File.join(library, "Ada Lovelace - Live Import.pdf"), book.reload.file_path
+      assert File.exist?(book.file_path)
+      assert_equal 1, request.downloads.count
+    end
+  ensure
+    if queue_job
+      SolidQueue::ReadyExecution.where(job_id: queue_job.id).delete_all
+      SolidQueue::ScheduledExecution.where(job_id: queue_job.id).delete_all
+      SolidQueue::ClaimedExecution.where(job_id: queue_job.id).delete_all
+      SolidQueue::BlockedExecution.where(job_id: queue_job.id).delete_all
+      SolidQueue::FailedExecution.where(job_id: queue_job.id).delete_all
+      queue_job.delete
+    end
+    SolidQueue::Record.establish_connection(original_queue_config) if original_queue_config
+  end
+
+  test "a live direct replacement lease blocks retirement from another request" do
+    Dir.mktmpdir do |root|
+      library = File.join(root, "audiobooks")
+      FileUtils.mkdir_p(library)
+      SettingsService.set(:audiobook_output_path, library)
+      old_dir = File.join(library, "Ada", "Title")
+      isolated = File.join(library, "Ada", "Title (2)")
+      published = File.join(isolated, "01.mp3")
+      FileUtils.mkdir_p(old_dir)
+      FileUtils.mkdir_p(isolated)
+      File.binwrite(File.join(old_dir, "old.mp3"), "old audio")
+      File.binwrite(published, "new track")
+      book = Book.create!(title: "Title", author: "Ada", book_type: :audiobook, file_path: old_dir)
+      earlier = Request.create!(book: book, user: users(:one), status: :failed)
+      other = earlier.search_results.create!(
+        guid: "direct-lease-other",
+        title: "Other release",
+        indexer: "Test",
+        download_url: "https://example.com/other.torrent",
+        status: :pending
+      )
+      later = Request.create!(book: book, user: users(:one), status: :downloading)
+      result = later.search_results.create!(
+        guid: "direct-lease-current",
+        title: "Current release",
+        indexer: "Test",
+        download_url: "https://example.com/current.torrent",
+        status: :selected
+      )
+      live = later.downloads.create!(
+        name: "Current release",
+        search_result: result,
+        status: :downloading,
+        download_type: "direct",
+        direct_staging_path: File.join(library, ".shelfarr-staging-v2", "direct-downloads", "download"),
+        replace_library_file: true,
+        library_replacement_state: JSON.generate(
+          "previous_path" => old_dir,
+          "destination" => isolated,
+          "book_path" => isolated,
+          "layout" => "directory",
+          "cleanup_pending" => true,
+          "published_paths" => [ published ]
+        )
+      )
+      live.touch
+
+      error = assert_raises(ArgumentError) do
+        earlier.select_result!(other, replace_library_file: true)
+      end
+
+      assert_match(/library file/i, error.message)
+      assert_equal "new track", File.binread(published)
+      assert_includes live.reload.library_replacement_state.to_s, published
+      assert_equal "old audio", File.binread(File.join(old_dir, "old.mp3"))
+      assert_equal 0, earlier.downloads.count
+    end
   end
 end

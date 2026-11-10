@@ -117,6 +117,21 @@ class OwnedMediaImportFileServiceTest < ActiveSupport::TestCase
     assert_equal "durable audiobook bytes", File.binread(destination)
   end
 
+  test "applies configured library import modes after the staging link is removed" do
+    SettingsService.set(:library_import_file_mode, "0664")
+    SettingsService.set(:library_import_folder_mode, "0775")
+    root_mode = File.stat(@output_root).mode & 0o777
+    service = persistent_service
+    result = service.with_destination_lock { service.finalize! }
+    destination = @media_import.reload.destination_path
+
+    assert_equal File.dirname(destination), result
+    assert_not File.exist?(@upload.reload.file_path)
+    assert_equal 0o664, File.stat(destination).mode & 0o777
+    assert_equal 0o775, File.stat(File.dirname(destination)).mode & 0o777
+    assert_equal root_mode, File.stat(@output_root).mode & 0o777
+  end
+
   test "reconciles a hard exit after staging unlink but before the database commit" do
     service = persistent_service
     result = service.with_destination_lock { service.finalize! }
@@ -476,6 +491,37 @@ class OwnedMediaImportFileServiceTest < ActiveSupport::TestCase
     assert_equal "#{File.dirname(first_destination)} (2)",
       File.dirname(second_import.reload.destination_path)
     assert_not_equal first_destination, second_import.destination_path
+  end
+
+  test "shares a completed ebook folder when audiobook uses the same root and template" do
+    SettingsService.set(:ebook_output_path, @output_root)
+    SettingsService.set(:ebook_path_template, "{series/}{seriesNum:00 - }{title}")
+    SettingsService.set(:audiobook_path_template, "{series/}{seriesNum:00 - }{title}")
+    @book.update!(
+      title: "The Final Empire",
+      series: "Mistborn",
+      series_position: "1"
+    )
+
+    shared_folder = File.join(File.realpath(@output_root), "Mistborn", "01 - The Final Empire")
+    FileUtils.mkdir_p(shared_folder)
+    File.binwrite(File.join(shared_folder, "Safe Author - The Final Empire.epub"), "ebook bytes")
+    Book.create!(
+      title: @book.title,
+      author: @book.author,
+      series: @book.series,
+      series_position: @book.series_position,
+      book_type: :ebook,
+      file_path: shared_folder
+    )
+
+    service = persistent_service
+    service.with_destination_lock { }
+
+    assert_equal shared_folder, @media_import.reload.library_path
+    assert_equal File.join(shared_folder, "Safe Author - The Final Empire.m4b"),
+      @media_import.destination_path
+    assert_no_match(/ \(2\)/, @media_import.library_path)
   end
 
   test "different filenames cannot reserve the same directory-mode library path" do

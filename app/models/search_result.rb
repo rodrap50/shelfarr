@@ -13,7 +13,6 @@ class SearchResult < ApplicationRecord
     rejected: 2
   }
 
-  # Source constants
   SOURCE_PROWLARR = "prowlarr"
   SOURCE_JACKETT = "jackett"
   SOURCE_NEWZNAB = "newznab"
@@ -116,14 +115,10 @@ class SearchResult < ApplicationRecord
     magnet_url.presence || download_url
   end
 
-  # Check if this is a usenet/NZB result
-  # Usenet results have: download URL, no magnet URL, no seeders
-  # Torrent results have: magnet URL or seeders count
   def usenet?
     download_url.present? && magnet_url.blank? && seeders.nil?
   end
 
-  # Check if this is a torrent result
   def torrent?
     magnet_url.present? || (download_url.present? && !usenet?)
   end
@@ -233,7 +228,35 @@ class SearchResult < ApplicationRecord
     score_detail(:preference_adjustment).to_i
   end
 
-  # Source helpers
+  def file_size_adjustment
+    score_detail(:file_size_adjustment).to_i
+  end
+
+  def file_size_limit_status
+    status = score_detail(:file_size_status)
+    status.present? ? status.to_sym : nil
+  end
+
+  def file_size_adjustment_label
+    adjustment = file_size_adjustment
+    return nil if adjustment.zero?
+
+    reason = case file_size_limit_status
+    when :below_min then "too small"
+    when :above_max then "too large"
+    end
+    reason ? "Size #{adjustment} (#{reason})" : "Size #{adjustment}"
+  end
+
+  def file_size_limit_explanation
+    case file_size_limit_status
+    when :below_min
+      "Smaller than the configured minimum file size"
+    when :above_max
+      "Larger than the configured maximum file size"
+    end
+  end
+
   def from_prowlarr?
     source == SOURCE_PROWLARR || source.blank?
   end

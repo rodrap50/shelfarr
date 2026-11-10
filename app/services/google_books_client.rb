@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-# Client for interacting with the Google Books Volumes API
-# https://developers.google.com/books/docs/v1/using
 class GoogleBooksClient
   BASE_URL = "https://www.googleapis.com"
   MAX_RESULTS = 40
@@ -90,7 +88,7 @@ class GoogleBooksClient
       true
     rescue Error => e
       Rails.logger.error "[GoogleBooksClient] Connection test failed: #{e.message}"
-      false
+      RemoteResult::Failed.new(e)
     end
 
     def reset_connection!

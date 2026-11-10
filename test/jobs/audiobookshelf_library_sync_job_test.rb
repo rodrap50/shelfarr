@@ -173,6 +173,74 @@ class AudiobookshelfLibrarySyncJobTest < ActiveJob::TestCase
     end
   end
 
+  test "a claimed scheduler lease survives concurrency maintenance past 10 minutes" do
+    SolidQueue::Record.establish_connection(:queue)
+    key = HardcoverSyncSchedulerJob.new.concurrency_key
+    assert_includes AudiobookshelfLibrarySyncJob::ConcurrencyLease::KEYS, key
+    assert_includes AudiobookshelfLibrarySyncJob::ConcurrencyLease::KEYS, AudiobookshelfLibrarySyncJob.new.concurrency_key
+
+    process = SolidQueue::Process.register(
+      kind: "Worker",
+      name: "scheduler-lease-#{SecureRandom.hex(4)}",
+      pid: Process.pid,
+      hostname: "test",
+      metadata: {}
+    )
+    active_job = HardcoverSyncSchedulerJob.new
+    job = SolidQueue::Job.create!(
+      active_job_id: active_job.job_id,
+      class_name: "HardcoverSyncSchedulerJob",
+      queue_name: "default",
+      arguments: active_job.serialize,
+      concurrency_key: key,
+      scheduled_at: Time.current
+    )
+    SolidQueue::ClaimedExecution.create!(job: job, process: process)
+    SolidQueue::Semaphore.where(key: key).delete_all
+    SolidQueue::Semaphore.create!(key: key, value: 0, expires_at: Time.current)
+
+    leap = [ HardcoverSyncSchedulerJob.concurrency_duration + 5.seconds, 10.minutes + 5.seconds ].max
+    assert_operator leap, :>, 10.minutes
+    travel leap do
+      SolidQueue::Dispatcher::ConcurrencyMaintenance.new(5.minutes, 500).send(:expire_semaphores)
+      assert SolidQueue::Semaphore.exists?(key: key)
+    end
+  ensure
+    if defined?(job) && job
+      SolidQueue::ClaimedExecution.where(job_id: job.id).delete_all
+      job.delete
+    end
+    process&.destroy
+    SolidQueue::Semaphore.where(key: key).delete_all if defined?(key) && key
+  end
+
+  test "an overdue post-scan refresh keeps its place when another import finishes" do
+    SettingsService.set(:audiobookshelf_library_sync_interval, 0)
+    start = Time.zone.parse("2026-08-26 12:00:00")
+    original = nil
+
+    with_solid_queue_library_sync do
+      travel_to start do
+        AudiobookshelfLibrarySyncJob.schedule_post_scan_refresh!
+        original = unfinished_library_syncs.sole
+      end
+
+      assert_equal(
+        (start + AudiobookshelfLibrarySyncJob::POST_SCAN_REFRESH_WAIT).to_i,
+        original.scheduled_at.to_i
+      )
+
+      travel_to start + 100.seconds do
+        Rails.cache.delete(AudiobookshelfLibrarySyncJob::POST_SCAN_REFRESH_CACHE_KEY)
+        AudiobookshelfLibrarySyncJob.schedule_post_scan_refresh!
+      end
+
+      kept = unfinished_library_syncs.to_a
+      assert_equal [ original.id ], kept.map(&:id)
+      assert_equal original.scheduled_at.to_i, kept.sole.scheduled_at.to_i
+    end
+  end
+
   test "post-scan refresh is a no-op when no platform is configured" do
     SettingsService.set(:audiobookshelf_url, "")
     SettingsService.set(:audiobookshelf_api_key, "")
@@ -201,5 +269,467 @@ class AudiobookshelfLibrarySyncJobTest < ActiveJob::TestCase
   def with_post_scan_refresh_cache
     Rails.cache.clear
     yield
+  end
+
+  def with_solid_queue_library_sync
+    original_adapter = ActiveJob::Base.queue_adapter
+    original_config = SolidQueue::Record.connection_db_config
+    SolidQueue::Record.establish_connection(:queue)
+    ActiveJob::Base.queue_adapter = :solid_queue
+    clear_library_sync_jobs!
+    yield
+  ensure
+    clear_library_sync_jobs! if defined?(original_config) && original_config
+    ActiveJob::Base.queue_adapter = original_adapter if defined?(original_adapter)
+    SolidQueue::Record.establish_connection(original_config) if defined?(original_config) && original_config
+  end
+
+  def unfinished_library_syncs
+    SolidQueue::Job.where(class_name: "AudiobookshelfLibrarySyncJob", finished_at: nil)
+  end
+
+  def clear_library_sync_jobs!
+    ids = SolidQueue::Job.where(class_name: "AudiobookshelfLibrarySyncJob").pluck(:id)
+    return if ids.empty?
+
+    [
+      SolidQueue::ReadyExecution,
+      SolidQueue::ScheduledExecution,
+      SolidQueue::ClaimedExecution,
+      SolidQueue::FailedExecution,
+      SolidQueue::RecurringExecution,
+      SolidQueue::BlockedExecution
+    ].each do |execution|
+      execution.where(job_id: ids).delete_all
+    end
+    SolidQueue::Job.where(id: ids).delete_all
+  end
+end
+
+class AudiobookshelfLibrarySyncOverlapTest < ActiveJob::TestCase
+  self.use_transactional_tests = false
+
+  setup do
+    @sync_queue = "library-sync-overlap-#{SecureRandom.hex(8)}"
+    @original_cache = Rails.cache
+    Rails.cache = ActiveSupport::Cache::MemoryStore.new
+    SettingsService.set(:audiobookshelf_url, "http://localhost:13378")
+    SettingsService.set(:audiobookshelf_api_key, "test-api-key")
+    SettingsService.set(:audiobookshelf_audiobook_library_id, "lib-audio")
+    SettingsService.set(:audiobookshelf_ebook_library_id, "")
+    SettingsService.set(:audiobookshelf_library_sync_interval, 3600)
+  end
+
+  teardown do
+    restore_test_adapter!
+    Rails.cache = @original_cache
+  end
+
+  test "a second sync does not enter the library request after the concurrency lease" do
+    LibraryItem.where(audiobookshelf_id: "ab-keep").delete_all
+    LibraryItem.create!(
+      library_platform: "audiobookshelf",
+      library_id: "lib-audio",
+      audiobookshelf_id: "ab-keep",
+      title: "Kept Title",
+      missing: false
+    )
+    entered = Queue.new
+    release = Queue.new
+    gate = Mutex.new
+    inside = 0
+    max_inside = 0
+    unrelated_job = nil
+
+    VCR.turned_off do
+      stub_request(:get, %r{/api/libraries/lib-audio/items}).to_return do
+        gate.synchronize do
+          inside += 1
+          max_inside = inside if inside > max_inside
+        end
+        entered << true
+        release.pop
+        gate.synchronize { inside -= 1 }
+        {
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: {
+            "results" => [ { "id" => "ab-keep", "title" => "Kept Title", "author" => "Keeper" } ],
+            "total" => 1
+          }.to_json
+        }
+      end
+
+      with_claimed_syncs(release) do |process|
+        AudiobookshelfLibrarySyncJob.set(queue: @sync_queue).perform_later
+        start_ready_syncs(process)
+        wait_for("the first sync to enter the library request") { !entered.empty? }
+
+        AudiobookshelfLibrarySyncJob.set(queue: @sync_queue).perform_later
+        wait_for("the second sync to block on the lease") { blocked_sync? }
+
+        leap = [ AudiobookshelfLibrarySyncJob.concurrency_duration + 5.seconds, 10.minutes + 5.seconds ].max
+        assert_operator leap, :>, 10.minutes
+        travel leap do
+          # Other tests can leave real queue work behind during serial coverage.
+          # Claiming that work must not look like a released second sync.
+          unrelated_job = SolidQueue::Job.enqueue(
+            Turbo::Streams::BroadcastStreamJob.new("library-sync-overlap", content: "")
+          )
+          key = AudiobookshelfLibrarySyncJob.new.concurrency_key
+          assert SolidQueue::Semaphore.where(key: key).where(expires_at: ...Time.current).exists?
+          maintenance = SolidQueue::Dispatcher::ConcurrencyMaintenance.new(5.minutes, 500)
+          maintenance.send(:expire_semaphores)
+          maintenance.send(:unblock_blocked_executions)
+          if start_ready_syncs(process)
+            wait_for("a released sync to enter the library request") { entered.size > 1 }
+          end
+          assert_equal 1, gate.synchronize { max_inside }
+          assert blocked_sync?
+          assert SolidQueue::ReadyExecution.exists?(job_id: unrelated_job.id)
+        end
+      end
+    end
+
+    assert_equal 1, gate.synchronize { max_inside }
+    assert_equal "Kept Title", LibraryItem.find_by(audiobookshelf_id: "ab-keep")&.title
+    assert_instance_of ActiveJob::QueueAdapters::TestAdapter, ActiveJob::Base.queue_adapter
+    assert_no_enqueued_jobs only: AudiobookshelfLibrarySyncJob
+  ensure
+    release_syncs(release, 2) if defined?(release) && release
+    join_sync_threads
+    restore_test_adapter!
+    unrelated_job&.destroy!
+    LibraryItem.where(audiobookshelf_id: "ab-keep").delete_all
+  end
+
+  # The jobs process never sees the web process's reset_connection!.
+  test "scheduled sync does not contact a library platform after its settings are removed" do
+    LibraryItem.destroy_all
+    LibraryPlatformClient.reset_connections!
+    SettingsService.set(:bookorbit_url, "http://bookorbit.example:3000")
+    SettingsService.set(:bookorbit_username, "admin")
+    SettingsService.set(:bookorbit_password, "secret")
+    SettingsService.set(:grimmory_url, "http://grimmory.example:5173")
+    SettingsService.set(:grimmory_username, "admin")
+    SettingsService.set(:grimmory_password, "secret")
+
+    VCR.turned_off do
+      stub_request(:get, "http://localhost:13378/api/libraries")
+        .with(headers: { "Authorization" => "Bearer test-api-key" })
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { "libraries" => [] }.to_json
+        )
+      stub_request(:post, "http://bookorbit.example:3000/api/v1/auth/login")
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { accessToken: "bookorbit-token" }.to_json
+        )
+      stub_request(:get, "http://bookorbit.example:3000/api/v1/libraries")
+        .with(headers: { "Authorization" => "Bearer bookorbit-token" })
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: [ { "id" => 1, "name" => "Books", "folders" => [] } ].to_json
+        )
+      stub_request(:post, "http://grimmory.example:5173/api/v1/auth/login")
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { accessToken: "grimmory-token" }.to_json
+        )
+      stub_request(:get, "http://grimmory.example:5173/api/v1/libraries")
+        .with(headers: { "Authorization" => "Bearer grimmory-token" })
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: [ { "id" => "lib-1", "name" => "Books", "paths" => [], "allowedFormats" => [ "epub" ] } ].to_json
+        )
+
+      assert_empty AudiobookshelfClient.libraries
+      assert_equal "Books", BookOrbitClient.libraries.first.name
+      assert_equal "Books", GrimmoryClient.libraries.first.name
+
+      SettingsService.set(:audiobookshelf_url, "")
+      SettingsService.set(:audiobookshelf_api_key, "")
+      SettingsService.set(:bookorbit_url, "")
+      SettingsService.set(:bookorbit_username, "")
+      SettingsService.set(:bookorbit_password, "")
+      SettingsService.set(:grimmory_url, "")
+      SettingsService.set(:grimmory_username, "")
+      SettingsService.set(:grimmory_password, "")
+
+      AudiobookshelfLibrarySyncJob.perform_now(scheduled: true)
+
+      assert_requested :get, "http://localhost:13378/api/libraries", times: 1
+      assert_requested :post, "http://bookorbit.example:3000/api/v1/auth/login", times: 1
+      assert_requested :get, "http://bookorbit.example:3000/api/v1/libraries", times: 1
+      assert_requested :post, "http://grimmory.example:5173/api/v1/auth/login", times: 1
+      assert_requested :get, "http://grimmory.example:5173/api/v1/libraries", times: 1
+      assert_not_requested :get, %r{http://localhost:13378/api/libraries/.+/items}
+      assert_not_requested :post, %r{http://bookorbit\.example:3000/api/v1/libraries/.+/books}
+      assert_not_requested :get, %r{http://grimmory\.example:5173/api/v1/libraries/.+/book}
+      assert_nil AudiobookshelfClient.instance_variable_get(:@connection)
+      assert_nil AudiobookshelfClient.instance_variable_get(:@connection_settings_key)
+      assert_nil BookOrbitClient.instance_variable_get(:@connection)
+      assert_nil BookOrbitClient.instance_variable_get(:@access_token)
+      assert_nil BookOrbitClient.instance_variable_get(:@connection_configuration)
+      assert_nil GrimmoryClient.instance_variable_get(:@connection)
+      assert_nil GrimmoryClient.instance_variable_get(:@access_token)
+      assert_nil GrimmoryClient.instance_variable_get(:@connection_settings_key)
+    end
+  ensure
+    LibraryPlatformClient.reset_connections!
+    SettingsService.set(:library_platform, "audiobookshelf")
+  end
+
+  # The jobs process never sees the web process's reset_connection!.
+  test "scheduled sync keeps a configured platform after another library integration is removed" do
+    LibraryItem.destroy_all
+    LibraryPlatformClient.reset_connections!
+    SettingsService.set(:bookorbit_url, "http://bookorbit.example:3000")
+    SettingsService.set(:bookorbit_username, "admin")
+    SettingsService.set(:bookorbit_password, "secret")
+
+    VCR.turned_off do
+      stub_request(:post, "http://bookorbit.example:3000/api/v1/auth/login")
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { accessToken: "bookorbit-token" }.to_json
+        )
+        .times(1)
+      stub_request(:get, "http://bookorbit.example:3000/api/v1/libraries")
+        .with(headers: { "Authorization" => "Bearer bookorbit-token" })
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: [ { "id" => 1, "name" => "Books", "folders" => [] } ].to_json
+        )
+        .times(1)
+      assert_equal "Books", BookOrbitClient.libraries.first.name
+
+      SettingsService.set(:bookorbit_url, "")
+      SettingsService.set(:bookorbit_username, "")
+      SettingsService.set(:bookorbit_password, "")
+
+      items = stub_request(:get, "http://localhost:13378/api/libraries/lib-audio/items")
+        .with(query: hash_including("limit" => "500", "page" => "0"))
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { "results" => [], "total" => 0 }.to_json
+        )
+
+      AudiobookshelfLibrarySyncJob.perform_now(scheduled: true)
+
+      assert_requested items, times: 1
+      assert_requested :get, "http://bookorbit.example:3000/api/v1/libraries", times: 1
+      assert_nil BookOrbitClient.instance_variable_get(:@connection)
+      assert_nil BookOrbitClient.instance_variable_get(:@access_token)
+    end
+  ensure
+    LibraryPlatformClient.reset_connections!
+  end
+
+  # The jobs process never sees the web process's reset_connection!.
+  test "scheduled sync drops cached connections for removed sibling integrations" do
+    LibraryItem.destroy_all
+    SettingsService.set(:flaresolverr_url, "http://flaresolverr.example:8191")
+    SettingsService.set(:gutenberg_enabled, true)
+    SettingsService.set(:gutenberg_url, "https://gutenberg.example")
+    SettingsService.set(:librivox_enabled, true)
+    SettingsService.set(:librivox_url, "https://librivox.example")
+    SettingsService.set(:prowlarr_url, "http://prowlarr.example:9696")
+    SettingsService.set(:prowlarr_api_key, "prowlarr-key")
+    SettingsService.set(:jackett_url, "http://jackett.example:9117")
+    SettingsService.set(:jackett_api_key, "jackett-key")
+    SettingsService.set(:newznab_url, "http://newznab.example:5076")
+    SettingsService.set(:newznab_api_key, "newznab-key")
+
+    prowlarr = IndexerClients::Prowlarr.send(:connection)
+    IndexerClients::Jackett.send(:connection)
+    IndexerClients::Newznab.send(:connection)
+    FlaresolverrClient.send(:connection)
+    GutenbergClient.send(:connection)
+    LibrivoxClient.send(:connection)
+
+    SettingsService.set(:flaresolverr_url, "")
+    SettingsService.set(:gutenberg_enabled, false)
+    SettingsService.set(:librivox_url, "")
+    SettingsService.set(:jackett_api_key, "")
+    SettingsService.set(:newznab_api_key, "")
+
+    items = stub_request(:get, "http://localhost:13378/api/libraries/lib-audio/items")
+      .with(query: hash_including("limit" => "500", "page" => "0"))
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: { "results" => [], "total" => 0 }.to_json
+      )
+
+    AudiobookshelfLibrarySyncJob.perform_now(scheduled: true)
+
+    assert_requested items, times: 1
+    assert_same prowlarr, IndexerClients::Prowlarr.instance_variable_get(:@connection)
+    assert_nil IndexerClients::Jackett.instance_variable_get(:@connection)
+    assert_nil IndexerClients::Jackett.instance_variable_get(:@connection_settings_key)
+    assert_nil IndexerClients::Newznab.instance_variable_get(:@connection)
+    assert_nil IndexerClients::Newznab.instance_variable_get(:@connection_settings_key)
+    assert_nil FlaresolverrClient.instance_variable_get(:@connection)
+    assert_nil FlaresolverrClient.instance_variable_get(:@connection_settings_key)
+    assert_nil GutenbergClient.instance_variable_get(:@connection)
+    assert_nil GutenbergClient.instance_variable_get(:@connection_settings_key)
+    assert_nil LibrivoxClient.instance_variable_get(:@connection)
+    assert_nil LibrivoxClient.instance_variable_get(:@connection_settings_key)
+    assert_not_requested :post, %r{flaresolverr\.example}
+    assert_not_requested :get, %r{gutenberg\.example}
+    assert_not_requested :get, %r{librivox\.example}
+    assert_not_requested :get, %r{jackett\.example}
+    assert_not_requested :get, %r{newznab\.example}
+    assert_not_requested :get, %r{prowlarr\.example}
+  ensure
+    IndexerClient.reset_all_connections!
+    FlaresolverrClient.reset_connection!
+    GutenbergClient.reset_connection!
+    LibrivoxClient.reset_connection!
+    SettingsService.set(:flaresolverr_url, "")
+    SettingsService.set(:gutenberg_enabled, false)
+    SettingsService.set(:gutenberg_url, "https://www.gutenberg.org")
+    SettingsService.set(:librivox_enabled, false)
+    SettingsService.set(:librivox_url, "https://librivox.org")
+    SettingsService.set(:prowlarr_url, "")
+    SettingsService.set(:prowlarr_api_key, "")
+    SettingsService.set(:jackett_url, "")
+    SettingsService.set(:jackett_api_key, "")
+    SettingsService.set(:newznab_url, "")
+    SettingsService.set(:newznab_api_key, "")
+  end
+
+  private
+
+  def with_claimed_syncs(release)
+    process = nil
+    original_config = SolidQueue::Record.connection_db_config
+    SolidQueue::Record.establish_connection(:queue)
+    switch_to_solid_queue!
+    clear_sync_queue!
+    @sync_threads = []
+    @sync_thread_error = nil
+    process = SolidQueue::Process.register(
+      kind: "Worker",
+      name: "library-sync-#{SecureRandom.hex(4)}",
+      pid: Process.pid,
+      hostname: "test",
+      metadata: {}
+    )
+    yield process
+  ensure
+    begin
+      release_syncs(release, 2)
+      join_sync_threads
+      start_ready_syncs(process) if process
+      join_sync_threads
+      clear_sync_queue! if process
+      process&.deregister
+    ensure
+      SolidQueue::Record.establish_connection(original_config) if original_config
+      restore_test_adapter!
+    end
+    raise @sync_thread_error if @sync_thread_error && !$!
+  end
+
+  def switch_to_solid_queue!
+    return if @switched_adapter
+
+    @original_queue_adapter = ActiveJob::Base._queue_adapter
+    @original_test_adapter = ActiveJob::Base._test_adapter
+    @switched_adapter = true
+    ActiveJob::Base.disable_test_adapter
+    ActiveJob::Base.queue_adapter = :solid_queue
+  end
+
+  def restore_test_adapter!
+    return unless @switched_adapter
+
+    if @original_queue_adapter
+      ActiveJob::Base.queue_adapter = @original_queue_adapter
+    else
+      ActiveJob::Base.queue_adapter = :test
+    end
+    if @original_test_adapter
+      ActiveJob::Base.enable_test_adapter(@original_test_adapter)
+    else
+      ActiveJob::Base.disable_test_adapter
+    end
+    @switched_adapter = false
+  end
+
+  def start_ready_syncs(process)
+    return false unless process
+
+    claimed = SolidQueue::ReadyExecution.claim(@sync_queue, 5, process.id)
+    return false if claimed.empty?
+
+    claimed.each do |execution|
+      @sync_threads << Thread.new(execution) do |claimed_execution|
+        Thread.current.report_on_exception = false
+        Thread.current.abort_on_exception = false
+        claimed_execution.perform
+      rescue Exception => error
+        @sync_thread_error = error
+      end
+    end
+    true
+  end
+
+  def join_sync_threads
+    @sync_threads&.each(&:join)
+  end
+
+  def release_syncs(release, count)
+    return unless release
+
+    count.times { release << true }
+  end
+
+  def clear_sync_queue!
+    SolidQueue::Job.uncached do
+      jobs = SolidQueue::Job.where(class_name: "AudiobookshelfLibrarySyncJob")
+      ids = jobs.ids
+      if ids.any?
+        SolidQueue::BlockedExecution.where(job_id: ids).delete_all
+        SolidQueue::ClaimedExecution.where(job_id: ids).delete_all
+        SolidQueue::ReadyExecution.where(job_id: ids).delete_all
+        SolidQueue::FailedExecution.where(job_id: ids).delete_all
+        SolidQueue::ScheduledExecution.where(job_id: ids).delete_all
+        jobs.delete_all
+      end
+      SolidQueue::Semaphore.where(key: AudiobookshelfLibrarySyncJob.new.concurrency_key).delete_all
+    end
+  end
+
+  def blocked_sync?
+    SolidQueue::BlockedExecution.uncached do
+      SolidQueue::BlockedExecution.joins(:job)
+        .where(solid_queue_jobs: { class_name: "AudiobookshelfLibrarySyncJob" })
+        .exists?
+    end
+  end
+
+  def wait_for(description)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+    until yield
+      detail = SolidQueue::FailedExecution.joins(:job)
+        .where(solid_queue_jobs: { class_name: "AudiobookshelfLibrarySyncJob" })
+        .pluck(:error)
+        .join("\n")
+      raise "timed out waiting for #{description}\n#{detail}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      sleep 0.02
+    end
   end
 end

@@ -15,6 +15,35 @@ class RequestDownloadFailureTest < ActiveSupport::TestCase
     clear_enqueued_jobs
   end
 
+  test "handle_download_failure keeps replace_library_file on the fallback download" do
+    SettingsService.set(:auto_select_enabled, true)
+    book = Book.create!(
+      title: "Fallback Book",
+      author: "Fallback Author",
+      book_type: :ebook,
+      file_path: "/ebooks/fallback-book.epub",
+      open_library_work_id: SecureRandom.uuid
+    )
+    request = Request.create!(book: book, user: users(:one), status: :downloading, language: "en")
+    selected = create_result(request, guid: "failed-replacement", status: :selected, seeders: 100)
+    fallback = create_result(request, guid: "fallback-replacement", status: :rejected, seeders: 20)
+    failed_download = request.downloads.create!(
+      name: selected.title,
+      search_result: selected,
+      status: :failed,
+      replace_library_file: true
+    )
+
+    assert_enqueued_with(job: DownloadJob) do
+      request.handle_download_failure!(failed_download, reason: "Dead torrent")
+    end
+
+    assert fallback.reload.selected?
+    retried = request.downloads.order(:id).last
+    assert_equal fallback.id, retried.search_result_id
+    assert retried.replace_library_file?
+  end
+
   test "handle_download_failure blocklists selected release and selects next candidate" do
     SettingsService.set(:auto_select_enabled, true)
     request = build_request
@@ -167,8 +196,8 @@ class RequestDownloadFailureTest < ActiveSupport::TestCase
     assert_idle_attention_clears_downloading(request)
   end
 
-  test "blocklist_and_select_next cancels active downloads and runs selection even when auto-select is disabled" do
-    SettingsService.set(:auto_select_enabled, false)
+  test "blocklist_and_select_next cancels active downloads and selects the next candidate when auto-select is enabled" do
+    SettingsService.set(:auto_select_enabled, true)
     request = build_request
     selected = create_result(request, guid: "failed", status: :selected, seeders: 100)
     fallback = create_result(request, guid: "fallback", status: :rejected, seeders: 20)
@@ -185,6 +214,30 @@ class RequestDownloadFailureTest < ActiveSupport::TestCase
     assert active_download.reload.failed?
     assert selected.reload.blocklisted?
     assert fallback.reload.selected?
+    assert request.reload.downloading?
+    assert_not request.attention_needed?
+  end
+
+  test "blocklist_and_select_next blocklists and flags manual review when auto-select is disabled" do
+    SettingsService.set(:auto_select_enabled, false)
+    request = build_request
+    selected = create_result(request, guid: "failed", status: :selected, seeders: 100)
+    fallback = create_result(request, guid: "fallback", status: :rejected, seeders: 20)
+    active_download = request.downloads.create!(name: selected.title, search_result: selected, status: :queued)
+
+    outcome = nil
+    assert_no_difference -> { request.downloads.count } do
+      assert_no_enqueued_jobs only: DownloadJob do
+        outcome = request.blocklist_and_select_next!(reason: "Blocklisted manually")
+      end
+    end
+
+    assert_equal :manual_review, outcome
+    assert active_download.reload.failed?
+    assert selected.reload.blocklisted?
+    assert fallback.reload.rejected?
+    assert_includes request.reload.issue_description, "Select another release manually"
+    assert_idle_attention_clears_downloading(request)
   end
 
   test "blocklist_and_select_next returns no_selected_result without a selection" do

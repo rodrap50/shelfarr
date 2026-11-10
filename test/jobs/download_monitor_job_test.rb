@@ -3,7 +3,7 @@
 require "test_helper"
 
 class DownloadMonitorJobTest < ActiveJob::TestCase
-  CLIENT_THREAD_LOCALS = %i[qbittorrent_sessions transmission_sessions transmission_protocols].freeze
+  CLIENT_THREAD_LOCALS = %i[qbittorrent_sessions deluge_sessions transmission_sessions transmission_protocols].freeze
 
   def run
     Request.suppressing_turbo_broadcasts { super }
@@ -16,7 +16,6 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     DownloadClient.destroy_all
     @request = requests(:pending_request)
 
-    # Create a qBittorrent client
     @qbittorrent = DownloadClient.create!(
       name: "Test qBittorrent",
       client_type: "qbittorrent",
@@ -27,13 +26,11 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
       enabled: true
     )
 
-    # Clear qBittorrent sessions
     @original_client_thread_locals = CLIENT_THREAD_LOCALS.to_h do |key|
       [ key, Thread.current.key?(key) ? Thread.current[key] : :unset ]
     end
     CLIENT_THREAD_LOCALS.each { |key| Thread.current[key] = {} }
 
-    # Create an active download associated with the client
     @download = @request.downloads.create!(
       name: "Test Audiobook",
       size_bytes: 1073741824,
@@ -64,14 +61,15 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     end
   end
 
-  test "schedules next run after monitoring" do
+  test "does not enqueue another monitor after checking" do
     VCR.turned_off do
       stub_qbittorrent_auth
       stub_qbittorrent_torrent_info(progress: 75, state: "downloading")
 
-      assert_enqueued_with(job: DownloadMonitorJob) do
+      assert_no_enqueued_jobs(only: DownloadMonitorJob) do
         DownloadMonitorJob.perform_now
       end
+      assert_equal 75, @download.reload.progress
     end
   end
 
@@ -128,35 +126,24 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     end
   end
 
-  test "recurring watchdog restarts a failed monitor chain without duplicating its replacement" do
+  test "recurring clock checks the download monitor without a command chain" do
     config = YAML.safe_load_file(Rails.root.join("config/recurring.yml"), aliases: true)
-    watchdog = config.fetch("production").fetch("download_monitor_recovery")
-    assert_equal "every 5 minutes", watchdog.fetch("schedule")
-    task = SolidQueue::RecurringTask.from_configuration("download_monitor_recovery", **watchdog.symbolize_keys)
+    assert_nil config.fetch("production")["download_monitor_recovery"]
+    monitor = config.fetch("production").fetch("download_monitor")
+    assert_equal "DownloadMonitorJob", monitor.fetch("class")
+    assert_equal "every minute", monitor.fetch("schedule")
+    assert_equal [ { "scheduled" => true } ], monitor.fetch("args")
+    assert_nil monitor["command"]
+    task = SolidQueue::RecurringTask.from_configuration("download_monitor", **monitor.symbolize_keys)
     assert task.valid?, task.errors.full_messages.join(", ")
 
-    with_solid_queue_monitor_jobs do |monitor_jobs|
-      # Other tests can leave unrelated jobs in the queue database. Claim the
-      # specific monitor rather than failing whichever job happens to be first.
-      unrelated_job = SolidQueue::RecurringJob.set(priority: -100).perform_later("nil")
-      job = DownloadMonitorJob.perform_later
-      worker = SolidQueue::Process.register(kind: "Worker", name: "monitor-recovery-test", pid: Process.pid)
-      claimed = SolidQueue::ReadyExecution.where(job_id: job.provider_job_id).claim([ "*" ], 1, worker.id).first
-      assert_equal job.job_id, claimed&.job&.active_job_id
-      claimed.failed_with(RuntimeError.new("interrupted polling"))
-      claimed.unblock_next_job
+    SettingsService.set(:download_check_interval, 60)
+    Rails.cache.write(DownloadMonitorJob::SCHEDULE_CACHE_KEY, Time.current)
 
-      assert_difference -> { monitor_jobs.count }, 1 do
-        SolidQueue::RecurringJob.perform_now(task.command)
-      end
-      assert_no_difference -> { monitor_jobs.count } do
-        SolidQueue::RecurringJob.perform_now(task.command)
-      end
-      assert SolidQueue::ReadyExecution.exists?(job_id: unrelated_job.provider_job_id)
-    ensure
-      SolidQueue::Job.find_by(active_job_id: unrelated_job.job_id)&.destroy! if unrelated_job
-      worker&.destroy!
+    assert_no_enqueued_jobs(only: DownloadMonitorJob) do
+      DownloadMonitorJob.perform_now(scheduled: true)
     end
+    assert_equal 50, @download.reload.progress
   end
 
   test "handles completed download and triggers post-processing" do
@@ -189,6 +176,36 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     end
   end
 
+  test "handles Deluge torrents paused or stopped at 100% as completed and triggers post-processing" do
+    deluge = DownloadClient.create!(
+      name: "Monitor Deluge",
+      client_type: "deluge",
+      url: "http://localhost:8112",
+      password: "adminadmin",
+      priority: 0,
+      enabled: true
+    )
+    @download.update!(download_client: deluge)
+
+    %w[Paused Stopped].each do |state|
+      @download.update!(status: :downloading, progress: 50, download_path: nil)
+
+      VCR.turned_off do
+        Thread.current[:deluge_sessions] = {}
+        stub_deluge_login
+        stub_deluge_torrent_info(progress: 100, state: state)
+
+        assert_enqueued_with(job: PostProcessingJob, args: [ @download.id ]) do
+          DownloadMonitorJob.perform_now
+        end
+      end
+
+      @download.reload
+      assert @download.completed?, "Deluge #{state} at 100% should complete the download"
+      assert_equal 100, @download.progress
+    end
+  end
+
   test "does not immediately fail download on first not-found" do
     VCR.turned_off do
       stub_qbittorrent_auth
@@ -199,6 +216,37 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
 
       assert @download.downloading?
       assert_equal 1, @download.not_found_count
+    end
+  end
+
+  test "does not post-process incomplete paused Deluge torrents rounded to 100 percent" do
+    deluge = DownloadClient.create!(
+      name: "Incomplete Deluge",
+      client_type: "deluge",
+      url: "http://localhost:8112",
+      password: "adminadmin",
+      priority: 0,
+      enabled: true
+    )
+    @download.update!(download_client: deluge)
+
+    %w[Paused PausedDownload PausedUpload Stopped].each do |state|
+      [ 1.0, 99.5, 99.99 ].each do |progress|
+        @download.update!(status: :downloading, progress: 0, download_path: nil)
+
+        VCR.turned_off do
+          Thread.current[:deluge_sessions] = {}
+          stub_deluge_login
+          stub_deluge_torrent_info(progress: progress, state: state)
+
+          assert_no_enqueued_jobs(only: PostProcessingJob) do
+            DownloadMonitorJob.perform_now
+          end
+        end
+
+        assert @download.reload.downloading?, "Deluge #{state} at #{progress}% is incomplete"
+        assert_equal progress.round, @download.progress
+      end
     end
   end
 
@@ -349,7 +397,7 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
             body["method"] == "torrent_get" &&
             body["params"] == {
               "ids" => [ "transmission-hash" ],
-              "fields" => %w[id name hash_string percent_done status total_size download_dir error error_string]
+              "fields" => DownloadClients::Transmission::JSONRPC_TORRENT_FIELDS
             } &&
             body["id"] == 1
         end
@@ -386,8 +434,73 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     end
   end
 
+  test "completes a stopped Transmission torrent at 100 percent and enqueues post-processing" do
+    transmission = DownloadClient.create!(
+      name: "Stopped Transmission",
+      client_type: "transmission",
+      url: "http://localhost:9091",
+      username: "admin",
+      password: "adminadmin",
+      priority: 0,
+      enabled: true
+    )
+    @download.update!(
+      external_id: "transmission-hash",
+      download_client: transmission
+    )
+
+    # 0 is stopped after a seed or idle limit of 0. 5 is queued to seed.
+    [ 0, 5 ].each do |status|
+      @download.update!(status: :downloading, progress: 50, download_path: nil)
+      Thread.current[:transmission_sessions] = {}
+      Thread.current[:transmission_protocols] = {}
+
+      VCR.turned_off do
+        stub_transmission_monitor_torrent(percent_done: 1.0, status: status, left_until_done: 0)
+
+        assert_enqueued_with(job: PostProcessingJob, args: [ @download.id ]) do
+          DownloadMonitorJob.perform_now
+        end
+      end
+
+      @download.reload
+      assert @download.completed?, "Transmission status #{status} at percentDone 1.0 should complete the download"
+      assert_equal 100, @download.progress
+      assert_equal "/downloads/complete/Test Audiobook", @download.download_path
+    end
+  end
+
+  test "does not complete a stopped Transmission torrent that is still short of 100 percent" do
+    transmission = DownloadClient.create!(
+      name: "Incomplete Transmission",
+      client_type: "transmission",
+      url: "http://localhost:9091",
+      username: "admin",
+      password: "adminadmin",
+      priority: 0,
+      enabled: true
+    )
+    @download.update!(
+      external_id: "transmission-hash",
+      download_client: transmission,
+      progress: 50
+    )
+
+    VCR.turned_off do
+      stub_transmission_monitor_torrent(percent_done: 0.995, status: 0, left_until_done: 1024)
+
+      assert_no_enqueued_jobs(only: PostProcessingJob) do
+        DownloadMonitorJob.perform_now
+      end
+    end
+
+    @download.reload
+    assert @download.downloading?
+    # 0.995 rounds to a displayed 100 and must still stay in progress.
+    assert_equal 100, @download.progress
+  end
+
   test "uses SABnzbd for usenet downloads" do
-    # Create SABnzbd client
     sabnzbd = DownloadClient.create!(
       name: "Test SABnzbd",
       client_type: "sabnzbd",
@@ -634,14 +747,11 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     end
   end
 
-  test "ensure_running! only enqueues one monitor job while scheduled" do
+  test "ensure_running! does not enqueue a monitor chain" do
     SettingsService.set(:download_check_interval, 60)
 
-    assert_enqueued_with(job: DownloadMonitorJob) do
+    assert_no_enqueued_jobs(only: DownloadMonitorJob) do
       DownloadMonitorJob.ensure_running!
-    end
-
-    assert_no_enqueued_jobs do
       DownloadMonitorJob.ensure_running!
     end
   end
@@ -656,30 +766,49 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     end
   end
 
-  test "solid queue recovers when a cache reservation exists without a pending job" do
+  test "ensure_running! does not enqueue when the clock reservation is in the future" do
     Rails.cache.write(DownloadMonitorJob::SCHEDULE_CACHE_KEY, 1.hour.from_now.to_i)
 
-    DownloadMonitorJob.stub(:solid_queue_adapter?, true) do
-      DownloadMonitorJob.stub(:monitor_job_pending?, false) do
-        assert_enqueued_with(job: DownloadMonitorJob) do
-          DownloadMonitorJob.ensure_running!
-        end
-      end
+    assert_no_enqueued_jobs(only: DownloadMonitorJob) do
+      DownloadMonitorJob.ensure_running!
     end
   end
 
-  test "does not schedule a successor when another protected monitor job is pending" do
+  test "consecutive minute ticks still monitor when a scan runs past its start" do
+    SettingsService.set(:download_check_interval, 60)
+    DownloadMonitorJob.clear_schedule!
+    scanned_at = []
+    start = Time.zone.parse("2026-08-26 12:00:00")
     job = DownloadMonitorJob.new
-    pending_job = lambda do |excluding_active_job_id: nil|
-      assert_equal job.job_id, excluding_active_job_id
-      true
-    end
 
-    DownloadMonitorJob.stub(:monitor_job_pending?, pending_job) do
-      assert_no_enqueued_jobs(only: DownloadMonitorJob) do
-        job.send(:schedule_next_run)
+    job.stub(:monitor_active_downloads, -> {
+      scanned_at << Time.current
+      travel 3.seconds
+    }) do
+      travel_to start do
+        job.perform(scheduled: true)
       end
     end
+
+    assert_equal [ start ], scanned_at
+
+    travel_to start + 1.minute do
+      job.stub(:monitor_active_downloads, -> { scanned_at << Time.current }) do
+        job.perform(scheduled: true)
+      end
+    end
+
+    assert_equal start + 1.minute, scanned_at.last
+  end
+
+  test "a scheduled run before the interval elapses does not monitor or enqueue" do
+    SettingsService.set(:download_check_interval, 60)
+    Rails.cache.write(DownloadMonitorJob::SCHEDULE_CACHE_KEY, Time.current)
+
+    assert_no_enqueued_jobs(only: DownloadMonitorJob) do
+      DownloadMonitorJob.perform_now(scheduled: true)
+    end
+    assert_equal 50, @download.reload.progress
   end
 
   test "stale monitor instances claim a completed download only once" do
@@ -703,9 +832,40 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     assert_equal first_info.download_path, @download.download_path
   end
 
+  test "legacy argument-less monitors cannot bypass the interval gate" do
+    scans = 0
+    original = DownloadMonitorJob.instance_method(:monitor_active_downloads)
+    DownloadMonitorJob.define_method(:monitor_active_downloads) { scans += 1 }
+    DownloadMonitorJob.send(:private, :monitor_active_downloads)
+    worker = nil
+
+    with_solid_queue_monitor_jobs do
+      legacy = DownloadMonitorJob.perform_later
+      Rails.cache.write(DownloadMonitorJob::SCHEDULE_CACHE_KEY, 30.seconds.from_now.to_i)
+      DownloadMonitorJob.ensure_running!
+      worker = SolidQueue::Process.register(
+        kind: "Worker",
+        name: "legacy-monitor-#{SecureRandom.hex(4)}",
+        pid: Process.pid,
+        hostname: "test",
+        metadata: {}
+      )
+      SolidQueue::ReadyExecution.where(job_id: legacy.provider_job_id).claim([ "*" ], 1, worker.id).each(&:perform)
+      DownloadMonitorJob.perform_now(scheduled: true)
+    end
+
+    assert_equal 0, scans
+  ensure
+    worker&.destroy!
+    if original
+      DownloadMonitorJob.define_method(:monitor_active_downloads, original)
+      DownloadMonitorJob.send(:private, :monitor_active_downloads)
+    end
+  end
+
   test "ensure_running! does not duplicate a persisted solid queue monitor" do
     with_solid_queue_monitor_jobs do |monitor_jobs|
-      DownloadMonitorJob.set(wait: 1.minute).perform_later
+      DownloadMonitorJob.set(wait: 1.minute).perform_later(scheduled: true)
       Rails.cache.write(DownloadMonitorJob::SCHEDULE_CACHE_KEY, 1.minute.ago.to_i)
 
       assert_equal 1, monitor_jobs.count
@@ -715,7 +875,7 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     end
   end
 
-  test "ensure_running! starts a watchdog for a queued direct download without clients" do
+  test "a due scheduled run watches a queued direct download without enqueueing a chain" do
     DownloadClient.destroy_all
     direct_result = search_results(:selected_result)
     direct_result.update!(source: SearchResult::SOURCE_GUTENBERG)
@@ -726,10 +886,13 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
       download_type: nil,
       search_result: direct_result
     )
+    DownloadMonitorJob.clear_schedule!
 
-    assert_enqueued_with(job: DownloadMonitorJob) do
-      DownloadMonitorJob.ensure_running!
+    assert DownloadMonitorJob.monitoring_required?
+    assert_no_enqueued_jobs(only: DownloadMonitorJob) do
+      DownloadMonitorJob.perform_now(scheduled: true)
     end
+    assert @download.reload.queued?
   end
 
   test "limits monitor execution to one protected job" do
@@ -739,17 +902,55 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     assert_equal :block, DownloadMonitorJob.concurrency_on_conflict
   end
 
+  test "a claimed monitor lease survives concurrency maintenance past 30 minutes" do
+    SolidQueue::Record.establish_connection(:queue)
+    key = DownloadMonitorJob.new.concurrency_key
+    assert_includes AudiobookshelfLibrarySyncJob::ConcurrencyLease::KEYS, key
+
+    process = SolidQueue::Process.register(
+      kind: "Worker",
+      name: "monitor-lease-#{SecureRandom.hex(4)}",
+      pid: Process.pid,
+      hostname: "test",
+      metadata: {}
+    )
+    active_job = DownloadMonitorJob.new
+    job = SolidQueue::Job.create!(
+      active_job_id: active_job.job_id,
+      class_name: "DownloadMonitorJob",
+      queue_name: "default",
+      arguments: active_job.serialize,
+      concurrency_key: key,
+      scheduled_at: Time.current
+    )
+    SolidQueue::ClaimedExecution.create!(job: job, process: process)
+    SolidQueue::Semaphore.where(key: key).delete_all
+    SolidQueue::Semaphore.create!(key: key, value: 0, expires_at: Time.current)
+
+    leap = [ DownloadMonitorJob.concurrency_duration + 5.seconds, 10.minutes + 5.seconds ].max
+    assert_operator leap, :>, 30.minutes
+    travel leap do
+      SolidQueue::Dispatcher::ConcurrencyMaintenance.new(5.minutes, 500).send(:expire_semaphores)
+      assert SolidQueue::Semaphore.exists?(key: key)
+    end
+  ensure
+    if defined?(job) && job
+      SolidQueue::ClaimedExecution.where(job_id: job.id).delete_all
+      job.delete
+    end
+    process&.destroy
+    SolidQueue::Semaphore.where(key: key).delete_all if defined?(key) && key
+  end
+
   test "skips downloads without external_id" do
     @download.update!(external_id: nil)
 
     VCR.turned_off do
       stub_qbittorrent_auth
 
-      # Should not make any torrent info requests
       DownloadMonitorJob.perform_now
       @download.reload
 
-      # Status should remain unchanged
       assert @download.downloading?
       assert_equal 50, @download.progress
     end
@@ -768,7 +969,7 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
 
     SettingsService.set(:download_enqueue_timeout_minutes, 5)
 
-    assert_enqueued_with(job: DownloadMonitorJob) do
+    assert_no_enqueued_jobs(only: DownloadMonitorJob) do
       DownloadMonitorJob.perform_now
     end
 
@@ -788,7 +989,6 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
       DownloadMonitorJob.perform_now
       @download.reload
 
-      # Status should remain unchanged
       assert @download.downloading?
       assert_equal 50, @download.progress
     end
@@ -974,6 +1174,63 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
     SolidQueue::Record.establish_connection(original_config)
   end
 
+  def stub_transmission_monitor_torrent(percent_done:, status:, left_until_done: 0, error: 0)
+    stub_request(:post, "http://localhost:9091/transmission/rpc")
+      .with do |request|
+        body = JSON.parse(request.body)
+        body["jsonrpc"] == "2.0" &&
+          body["method"] == "session_get" &&
+          body["params"] == {} &&
+          body["id"] == 1
+      end
+      .to_return(
+        {
+          status: 409,
+          headers: { "x-transmission-session-id" => "session-id" },
+          body: { "result" => "session", "arguments" => {} }.to_json
+        },
+        {
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { "jsonrpc" => "2.0", "result" => { "version" => "4.1.1" }, "id" => 1 }.to_json
+        }
+      )
+    stub_request(:post, "http://localhost:9091/transmission/rpc")
+      .with do |request|
+        body = JSON.parse(request.body)
+        body["jsonrpc"] == "2.0" &&
+          body["method"] == "torrent_get" &&
+          body["params"] == {
+            "ids" => [ "transmission-hash" ],
+            "fields" => DownloadClients::Transmission::JSONRPC_TORRENT_FIELDS
+          } &&
+          body["id"] == 1
+      end
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: {
+          "jsonrpc" => "2.0",
+          "result" => {
+            "torrents" => [
+              {
+                "hash_string" => "transmission-hash",
+                "name" => "Test Audiobook",
+                "percent_done" => percent_done,
+                "left_until_done" => left_until_done,
+                "status" => status,
+                "error" => error,
+                "error_string" => "",
+                "total_size" => 1_073_741_824,
+                "download_dir" => "/downloads/complete"
+              }
+            ]
+          },
+          "id" => 1
+        }.to_json
+      )
+  end
+
   def stub_qbittorrent_auth
     stub_request(:post, "http://localhost:8080/api/v2/auth/login")
       .to_return(
@@ -998,6 +1255,39 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
             "content_path" => "/downloads/complete/Test Audiobook"
           }
         ].to_json
+      )
+  end
+
+  def stub_deluge_login
+    stub_request(:post, "http://localhost:8112/json")
+      .with(body: /"auth.login"/)
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json", "Set-Cookie" => "sessionid=test_session_id; Path=/" },
+        body: { result: true, error: nil, id: 1 }.to_json
+      )
+  end
+
+  def stub_deluge_torrent_info(progress:, state:)
+    stub_request(:post, "http://localhost:8112/json")
+      .with(body: /"core.get_torrents_status"/)
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: {
+          result: {
+            "abc123def456" => {
+              "name" => "Test Audiobook",
+              "progress" => progress,
+              "state" => state,
+              "total_size" => 1_073_741_824,
+              "download_location" => "/downloads/complete",
+              "save_path" => "/downloads/complete"
+            }
+          },
+          error: nil,
+          id: 1
+        }.to_json
       )
   end
 
@@ -1030,5 +1320,212 @@ class DownloadMonitorJobTest < ActiveJob::TestCase
           }
         }.to_json
       )
+  end
+end
+
+class DownloadMonitorReadyLeaseTest < ActiveJob::TestCase
+  self.use_transactional_tests = false
+
+  setup do
+    @original_cache = Rails.cache
+    Rails.cache = ActiveSupport::Cache::MemoryStore.new
+    DownloadMonitorJob.clear_schedule!
+    SettingsService.set(:download_check_interval, 60)
+    @queue = "download-monitor-ready-#{SecureRandom.hex(4)}"
+    @client = DownloadClient.create!(
+      name: "Ready lease qBittorrent",
+      client_type: "qbittorrent",
+      url: "http://localhost:8080",
+      username: "admin",
+      password: "adminadmin",
+      priority: 0,
+      enabled: true
+    )
+  end
+
+  teardown do
+    DownloadMonitorJob.clear_schedule!
+    Rails.cache = @original_cache
+    @client&.destroy
+  end
+
+  test "an expired ready monitor does not overlap a later tick while workers drain" do
+    start = Time.zone.parse("2026-08-26 12:00:00")
+    entered = Queue.new
+    release = Queue.new
+    gate = Mutex.new
+    state = { inside: 0, max_inside: 0 }
+    processes = []
+    install_overlap_probe!(gate, entered, release, state)
+
+    with_solid_queue_monitors do
+      begin
+        processes = register_workers(3)
+        travel_to start do
+          DownloadMonitorJob.set(queue: @queue).perform_later(scheduled: true)
+          assert_equal 1, ready_monitor_count
+          assert SolidQueue::Semaphore.exists?(key: DownloadMonitorJob.new.concurrency_key)
+        end
+
+        leap = DownloadMonitorJob.concurrency_duration + 1.minute
+        assert_operator leap, :>, 30.minutes
+        travel_to start + leap do
+          SolidQueue::Dispatcher::ConcurrencyMaintenance.new(5.minutes, 500).send(:expire_semaphores)
+          assert_equal 1, ready_monitor_count
+          DownloadMonitorJob.set(queue: @queue).perform_later(scheduled: true)
+          claim_and_perform(processes.first, 1)
+          wait_for("the waiting monitor to start") { entered.size >= 1 }
+        end
+
+        travel_to start + leap + 1.minute do
+          processes.each { |process| claim_and_perform(process, 1) }
+          deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
+          until gate.synchronize { state[:max_inside] } > 1 || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+            sleep 0.02
+          end
+          assert_equal 1, gate.synchronize { state[:max_inside] }
+        end
+      ensure
+        3.times { release << true }
+        join_worker_threads
+      end
+    end
+  ensure
+    3.times { release << true } if defined?(release) && release
+    join_worker_threads
+    restore_scan_probe!
+    processes&.each { |process| process.deregister rescue nil }
+    raise @worker_error if @worker_error && !$!
+  end
+
+  private
+
+  def install_overlap_probe!(gate, entered, release, state)
+    @original_monitor = DownloadMonitorJob.instance_method(:monitor_active_downloads)
+    DownloadMonitorJob.define_method(:monitor_active_downloads) do
+      gate.synchronize do
+        state[:inside] += 1
+        state[:max_inside] = state[:inside] if state[:inside] > state[:max_inside]
+      end
+      entered << true
+      release.pop
+      gate.synchronize { state[:inside] -= 1 }
+    end
+    DownloadMonitorJob.send(:private, :monitor_active_downloads)
+  end
+
+  def restore_scan_probe!
+    return unless @original_monitor
+
+    DownloadMonitorJob.define_method(:monitor_active_downloads, @original_monitor)
+    DownloadMonitorJob.send(:private, :monitor_active_downloads)
+    @original_monitor = nil
+  end
+
+  def with_solid_queue_monitors
+    original_config = SolidQueue::Record.connection_db_config
+    SolidQueue::Record.establish_connection(:queue)
+    switch_to_solid_queue!
+    clear_monitor_queue!
+    @worker_threads = []
+    @worker_error = nil
+    yield
+  ensure
+    begin
+      join_worker_threads
+      clear_monitor_queue!
+    ensure
+      SolidQueue::Record.establish_connection(original_config) if original_config
+      restore_test_adapter!
+    end
+  end
+
+  def register_workers(count)
+    count.times.map do |index|
+      SolidQueue::Process.register(
+        kind: "Worker",
+        name: "monitor-ready-#{index}-#{SecureRandom.hex(4)}",
+        pid: Process.pid,
+        hostname: "test",
+        metadata: {}
+      )
+    end
+  end
+
+  def claim_and_perform(process, limit)
+    claimed = SolidQueue::ReadyExecution.claim(@queue, limit, process.id)
+    claimed.each do |execution|
+      @worker_threads << Thread.new(execution) do |claimed_execution|
+        Thread.current.report_on_exception = false
+        Thread.current.abort_on_exception = false
+        claimed_execution.perform
+      rescue Exception => error
+        @worker_error = error
+      end
+    end
+    claimed
+  end
+
+  def ready_monitor_count
+    SolidQueue::ReadyExecution.joins(:job).where(
+      queue_name: @queue,
+      solid_queue_jobs: { class_name: "DownloadMonitorJob" }
+    ).count
+  end
+
+  def join_worker_threads
+    @worker_threads&.each { |thread| thread.join(5) }
+  end
+
+  def clear_monitor_queue!
+    SolidQueue::Job.uncached do
+      jobs = SolidQueue::Job.where(class_name: "DownloadMonitorJob")
+      ids = jobs.ids
+      if ids.any?
+        SolidQueue::BlockedExecution.where(job_id: ids).delete_all
+        SolidQueue::ClaimedExecution.where(job_id: ids).delete_all
+        SolidQueue::ReadyExecution.where(job_id: ids).delete_all
+        SolidQueue::FailedExecution.where(job_id: ids).delete_all
+        SolidQueue::ScheduledExecution.where(job_id: ids).delete_all
+        SolidQueue::RecurringExecution.where(job_id: ids).delete_all
+        jobs.delete_all
+      end
+      SolidQueue::Semaphore.where(key: DownloadMonitorJob.new.concurrency_key).delete_all
+    end
+  end
+
+  def switch_to_solid_queue!
+    return if @switched_adapter
+
+    @original_queue_adapter = ActiveJob::Base._queue_adapter
+    @original_test_adapter = ActiveJob::Base._test_adapter
+    @switched_adapter = true
+    ActiveJob::Base.disable_test_adapter
+    ActiveJob::Base.queue_adapter = :solid_queue
+  end
+
+  def restore_test_adapter!
+    return unless @switched_adapter
+
+    if @original_queue_adapter
+      ActiveJob::Base.queue_adapter = @original_queue_adapter
+    else
+      ActiveJob::Base.queue_adapter = :test
+    end
+    if @original_test_adapter
+      ActiveJob::Base.enable_test_adapter(@original_test_adapter)
+    else
+      ActiveJob::Base.disable_test_adapter
+    end
+    @switched_adapter = false
+  end
+
+  def wait_for(description)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+    until yield
+      raise "timed out waiting for #{description} #{@worker_error}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      sleep 0.02
+    end
   end
 end

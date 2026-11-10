@@ -8,8 +8,8 @@ require "logger"
 # Usenet downloads are removed from the client after successful import.
 class PostProcessingJob < ApplicationJob
   EBOOK_FILE_EXTENSIONS = %w[epub pdf mobi azw azw3 cbz cbr djvu].freeze
-  EBOOK_SIDECAR_EXTENSIONS = %w[jpg jpeg png webp opf nfo txt].freeze
-  EBOOK_ALLOWED_EXTENSIONS = (EBOOK_FILE_EXTENSIONS + EBOOK_SIDECAR_EXTENSIONS).freeze
+  EBOOK_COVER_EXTENSIONS = %w[jpg jpeg png webp].freeze
+  AUDIOBOOK_COVER_EXTENSIONS = %w[bmp gif jpeg jpg png webp].freeze
   # SABnzbd (and some torrent clients) report a completed file path instead of
   # the job folder. Remap through the parent while preserving the reported file.
   COMPLETED_DOWNLOAD_FILE_EXTENSIONS = (
@@ -45,6 +45,7 @@ class PostProcessingJob < ApplicationJob
     @referenced_file_count = 0
     @reused_file_count = 0
     @completed_reference_target_roots = []
+    @imported_library_entry = false
     download = Download.find_by(id: download_id)
     return unless download&.completed?
 
@@ -58,10 +59,16 @@ class PostProcessingJob < ApplicationJob
     return unless download.completed?
 
     request = download.request
-    return unless claim_request_for_post_processing(download, request, expected_owner_job_id)
+    claimed = claim_request_for_post_processing(download, request, expected_owner_job_id)
+    return if RemoteResult.failed?(claimed) || !claimed
 
     book = request.book
     acquisition_finalized = false
+    @replacement_plan = nil
+    @replacement_file_path = nil
+    @replacement_file_override_used = false
+    @publication_download = download
+    @reused_destination_locks = []
 
     Rails.logger.info "[PostProcessingJob] Starting download ##{download.id}, book ##{book.id}"
 
@@ -72,22 +79,23 @@ class PostProcessingJob < ApplicationJob
           "This title already has an acquisition in progress; its recovery reservation was preserved"
       end
 
-      # Shelfarr versions which predate atomic finalization could be killed
-      # after attaching the imported path to Book but before completing the
-      # Request. The durable Download owner proves this request still needs
-      # reconciliation, so finish only the database transition and retain the
+      # A verifiable library path means a prior (or legacy) acquisition already
+      # published the file. Finish only the database transition and retain the
       # download source for manual cleanup.
-      if book.acquired?
-        unless verifiable_library_entry?(book.file_path)
-          raise BookAcquisitionConflictError,
-            "The existing library entry could not be verified; its database state was preserved for review"
-        end
-
-        acquisition_finalized = finalize_acquisition!(
-          download,
-          request,
-          book,
-          book.file_path
+      #
+      # An unverifiable path is stale: re-import from the completed download
+      # instead of leaving Retry stuck in Attention Required. A later
+      # finalize_acquisition! replaces that path only after import succeeds,
+      # and still preserves a different verifiable library file.
+      if book.acquired? && !download.replace_library_file? &&
+          RemoteResult.succeeded?(verifiable_library_entry?(book.file_path))
+        acquisition_finalized = RemoteResult.succeeded?(
+          finalize_acquisition!(
+            download,
+            request,
+            book,
+            book.file_path
+          )
         )
         return unless acquisition_finalized
 
@@ -119,6 +127,23 @@ class PostProcessingJob < ApplicationJob
       rescue FileCopyService::ReferenceTargetUnavailableError
         return retry_source_path_later(download, request, source_path, source_path_retry_count)
       end
+      if download.replace_library_file? && book.file_path.present?
+        # The isolated destination is stored before any bytes are published and
+        # reused if this import is retried. Layout comes from the incoming
+        # files, which are known only after the source path is resolved.
+        replacement_plan = prepare_library_replacement!(
+          download,
+          book,
+          destination,
+          source_path,
+          language: import_language
+        )
+        if RemoteResult.failed?(replacement_plan)
+          raise LibraryReplacement::UnreadablePlanError, "stored replacement plan could not be read"
+        end
+
+        destination = import_directory_for_replacement(destination, replacement_plan)
+      end
 
       # Reference mode keeps download bytes as the only content; never delete
       # usenet/client sources after a symlink-only import.
@@ -142,29 +167,49 @@ class PostProcessingJob < ApplicationJob
       end
 
       book_path = imported_book_path(book, destination)
+      @imported_library_entry = true
       cleanup_state = source_cleanup&.fetch(:state)
-      acquisition_finalized = finalize_acquisition!(download, request, book, book_path, cleanup_state)
+      if remove_usenet_download && cleanup_state
+        cleanup_state = with_pending_client_cleanup(
+          cleanup_state,
+          source_path,
+          source_authorization.fetch(:directory)
+        )
+        source_cleanup[:state] = cleanup_state
+      end
+      acquisition_finalized = RemoteResult.succeeded?(
+        finalize_acquisition!(download, request, book, book_path, cleanup_state)
+      )
       return unless acquisition_finalized
+
+      LibraryReplacement.finish_cleanup!(download) if @replacement_plan
+      LibraryReplacement.release_publication!(download)
 
       # Destructive source/client cleanup happens only after Book, Request, and
       # Download ownership commit together. A hard kill before that commit can
       # therefore retry the idempotent import without losing its source.
       cleanup_outcome = remove_import_source(source_cleanup)
-      if cleanup_state && cleanup_outcome != :retry
-        clear_source_cleanup_state(download, cleanup_state)
-      end
       if remove_usenet_download && cleanup_outcome == :complete
-        cleanup_usenet_download(
+        client_cleanup_outcome = cleanup_usenet_download(
           download,
           source_path,
           source_directory: source_authorization.fetch(:directory)
         )
+        # The partial-move journal is the only record that this client removal
+        # still has to happen. An unconfirmed response must not drop it.
+        if client_cleanup_pending?(cleanup_state) && !self.class.usenet_cleanup_confirmed?(client_cleanup_outcome)
+          cleanup_outcome = :retry
+        end
+      end
+      if cleanup_state && cleanup_outcome != :retry
+        clear_source_cleanup_state(download, cleanup_state)
       end
 
       run_completion_side_effects(request, download, book, book_path)
     rescue => e
       error_detail = "#{e.class}: #{bounded_exception_message(e)}"
       diagnostic_path = bounded_error_path(e)
+      diagnostic_path = nil if RemoteResult.failed?(diagnostic_path)
       error_detail << " at #{diagnostic_path.inspect}" if diagnostic_path
       cause = e.cause
       if cause && !cause.equal?(e)
@@ -172,10 +217,12 @@ class PostProcessingJob < ApplicationJob
       end
       Rails.logger.error "[PostProcessingJob] Download ##{download.id} failed: #{error_detail}"
       mark_post_processing_failure!(download, request, e) unless acquisition_finalized
+    ensure
+      release_reused_destination_locks!
     end
   end
 
-  def with_post_processing_lock(download_id, &operation)
+  def self.with_post_processing_lock(download_id, &operation)
     tmp_root = Rails.root.join("tmp")
     lock_root = tmp_root.join("post-processing-locks")
     FileCopyService.ensure_directory(lock_root.to_s, root: tmp_root.to_s, mode: 0o700)
@@ -183,6 +230,10 @@ class PostProcessingJob < ApplicationJob
     lock_slot = download_id % POST_PROCESSING_LOCK_SLOTS
     lock_path = lock_root.join("#{lock_slot}.lock")
     FileCopyService.with_private_lock(lock_path.to_s, root: lock_root.to_s, &operation)
+  end
+
+  def with_post_processing_lock(download_id, &operation)
+    self.class.with_post_processing_lock(download_id, &operation)
   end
 
   def claim_request_for_post_processing(download, request, expected_owner_job_id)
@@ -203,8 +254,8 @@ class PostProcessingJob < ApplicationJob
     end
 
     true
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def finalize_acquisition!(download, request, book, imported_path, cleanup_state = nil)
@@ -222,26 +273,24 @@ class PostProcessingJob < ApplicationJob
       end
 
       if book.file_path.blank?
-        reference_target_roots = Book.dump_reference_target_roots(
-          @completed_reference_target_roots
-        )
-        claimed = Book.where(id: book.id)
-          .where("file_path IS NULL OR TRIM(file_path) = ''")
-          .where(acquisition_reservation_token: nil)
-          .update_all(
-            file_path: imported_path,
-            reference_target_roots: reference_target_roots,
-            updated_at: Time.current
-          )
-        unless claimed == 1
-          raise BookAcquisitionConflictError,
-            "Another acquisition claimed this title while post-processing was finalizing"
+        claim_imported_path!(book, imported_path) do
+          Book.where(id: book.id)
+            .where("file_path IS NULL OR TRIM(file_path) = ''")
+            .where(acquisition_reservation_token: nil)
         end
-        book.file_path = imported_path
-        book[:reference_target_roots] = reference_target_roots
-      elsif book.file_path != imported_path
-        raise BookAcquisitionConflictError,
-          "Another acquisition already attached a different library file to this title"
+      elsif book.file_path != imported_path || @imported_library_entry
+        if book.file_path != imported_path &&
+            RemoteResult.succeeded?(verifiable_library_entry?(book.file_path)) &&
+            !replacing_verified_library_file?(download, book, imported_path)
+          raise BookAcquisitionConflictError,
+            "Another acquisition already attached a different library file to this title"
+        end
+
+        stale_path = book.file_path
+        claim_imported_path!(book, imported_path) do
+          Book.where(id: book.id, file_path: stale_path)
+            .where(acquisition_reservation_token: nil)
+        end
       end
 
       # Clearing the owner and completing the Request in one transaction closes
@@ -257,8 +306,26 @@ class PostProcessingJob < ApplicationJob
     end
 
     finalized == true
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
+  end
+
+  def claim_imported_path!(book, imported_path)
+    reference_target_roots = Book.dump_reference_target_roots(
+      @completed_reference_target_roots
+    )
+    claimed = yield.update_all(
+      file_path: imported_path,
+      reference_target_roots: reference_target_roots,
+      updated_at: Time.current
+    )
+    unless claimed == 1
+      raise BookAcquisitionConflictError,
+        "Another acquisition claimed this title while post-processing was finalizing"
+    end
+
+    book.file_path = imported_path
+    book[:reference_target_roots] = reference_target_roots
   end
 
   def mark_post_processing_failure!(download, request, error)
@@ -272,8 +339,8 @@ class PostProcessingJob < ApplicationJob
       true
     end
     marked == true
-  rescue ActiveRecord::RecordNotFound
-    false
+  rescue ActiveRecord::RecordNotFound => error
+    RemoteResult::Failed.new(error)
   end
 
   def run_completion_side_effects(request, download, book, book_path)
@@ -307,8 +374,7 @@ class PostProcessingJob < ApplicationJob
 
     Rails.logger.info "[PostProcessingJob] Completed processing for download #{download&.id}"
   rescue => error
-    # These are post-commit conveniences. Their failure must never reopen or
-    # overwrite the completed acquisition state.
+    # These are post-commit conveniences. Their failure must never reopen or overwrite the completed acquisition state.
     Rails.logger.warn(
       "[PostProcessingJob] Completion side effect failed for download #{download&.id}: #{error.class}"
     )
@@ -319,10 +385,10 @@ class PostProcessingJob < ApplicationJob
     when BookAcquisitionConflictError
       bounded_exception_message(error)
     when FileCopyService::DirectoryNotWritableError
-      location = safe_attention_library_path(error)
+      location = attention_library_location(error)
       "Shelfarr cannot write to #{location || "the configured library directory"}"
     when FileCopyService::UnsafeFilePermissionsError
-      location = safe_attention_library_path(error)
+      location = attention_library_location(error)
       message = "The library filesystem reported unsupported file or directory permissions"
       location ? "#{message} at #{location}" : message
     when FileCopyService::DurabilityUnsupportedError
@@ -358,10 +424,18 @@ class PostProcessingJob < ApplicationJob
     "[unavailable error detail]"
   end
 
+  def tagged_diagnostic_text(raw)
+    return raw unless raw.encoding == Encoding::BINARY
+
+    FilenameBytes.utf8(raw)
+  rescue EncodingError
+    raw.encode(Encoding::UTF_8, Encoding::UTF_8, invalid: :replace, undef: :replace, replace: "\uFFFD")
+  end
+
   def bounded_diagnostic_text(value)
     raw = value.to_s.dup
     raw = raw.byteslice(0, ERROR_DETAIL_INPUT_BYTE_LIMIT).to_s
-    raw.force_encoding(Encoding::UTF_8) if raw.encoding == Encoding::BINARY
+    raw = tagged_diagnostic_text(raw)
     raw.encode(
       Encoding::UTF_8,
       invalid: :replace,
@@ -370,12 +444,19 @@ class PostProcessingJob < ApplicationJob
     ).squish.first(ERROR_DETAIL_CHARACTER_LIMIT)
   end
 
+  def attention_library_location(error)
+    location = safe_attention_library_path(error)
+    return if RemoteResult.failed?(location)
+
+    location
+  end
+
   def bounded_error_path(error)
     return unless error.respond_to?(:path) && error.path.present?
 
     bounded_diagnostic_text(error.path)
-  rescue StandardError
-    nil
+  rescue StandardError => failure
+    RemoteResult::Failed.new(failure)
   end
 
   def safe_attention_library_path(error)
@@ -389,8 +470,8 @@ class PostProcessingJob < ApplicationJob
     return "the configured library root" if relative.to_s == "."
 
     "library path #{bounded_diagnostic_text(relative.to_s).inspect}"
-  rescue StandardError
-    nil
+  rescue StandardError => failure
+    RemoteResult::Failed.new(failure)
   end
 
   def safe_attention_detail(error)
@@ -405,6 +486,8 @@ class PostProcessingJob < ApplicationJob
       "Refusing to import source outside configured download roots"
     when /no supported ebook files/i
       "No supported ebook files found in the completed download"
+    when /no supported audiobook files/i
+      "No supported audiobook files found in the completed download"
     when /unsupported ebook import file type/i
       "Unsupported ebook import file type or invalid ebook content"
     when /failed to enqueue post-processing retry/i
@@ -418,8 +501,8 @@ class PostProcessingJob < ApplicationJob
     stat = File.lstat(path)
     # Reference import mode publishes leaf symlinks under the library root.
     stat.file? || stat.directory? || stat.symlink?
-  rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR
-    false
+  rescue Errno::ENOENT, Errno::ENOTDIR => error
+    RemoteResult::Failed.new(error)
   end
 
   def source_path_unavailable?(source_path)
@@ -430,8 +513,8 @@ class PostProcessingJob < ApplicationJob
   def validate_download_specific_source_path!(source_path, authorized_roots, download)
     return unless source_path.present?
 
-    roots = Array(authorized_roots).filter_map { |path| canonical_download_root(path) }.uniq
-    shared_roots = shared_download_roots(download).filter_map { |path| canonical_download_root(path) }.uniq
+    roots = canonical_download_roots(authorized_roots)
+    shared_roots = canonical_download_roots(shared_download_roots(download))
     source_stat = File.lstat(source_path)
     reference_link = source_stat.symlink? && reference_completed_downloads?
     source = if reference_link
@@ -529,6 +612,13 @@ class PostProcessingJob < ApplicationJob
     File.realpath(expanded)
   end
 
+  def canonical_download_roots(paths)
+    Array(paths).filter_map { |path|
+      root = canonical_download_root(path)
+      root if RemoteResult.succeeded?(root)
+    }.uniq
+  end
+
   def canonical_download_root(path)
     expanded = File.expand_path(normalize_path_separators(path))
     return unless File.directory?(expanded)
@@ -537,8 +627,8 @@ class PostProcessingJob < ApplicationJob
     return if Pathname(canonical).root?
 
     canonical
-  rescue ArgumentError, SystemCallError
-    nil
+  rescue ArgumentError, SystemCallError => error
+    RemoteResult::Failed.new(error)
   end
 
   def path_inside_root?(path, root)
@@ -603,7 +693,14 @@ class PostProcessingJob < ApplicationJob
 
   def cleanup_usenet_download(download, source_path = nil, source_directory: true)
     Rails.logger.info "[PostProcessingJob] Removing usenet download ##{download.id}"
-    download.download_client.adapter.remove_torrent(download.external_id, delete_files: true)
+    removed = download.download_client.adapter.remove_torrent(download.external_id, delete_files: true)
+    # A false body or a connection error is not proof the history item is gone.
+    # SABnzbd reports success for an id that is already archived.
+    unless removed == true
+      Rails.logger.warn "[PostProcessingJob] Usenet cleanup was not confirmed for download ##{download.id}"
+      return :retry
+    end
+
     Rails.logger.info "[PostProcessingJob] Usenet download removed successfully"
 
     # SABnzbd history delete with del_files doesn't remove completed storage directories.
@@ -611,8 +708,10 @@ class PostProcessingJob < ApplicationJob
     if source_path.present?
       remove_empty_download_job_directory(download, source_path, source_directory: source_directory)
     end
+    true
   rescue => e
     Rails.logger.warn "[PostProcessingJob] Usenet cleanup failed for download ##{download.id}: #{e.class}"
+    :retry
   end
 
   def remove_empty_download_job_directory(download, source_path, source_directory: true)
@@ -623,14 +722,17 @@ class PostProcessingJob < ApplicationJob
       SettingsService.get(:download_local_path, default: "/downloads"),
       SettingsService.get(:download_remote_path),
       download.download_client&.download_path
-    ].compact_blank.filter_map { |path| canonical_download_root(path) }.uniq
-    shared_roots = shared_download_roots(download).filter_map { |path| canonical_download_root(path) }.uniq
+    ].compact_blank.then { |paths| canonical_download_roots(paths) }
+    shared_roots = canonical_download_roots(shared_download_roots(download))
     canonical_source = snapshot.canonical_path.to_s
 
     return if shared_roots.include?(canonical_source)
     return unless authorized_roots.any? { |root| path_inside_root?(canonical_source, root) }
 
-    if FileCopyService.remove_source_tree(snapshot)
+    if RemoteResult.succeeded?(FileCopyService.remove_source_tree(
+      snapshot,
+      allow_nonatomic: SettingsService.get(:allow_nonatomic_nfs_directory_publication)
+    ))
       Rails.logger.info "[PostProcessingJob] Removed empty download job directory"
     end
   rescue FileCopyService::UnsafePathError, SystemCallError => e
@@ -659,8 +761,15 @@ class PostProcessingJob < ApplicationJob
   # Flat imports write into the shared output root, so the root must not be
   # recorded as the book's own path when the import produced a single file.
   # Pointing file_path at that file keeps downloads and deletions per-book.
+  # A directory replacement owns the folder, including every format inside it.
   def imported_book_path(book, destination)
     return @imported_book_path_override if @imported_book_path_override.present?
+    if @replacement_plan&.file?
+      return @imported_renamed_files.first if @imported_renamed_files&.one?
+
+      return @replacement_plan.book_path
+    end
+    return @replacement_plan.book_path if @replacement_plan
     return destination unless PathTemplateService.flat_output?(book)
     return destination unless @imported_renamed_files&.one?
 
@@ -718,7 +827,9 @@ class PostProcessingJob < ApplicationJob
     @imported_renamed_files = []
     @imported_source_files = Set.new
     @verified_library_snapshots = Hash.new { |snapshots, path| snapshots[path] = [] }
+    @configured_library_directories = []
     @imported_book_path_override = nil
+    @replacement_file_override_used = false
     @import_base_path = Pathname(base_path || get_base_path(book)).expand_path
     @defer_source_removal = move_completed_downloads?
     # Reference mode only publishes symlinks; fsync durability of library
@@ -733,6 +844,7 @@ class PostProcessingJob < ApplicationJob
     }.fetch(completed_download_import_mode, "Copying")
     Rails.logger.info "[PostProcessingJob] #{action} library content"
     validate_ebook_source!(source) if readable_file_import?(book)
+    validate_audiobook_source!(source) if book&.audiobook?
     source_cleanup = nil
 
     if directory_source
@@ -740,12 +852,30 @@ class PostProcessingJob < ApplicationJob
       source_root = @import_source_root
       imported_source_files = @imported_source_files.dup.freeze
       destination_snapshots = @verified_library_snapshots.values.flatten.freeze
+      destination_snapshots_by_source = @verified_library_snapshots.each_with_object({}) do |(path, snapshots), indexed|
+        indexed[path] = snapshots.dup.freeze
+      end.freeze
       if move_completed_downloads?
+        imported_file_snapshots = imported_file_cleanup_snapshots(
+          source_root,
+          imported_source_files,
+          destination_snapshots_by_source
+        )
         source_cleanup = {
           operation: lambda do
-            remove_import_source_tree(source_root, imported_source_files, destination_snapshots)
+            remove_import_source_tree(
+              source_root,
+              imported_source_files,
+              destination_snapshots,
+              imported_file_snapshots: imported_file_snapshots
+            )
           end,
-          state: nil,
+          state: directory_move_cleanup_state(
+            source_root,
+            imported_source_files,
+            destination_snapshots,
+            imported_file_snapshots
+          ),
           source_snapshot: nil
         }
       elsif require_durable
@@ -756,7 +886,6 @@ class PostProcessingJob < ApplicationJob
         }
       end
     else
-      # Import single file with renamed filename based on template
       ensure_real_import_directory!(destination)
       import_renamed_file(source, destination, book, language: language)
       source_snapshot = @import_source_file_snapshot
@@ -781,6 +910,8 @@ class PostProcessingJob < ApplicationJob
       end
     end
 
+    apply_configured_library_directory_modes!
+
     if hardlink_completed_downloads?
       Rails.logger.info(
         "[PostProcessingJob] Hardlink import completed successfully: " \
@@ -804,6 +935,7 @@ class PostProcessingJob < ApplicationJob
     remove_instance_variable(:@import_source_file_snapshot) if instance_variable_defined?(:@import_source_file_snapshot)
     remove_instance_variable(:@reference_regular_source_root) if instance_variable_defined?(:@reference_regular_source_root)
     remove_instance_variable(:@verified_library_snapshots) if instance_variable_defined?(:@verified_library_snapshots)
+    remove_instance_variable(:@configured_library_directories) if instance_variable_defined?(:@configured_library_directories)
     remove_instance_variable(:@require_durable_import) if instance_variable_defined?(:@require_durable_import)
   end
 
@@ -853,8 +985,8 @@ class PostProcessingJob < ApplicationJob
 
     ensure_real_import_directory!(destination)
 
-    # Preserve dot-prefixed audiobook release files. Ebook/comic validation and
-    # recursive import intentionally retain their existing hidden-file policy.
+    # Ebook and comic imports ignore hidden names. Audiobook imports keep hidden
+    # audio and recognized covers, and leave other dotfiles in the download.
     files = source_manifest_children(source)
     files.reject! { |file| file.start_with?(".") } if readable_file_import?(book)
     Rails.logger.info "[PostProcessingJob] Found #{files.size} files/folders to import"
@@ -877,8 +1009,15 @@ class PostProcessingJob < ApplicationJob
       source: source,
       book: book,
       base_path: base_path || get_base_path(book),
-      language: language
+      language: language,
+      tracked_destination: replacement_tracked_destination
     )
+  end
+
+  def replacement_tracked_destination
+    return if @replacement_plan.nil? || @replacement_plan.file?
+
+    @replacement_plan.destination
   end
 
   def import_split_audiobook_bundle(plan)
@@ -887,22 +1026,28 @@ class PostProcessingJob < ApplicationJob
     plan.entries.each do |entry|
       ensure_real_import_directory!(entry.destination)
       import_audiobook_bundle_file(entry.source_path, entry.destination)
-      entry.sidecar_paths.each do |sidecar|
-        import_sidecar_file(sidecar, entry.destination, retry_safe: true)
-      end
+      import_audiobook_bundle_covers(entry)
     end
 
-    tracked_destination = plan.tracked_entry.destination
-    ensure_real_import_directory!(tracked_destination)
-    plan.unassigned_paths.each do |path|
-      import_sidecar_file(path, tracked_destination, retry_safe: true)
-    end
-    @imported_book_path_override = tracked_destination
+    @imported_book_path_override = plan.tracked_entry.destination
   end
 
   def import_audiobook_bundle_file(source_file, destination)
     destination_file = File.join(destination, File.basename(source_file))
     import_file_without_duplicate_content(source_file, destination_file)
+  end
+
+  def import_audiobook_bundle_covers(entry)
+    audio_stem = AudiobookBundleImportPlanner.stem_for(entry.source_path)
+    entry.sidecar_paths.each do |sidecar|
+      next unless AudiobookBundleImportPlanner.cover_file?(
+        sidecar,
+        audio_stems: [ audio_stem ],
+        extensions: AUDIOBOOK_COVER_EXTENSIONS
+      )
+
+      import_sidecar_file(sidecar, entry.destination, retry_safe: true)
+    end
   end
 
   def import_ebook_directory_entry(source_file, destination, book, language: nil)
@@ -912,7 +1057,7 @@ class PostProcessingJob < ApplicationJob
       end
     elsif allowed_ebook_import_file?(source_file) && ebook_file?(source_file)
       import_renamed_file(source_file, destination, book, language: language)
-    elsif allowed_ebook_import_file?(source_file)
+    elsif allowed_ebook_import_file?(source_file) && ebook_cover_file?(source_file)
       import_sidecar_file(source_file, destination)
     else
       Rails.logger.info "[PostProcessingJob] Skipping one unsupported ebook import file"
@@ -940,14 +1085,14 @@ class PostProcessingJob < ApplicationJob
     paths = ebook_directory_files(source)
 
     paths.each do |path|
+      extension = path_extension(path)
+      next unless ebook_import_candidate?(path, extension)
+
       if File.symlink?(path) && !reference_source_snapshot(path)
         raise "Unsupported ebook import file type: #{File.basename(path)}"
       end
 
-      extension = File.extname(path).delete_prefix(".").downcase
-      next unless EBOOK_ALLOWED_EXTENSIONS.include?(extension)
-
-      unless allowed_ebook_import_file?(path)
+      unless allowed_ebook_import_file?(path, extension: extension)
         raise "Unsupported ebook import file type: #{File.basename(path)}"
       end
 
@@ -965,19 +1110,19 @@ class PostProcessingJob < ApplicationJob
   end
 
   def allowed_ebook_import_file?(path, extension: nil)
+    extension ||= path_extension(path)
+    return false unless ebook_import_candidate?(path, extension)
+
     if (snapshot = reference_source_snapshot(path)).is_a?(FileCopyService::ReferenceSourceSnapshot)
       target = snapshot.target_snapshot.path.to_s
-      extension ||= File.extname(path).delete_prefix(".").downcase
       return false unless File.file?(target) && !File.symlink?(target)
 
-      return EBOOK_ALLOWED_EXTENSIONS.include?(extension) &&
-        valid_ebook_import_content?(target, extension)
+      return RemoteResult.succeeded?(valid_ebook_import_content?(target, extension))
     end
     return false if File.symlink?(path)
     return false unless File.file?(path)
 
-    extension ||= File.extname(path).delete_prefix(".").downcase
-    EBOOK_ALLOWED_EXTENSIONS.include?(extension) && valid_ebook_import_content?(path, extension)
+    RemoteResult.succeeded?(valid_ebook_import_content?(path, extension))
   end
 
   def valid_ebook_import_content?(path, extension)
@@ -1007,15 +1152,11 @@ class PostProcessingJob < ApplicationJob
       head.start_with?("\x89PNG\r\n\x1A\n".b)
     when "webp"
       head.start_with?("RIFF") && head.byteslice(8, 4) == "WEBP"
-    when "opf"
-      text_file_content?(head) && head.downcase.include?("<package")
-    when "nfo", "txt"
-      text_file_content?(head)
     else
       false
     end
-  rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENXIO, Errno::ENODEV, Errno::ENOTDIR
-    false
+  rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENXIO, Errno::ENODEV, Errno::ENOTDIR => error
+    RemoteResult::Failed.new(error)
   end
 
   def executable_file_signature?(head)
@@ -1027,14 +1168,6 @@ class PostProcessingJob < ApplicationJob
       head.start_with?("\xCF\xFA\xED\xFE".b)
   end
 
-  def text_file_content?(head)
-    return false if head.include?("\x00")
-
-    head.bytes.all? do |byte|
-      byte == 9 || byte == 10 || byte == 12 || byte == 13 || byte >= 32
-    end
-  end
-
   def import_sidecar_file(source_file, destination, retry_safe: false)
     # All sidecars now use retry-safe reconciliation; retain the keyword for
     # compatibility with bundle planner call sites.
@@ -1043,14 +1176,19 @@ class PostProcessingJob < ApplicationJob
   end
 
   def import_renamed_file(source, destination, book, language: nil)
-    destination_file = renamed_destination_file(source, destination, book, language: language)
+    override = replacement_file_destination(destination)
+    if RemoteResult.failed?(override)
+      raise LibraryReplacement::UnreadablePlanError, "replacement file is outside the import directory"
+    end
+
+    destination_file = override.presence || renamed_destination_file(source, destination, book, language: language)
     Rails.logger.info "[PostProcessingJob] Applying the configured library filename template"
     destination_file = import_file_without_duplicate_content(source, destination_file)
     @imported_renamed_files << destination_file
     destination_file
   end
 
-  def import_file(source, destination)
+  def import_file(source, destination, before_publish: nil)
     if reference_completed_downloads?
       source_snapshot = reference_source_snapshot(source)
       regular_root_snapshot = @reference_regular_source_root unless
@@ -1061,7 +1199,8 @@ class PostProcessingJob < ApplicationJob
         root: @import_base_path,
         source_root: source_snapshot ? nil : @import_source_root,
         source_snapshot: source_snapshot,
-        authorized_root_snapshot: regular_root_snapshot
+        authorized_root_snapshot: regular_root_snapshot,
+        before_publish: before_publish
       )
       @referenced_file_count += 1
     elsif hardlink_completed_downloads?
@@ -1071,7 +1210,8 @@ class PostProcessingJob < ApplicationJob
           destination,
           root: @import_base_path,
           source_root: @import_source_root,
-          require_durable: @require_durable_import
+          require_durable: @require_durable_import,
+          before_publish: before_publish
         )
         @hardlinked_file_count += 1
       rescue FileCopyService::HardlinkUnsupportedError
@@ -1084,7 +1224,8 @@ class PostProcessingJob < ApplicationJob
           root: @import_base_path,
           source_root: @import_source_root,
           hardlink_mode: true,
-          require_durable: @require_durable_import
+          require_durable: @require_durable_import,
+          before_publish: before_publish
         )
         @hardlink_fallback_copied_count += 1
       end
@@ -1095,7 +1236,8 @@ class PostProcessingJob < ApplicationJob
         root: @import_base_path,
         source_root: @import_source_root,
         source_snapshot: @import_source_file_snapshot,
-        require_durable: @require_durable_import
+        require_durable: @require_durable_import,
+        before_publish: before_publish
       )
     end
     destination
@@ -1111,6 +1253,14 @@ class PostProcessingJob < ApplicationJob
     loop do
       destination, already_imported = retry_safe_destination(source, original_destination)
       if already_imported
+        # Cancellation of the import that first journaled this path must not
+        # delete it while this job is still going to attach it.
+        held = LibraryReplacement.share_reused_destination!(destination)
+        unless held.is_a?(File)
+          raise LibraryReplacement::UnreadablePlanError, "reused library file could not be protected"
+        end
+        (@reused_destination_locks ||= []) << held
+
         if hardlink_completed_downloads?
           @reused_file_count += 1
         end
@@ -1121,17 +1271,37 @@ class PostProcessingJob < ApplicationJob
         )
         record_imported_source!(source)
         Rails.logger.info "[PostProcessingJob] Reusing one identical previously imported file"
+        apply_configured_library_file_mode!(source, destination)
         return destination
       end
 
-      imported = import_file(source, destination)
+      record_published_library_file!(destination)
+      proof = nil
+      begin
+        imported = import_file(
+          source,
+          destination,
+          before_publish: lambda { |publication_proof|
+            proof = publication_proof
+            record_publication_proof!(destination, publication_proof)
+          }
+        )
+      rescue Errno::EEXIST
+        # Another importer won this candidate after retry_safe_destination.
+        # Drop this attempt's record of it, then re-run content reconciliation
+        # before choosing a suffix.
+        forgotten = LibraryReplacement.forget_published_path!(@publication_download, destination, proof: proof)
+        unless forgotten == true
+          raise LibraryReplacement::UnreadablePlanError, "published library file could not be recorded"
+        end
+
+        next
+      end
+      record_published_library_file!(imported) unless imported == destination
       verify_imported_destination!(source, imported, require_durable: true) if @require_durable_import
       record_imported_source!(source)
+      apply_configured_library_file_mode!(source, imported)
       return imported
-    rescue Errno::EEXIST
-      # Another importer won this candidate after retry_safe_destination.
-      # Re-run content reconciliation before choosing a suffix.
-      next
     end
   end
 
@@ -1143,10 +1313,10 @@ class PostProcessingJob < ApplicationJob
       break unless path_occupied?(candidate)
 
       if reference_completed_downloads?
-        if reference_target_matches?(source, candidate)
+        if RemoteResult.succeeded?(reference_target_matches?(source, candidate))
           return [ candidate, true ]
         end
-      elsif !File.symlink?(candidate) && same_file_content?(source, candidate)
+      elsif !File.symlink?(candidate) && RemoteResult.succeeded?(same_file_content?(source, candidate))
         unless hardlink_completed_downloads?
           return [ candidate, true ]
         end
@@ -1162,7 +1332,7 @@ class PostProcessingJob < ApplicationJob
           candidate,
           root: @import_base_path
         )
-        if same_source_inode || prior_fallback_copy
+        if RemoteResult.succeeded?(same_source_inode) || RemoteResult.succeeded?(prior_fallback_copy)
           return [ candidate, true ]
         end
       end
@@ -1201,7 +1371,7 @@ class PostProcessingJob < ApplicationJob
 
   def verify_imported_destination!(source, destination, require_durable:)
     if reference_completed_downloads?
-      unless reference_target_matches?(source, destination)
+      unless RemoteResult.succeeded?(reference_target_matches?(source, destination))
         raise Errno::ESTALE, "library reference changed after import"
       end
       return
@@ -1223,27 +1393,88 @@ class PostProcessingJob < ApplicationJob
 
   def import_directory_entry(source, destination)
     stat = File.lstat(source)
+    if stat.directory? && !stat.symlink?
+      import_audiobook_subdirectory(source, destination)
+    elsif audiobook_library_file?(source)
+      import_audiobook_leaf(source, destination, stat)
+    else
+      Rails.logger.info "[PostProcessingJob] Skipping one non-audiobook release file"
+    end
+  end
+
+  def import_audiobook_subdirectory(source, destination)
+    children = source_manifest_children(source)
+    return if children.none? { |entry| audiobook_tree_has_library_file?(File.join(source, entry)) }
+
+    nested_destination = File.join(destination, File.basename(source))
+    ensure_real_import_directory!(nested_destination)
+    children.each do |entry|
+      import_directory_entry(File.join(source, entry), nested_destination)
+    end
+  end
+
+  def import_audiobook_leaf(source, destination, stat)
     if stat.symlink?
       unless reference_completed_downloads? && reference_source_snapshot(source)
         raise "Refusing to import symbolic link: #{source}"
       end
-
-      import_file_without_duplicate_content(source, File.join(destination, File.basename(source)))
-    elsif stat.directory?
-      nested_destination = File.join(destination, File.basename(source))
-      ensure_real_import_directory!(nested_destination)
-      source_manifest_children(source).each do |entry|
-        import_directory_entry(File.join(source, entry), nested_destination)
-      end
-    elsif stat.file?
-      import_file_without_duplicate_content(source, File.join(destination, File.basename(source)))
-    else
+    elsif !stat.file?
       raise "Refusing to import non-regular path: #{source}"
+    end
+
+    import_file_without_duplicate_content(source, File.join(destination, File.basename(source)))
+  end
+
+  # Keep the creation mode until the import finishes. A folder mode applied
+  # while ancestors are still being created can drop the owner's search bit
+  # and make the library unreachable before any file is published.
+  def ensure_real_import_directory!(path)
+    FileCopyService.ensure_directory(path, root: @import_base_path, mode: 0o750)
+    @configured_library_directories << path
+  end
+
+  def apply_configured_library_directory_modes!
+    @configured_library_directories.uniq.each do |path|
+      LibraryImportPermissions.apply_directory!(path, root: @import_base_path)
     end
   end
 
-  def ensure_real_import_directory!(path)
-    FileCopyService.ensure_directory(path, root: @import_base_path, mode: 0o750)
+  # Shared inodes are left unchanged by the chmod itself. When a mode was
+  # requested, refresh the verified snapshot so move cleanup sees the
+  # post-chmod ctime.
+  def apply_configured_library_file_mode!(source, destination)
+    return if reference_completed_downloads?
+
+    result = LibraryImportPermissions.apply_file!(destination, root: @import_base_path)
+    return if RemoteResult.failed?(result)
+    return if SettingsService.get(:library_import_file_mode).blank?
+
+    record_post_chmod_library_snapshot!(source, destination)
+  end
+
+  def record_post_chmod_library_snapshot!(source, destination)
+    return unless defined?(@verified_library_snapshots) && @verified_library_snapshots
+
+    key = Pathname(source).expand_path.to_s
+    return unless @verified_library_snapshots.key?(key)
+
+    previous = @verified_library_snapshots[key].last
+    return unless previous
+
+    manifest = FileCopyService.library_file_manifest(destination, root: @import_base_path)
+    return if RemoteResult.failed?(manifest)
+    return unless manifest.is_a?(Array)
+    return unless manifest.values_at(0, 1, 2, 3) == previous.manifest.values_at(0, 1, 2, 3)
+
+    @verified_library_snapshots[key][-1] = FileCopyService::SourceFileSnapshot.new(
+      path: previous.path,
+      parent_path: previous.parent_path,
+      canonical_parent_path: previous.canonical_parent_path,
+      parent_device: previous.parent_device,
+      parent_inode: previous.parent_inode,
+      manifest: manifest,
+      content_digest: previous.content_digest
+    ).freeze
   end
 
   def move_completed_downloads?
@@ -1271,10 +1502,14 @@ class PostProcessingJob < ApplicationJob
     return :complete unless source_cleanup
 
     removed = source_cleanup.fetch(:operation).call
-    return :complete unless removed == false
+    return :complete if removed == true
+    return :retry if removed == :retry
+    # A failed directory delete is still in progress. Clearing the claim would
+    # abandon a quarantine another worker may be deleting.
+    return :retry if source_cleanup.fetch(:source_snapshot).nil? && RemoteResult.failed?(removed)
 
     source_snapshot = source_cleanup.fetch(:source_snapshot)
-    if source_snapshot && FileCopyService.source_file_quarantined?(source_snapshot)
+    if source_snapshot && RemoteResult.succeeded?(FileCopyService.source_file_quarantined?(source_snapshot))
       :retry
     else
       :retained
@@ -1289,44 +1524,271 @@ class PostProcessingJob < ApplicationJob
       source_snapshot,
       destination_snapshot: destination_snapshot
     )
-    Rails.logger.warn "[PostProcessingJob] Source file changed; it was retained" unless removed
+    Rails.logger.warn "[PostProcessingJob] Source file changed; it was retained" unless removed == true
     removed
   end
 
-  def remove_import_source_tree(source_root, imported_source_files, destination_snapshots)
+  def self.remove_persisted_directory_source(payload)
+    source_root = FileCopyService.deserialize_source_root(payload.fetch("source_root"))
+    destination_snapshots = payload.fetch("destinations").map { |snapshot|
+      FileCopyService.deserialize_file_snapshot(snapshot)
+    }
+    imported_file_snapshots = payload["imported_file_snapshots"]&.map { |pair|
+      serialized_destinations = pair["destinations"] || [ pair.fetch("destination") ]
+      {
+        relative: pair.fetch("relative"),
+        source: FileCopyService.deserialize_file_snapshot(pair.fetch("source")),
+        destinations: serialized_destinations.map { |snapshot|
+          FileCopyService.deserialize_file_snapshot(snapshot)
+        }
+      }
+    }
+    new(0).send(
+      :remove_import_source_tree,
+      source_root,
+      payload.fetch("imported_source_files"),
+      destination_snapshots,
+      imported_file_snapshots: imported_file_snapshots
+    )
+  end
+
+  def self.resume_persisted_client_cleanup(download, client_cleanup)
+    new(download.id).send(
+      :cleanup_usenet_download,
+      download,
+      client_cleanup.fetch("source_path"),
+      source_directory: client_cleanup.fetch("source_directory")
+    )
+  end
+
+  def self.directory_source_quarantine_pending?(payload)
+    source_root = FileCopyService.deserialize_source_root(payload.fetch("source_root"))
+    FileCopyService.owned_source_tree_quarantined?(source_root)
+  end
+
+  def self.usenet_cleanup_confirmed?(outcome)
+    outcome == true
+  end
+
+  def self.source_quarantine_unresolved?(snapshots)
+    Array(snapshots).any? do |snapshot|
+      quarantined = FileCopyService.source_file_quarantined?(snapshot)
+      return true if RemoteResult.failed?(quarantined)
+
+      quarantined == true
+    end
+  end
+
+  def self.saved_cleanup_source_snapshots(payload)
+    Array(payload["imported_file_snapshots"]).map do |pair|
+      FileCopyService.deserialize_file_snapshot(pair.fetch("source"))
+    end
+  end
+
+  def remove_import_source_tree(
+    source_root,
+    imported_source_files,
+    destination_snapshots,
+    imported_file_snapshots: nil
+  )
     expected_files = source_root.entries.filter_map do |relative, manifest|
       relative if manifest[2] == :file
     end.sort
-    unless imported_source_files.to_a.sort == expected_files
+    imported_files = imported_source_files.to_a.sort
+    unless (imported_files - expected_files).empty?
       Rails.logger.warn(
-        "[PostProcessingJob] Source directory contains files that were not imported; it was retained"
+        "[PostProcessingJob] Imported files are absent from the source snapshot; the source directory was retained"
       )
       return false
     end
 
-    unless destination_snapshots_current?(destination_snapshots)
+    unimported_files = expected_files - imported_files
+    destination_current = destination_snapshots_current?(destination_snapshots)
+    # A library mount that cannot be opened is not a changed import.
+    if RemoteResult.failed?(destination_current)
+      Rails.logger.warn(
+        "[PostProcessingJob] Imported library files could not be verified; source cleanup will be retried"
+      )
+      return :retry
+    end
+    unless destination_current
+      return retain_changed_import_source(imported_file_snapshots) if imported_file_snapshots
+
+      return retain_directory_source(
+        source_root,
+        "An imported library file changed; the source directory was retained"
+      )
+    end
+
+    if unimported_files.empty?
+      removed = FileCopyService.remove_source_tree(
+        source_root,
+        allow_nonatomic: SettingsService.get(:allow_nonatomic_nfs_directory_publication)
+      )
+      return retain_directory_source(source_root, "Source directory was retained") if removed == false
+
+      Rails.logger.warn "[PostProcessingJob] Source directory was retained" unless removed == true
+      return removed
+    end
+
+    # Ebook and comic imports skip files they will not publish. Move still has
+    # to drop the bytes that were published; the skipped files stay here.
+    return false if imported_files.empty?
+    return false if imported_file_snapshots.blank?
+
+    saved_files = imported_file_snapshots.map { |pair| pair.fetch(:relative) }.sort
+    unless saved_files == imported_files
+      Rails.logger.warn(
+        "[PostProcessingJob] Imported source snapshots do not match the download; the source directory was retained"
+      )
+      return false
+    end
+
+    Rails.logger.warn(
+      "[PostProcessingJob] Source directory contains files that were not imported; removing only the imported files"
+    )
+    remove_saved_imported_files(imported_file_snapshots)
+  end
+
+  def retain_changed_import_source(imported_file_snapshots)
+    if imported_file_snapshots.blank?
       Rails.logger.warn(
         "[PostProcessingJob] An imported library file changed; the source directory was retained"
       )
       return false
     end
 
-    removed = FileCopyService.remove_source_tree(source_root)
-    Rails.logger.warn "[PostProcessingJob] Source directory changed; it was retained" unless removed
-    removed
+    outcome = remove_saved_imported_files(imported_file_snapshots)
+    return outcome if outcome == :retry || outcome == true || RemoteResult.failed?(outcome)
+    return :retry if self.class.source_quarantine_unresolved?(
+      imported_file_snapshots.map { |pair| pair.fetch(:source) }
+    )
+
+    Rails.logger.warn(
+      "[PostProcessingJob] An imported library file changed; the source directory was retained"
+    )
+    false
   end
 
-  def destination_snapshots_current?(snapshots)
-    snapshots.all? do |snapshot|
-      FileCopyService.file_snapshot_current?(snapshot, require_durable: true)
+  def remove_saved_imported_files(imported_file_snapshots)
+    retry_later = false
+    retained = false
+
+    # An earlier retain must not skip a later file still sitting in quarantine.
+    imported_file_snapshots.each do |pair|
+      removed = remove_verified_source_file(pair.fetch(:source), pair.fetch(:destinations))
+      next if removed == true
+      if RemoteResult.failed?(removed) && removed.error.is_a?(Errno::ENOENT) &&
+          FileCopyService.source_parent_missing?(pair.fetch(:source)) == true
+        next
+      end
+
+      quarantined = FileCopyService.source_file_quarantined?(pair.fetch(:source))
+      if RemoteResult.succeeded?(quarantined) || RemoteResult.failed?(removed) || RemoteResult.failed?(quarantined)
+        retry_later = true
+        next
+      end
+
+      retained = true
+    end
+
+    Rails.logger.warn "[PostProcessingJob] Imported source file changed; it was retained" if retained
+    return :retry if retry_later
+
+    retained ? false : true
+  end
+
+  # A shared cover is copied into each split book folder. Every copy has to
+  # still match before that one source file is removed.
+  def remove_verified_source_file(source_snapshot, destinations)
+    return false if destinations.empty?
+
+    FileCopyService.remove_source_file(source_snapshot, destination_snapshots: destinations)
+  end
+
+  def client_cleanup_pending?(cleanup_state)
+    return false if cleanup_state.blank?
+
+    payload = JSON.parse(cleanup_state)
+    payload.is_a?(Hash) && payload.key?("client_cleanup")
+  end
+
+  def imported_file_cleanup_snapshots(source_root, imported_source_files, destination_snapshots_by_source)
+    expected_files = source_root.entries.filter_map do |relative, manifest|
+      relative if manifest[2] == :file
+    end
+    return nil if (expected_files - imported_source_files.to_a).empty?
+    return nil if imported_source_files.empty?
+
+    imported_source_files.to_a.sort.map do |relative|
+      source_path = source_root.path.join(relative).expand_path
+      snapshots = destination_snapshots_by_source[source_path.to_s]
+      return nil unless snapshots&.any?
+
+      {
+        relative: relative,
+        source: FileCopyService.snapshot_source_file(source_path.to_s, source_root: source_root),
+        destinations: snapshots
+      }
     end
   end
 
+  def directory_move_cleanup_state(source_root, imported_source_files, destination_snapshots, imported_file_snapshots)
+    JSON.generate(
+      "source_root" => FileCopyService.serialize_source_root(source_root),
+      "imported_source_files" => imported_source_files.to_a,
+      "destinations" => destination_snapshots.map { |snapshot|
+        FileCopyService.serialize_file_snapshot(snapshot)
+      },
+      "imported_file_snapshots" => imported_file_snapshots&.map { |pair|
+        {
+          "relative" => pair.fetch(:relative),
+          "source" => FileCopyService.serialize_file_snapshot(pair.fetch(:source)),
+          "destinations" => pair.fetch(:destinations).map { |snapshot|
+            FileCopyService.serialize_file_snapshot(snapshot)
+          }
+        }
+      }
+    )
+  end
+
+  def with_pending_client_cleanup(cleanup_state, source_path, source_directory)
+    payload = JSON.parse(cleanup_state)
+    return cleanup_state unless payload["imported_file_snapshots"]
+
+    payload["client_cleanup"] = {
+      "source_path" => source_path,
+      "source_directory" => source_directory
+    }
+    JSON.generate(payload)
+  end
+
+  def retain_directory_source(source_root, message)
+    restored = FileCopyService.restore_owned_source_tree(
+      source_root,
+      allow_nonatomic: SettingsService.get(:allow_nonatomic_nfs_directory_publication)
+    )
+    case restored
+    when :absent, :restored
+      Rails.logger.warn "[PostProcessingJob] #{message}"
+      false
+    else
+      Rails.logger.warn "[PostProcessingJob] Owned source quarantine remains; source cleanup will retry"
+      :retry
+    end
+  end
+
+  def destination_snapshots_current?(snapshots)
+    snapshots.each do |snapshot|
+      current = FileCopyService.file_snapshot_current?(snapshot, require_durable: true)
+      return current if RemoteResult.failed?(current)
+      return false unless current
+    end
+    true
+  end
+
   def clear_source_cleanup_state(download, cleanup_state)
-    Download.where(
-      id: download.id,
-      post_processing_cleanup_state: cleanup_state
-    ).update_all(post_processing_cleanup_state: nil, updated_at: Time.current)
+    Download.clear_post_processing_cleanup!(download.id, cleanup_state)
   end
 
   def source_manifest_children(directory)
@@ -1393,8 +1855,8 @@ class PostProcessingJob < ApplicationJob
 
     relative = expanded.relative_path_from(@import_source_root.path).to_s
     @import_source_root.reference_snapshots[relative]
-  rescue ArgumentError
-    nil
+  rescue ArgumentError => error
+    RemoteResult::Failed.new(error)
   end
 
   def renamed_destination_file(source, destination, book, language: nil)
@@ -1410,7 +1872,93 @@ class PostProcessingJob < ApplicationJob
   end
 
   def ebook_file?(path)
-    EBOOK_FILE_EXTENSIONS.include?(File.extname(path).delete_prefix(".").downcase)
+    EBOOK_FILE_EXTENSIONS.include?(path_extension(path))
+  end
+
+  def validate_audiobook_source!(source)
+    return unless File.directory?(source) && !File.symlink?(source)
+    return if audiobook_audio_descendant?(source)
+
+    raise "No supported audiobook files found in download"
+  end
+
+  def audiobook_audio_descendant?(source)
+    stat = File.lstat(source)
+    if stat.directory? && !stat.symlink?
+      source_manifest_children(source).any? { |entry| audiobook_audio_descendant?(File.join(source, entry)) }
+    else
+      audiobook_audio_file?(source)
+    end
+  end
+
+  def audiobook_tree_has_library_file?(source)
+    stat = File.lstat(source)
+    if stat.directory? && !stat.symlink?
+      source_manifest_children(source).any? { |entry| audiobook_tree_has_library_file?(File.join(source, entry)) }
+    else
+      audiobook_library_file?(source)
+    end
+  end
+
+  def audiobook_library_file?(path)
+    audiobook_audio_file?(path) || audiobook_cover_file?(path) || aaxc_voucher_file?(path)
+  end
+
+  # Audible cannot decrypt an AAXC file without the same-stem voucher.
+  def aaxc_voucher_file?(path)
+    return false unless path_extension(path) == "voucher"
+
+    stem = AudiobookBundleImportPlanner.stem_for(path)
+    directory = File.dirname(path.to_s)
+    source_manifest_children(directory).any? do |entry|
+      candidate = File.join(directory, entry)
+      next if File.directory?(candidate)
+
+      AudiobookBundleImportPlanner.extension_for(candidate) == "aaxc" &&
+        AudiobookBundleImportPlanner.stem_for(candidate) == stem
+    end
+  end
+
+  def audiobook_audio_file?(path)
+    AudiobookBundleImportPlanner.audio_file?(path)
+  end
+
+  def audiobook_cover_file?(path)
+    return false unless AUDIOBOOK_COVER_EXTENSIONS.include?(path_extension(path))
+
+    AudiobookBundleImportPlanner.cover_file?(
+      path,
+      audio_stems: sibling_audio_stems(path),
+      extensions: AUDIOBOOK_COVER_EXTENSIONS
+    )
+  end
+
+  def sibling_audio_stems(path)
+    directory = File.dirname(path.to_s)
+    source_manifest_children(directory).filter_map do |entry|
+      candidate = File.join(directory, entry)
+      next if File.directory?(candidate)
+      next unless audiobook_audio_file?(candidate)
+
+      AudiobookBundleImportPlanner.stem_for(candidate)
+    end
+  end
+
+  def ebook_cover_file?(path)
+    AudiobookBundleImportPlanner.cover_file?(
+      path,
+      audio_stems: [],
+      extensions: EBOOK_COVER_EXTENSIONS
+    )
+  end
+
+  def ebook_import_candidate?(path, extension = nil)
+    extension ||= path_extension(path)
+    EBOOK_FILE_EXTENSIONS.include?(extension) || ebook_cover_file?(path)
+  end
+
+  def path_extension(path)
+    File.extname(path.to_s).delete_prefix(".").downcase
   end
 
   def handle_duplicate_filename(path)
@@ -1421,6 +1969,240 @@ class PostProcessingJob < ApplicationJob
       new_path = duplicate_filename_candidate(path, counter)
     end
     new_path
+  end
+
+  def replacing_verified_library_file?(download, book, imported_path)
+    return false unless download.replace_library_file?
+    return false if imported_path.blank? || book.file_path.blank?
+    return false if SafeLibraryDeletionService.overlapping_library_paths?(imported_path, book.file_path)
+
+    true
+  end
+
+  def prepare_library_replacement!(download, book, canonical_destination, source_path, language:)
+    # The lock covers retirement and the new plan together. It is not held
+    # across the file copy that follows this method.
+    LibraryReplacement.with_book_lock(book) do
+      existing = LibraryReplacement.load(download)
+      return existing if RemoteResult.failed?(existing) || existing.is_a?(LibraryReplacement::Plan)
+
+      previous_path = book.file_path.to_s
+      return if previous_path.blank?
+
+      released = LibraryReplacement.release_conflicting_plans!(
+        book,
+        artifact_id: download.search_result_id,
+        except_download_id: download.id
+      )
+      return released if RemoteResult.failed?(released)
+      unless released == true
+        raise LibraryReplacement::UnreadablePlanError, "an earlier replacement could not be removed"
+      end
+
+      layout, extension = incoming_replacement_layout(
+        book,
+        canonical_destination,
+        previous_path,
+        source_path
+      )
+      return layout if RemoteResult.failed?(layout)
+
+      adopted = LibraryReplacement.adopt!(download, book, layout: layout)
+      return adopted if RemoteResult.failed?(adopted) || adopted.is_a?(LibraryReplacement::Plan)
+
+      destination, book_path = choose_post_processing_replacement(
+        book,
+        canonical_destination,
+        previous_path,
+        layout,
+        extension,
+        language
+      )
+      return destination if RemoteResult.failed?(destination)
+
+      LibraryReplacement.persist!(
+        download,
+        previous_path: previous_path,
+        destination: destination,
+        book_path: book_path,
+        layout: layout
+      )
+    end
+  end
+
+  def import_directory_for_replacement(canonical_destination, plan)
+    return canonical_destination unless plan.is_a?(LibraryReplacement::Plan)
+
+    @replacement_plan = plan
+    @replacement_file_override_used = false
+    if plan.file?
+      @replacement_file_path = plan.destination
+      File.dirname(plan.destination)
+    else
+      @replacement_file_path = nil
+      plan.destination
+    end
+  end
+
+  # A flat library can hold one renamed file or an isolated folder. Several
+  # media files in one release share that folder so every format stays owned.
+  # The previous copy's extension describes that copy, not the incoming bytes.
+  def incoming_replacement_layout(book, canonical_destination, previous_path, source_path)
+    flat_file = flat_single_file_target?(book, canonical_destination, previous_path)
+    return flat_file if RemoteResult.failed?(flat_file)
+    return [ "directory", nil ] unless flat_file
+
+    directory = directory_source?(source_path)
+    return directory if RemoteResult.failed?(directory)
+    return [ "directory", nil ] if directory && !readable_file_import?(book)
+    if directory
+      multiple = multiple_incoming_media_files?(source_path)
+      return multiple if RemoteResult.failed?(multiple)
+      return [ "directory", nil ] if multiple
+    end
+
+    extension = incoming_media_extension(book, source_path)
+    return extension if RemoteResult.failed?(extension)
+    extension = File.extname(previous_path) if extension.blank?
+    [ "file", extension ]
+  end
+
+  def flat_single_file_target?(book, canonical_destination, previous_path)
+    return false unless PathTemplateService.flat_output?(book)
+
+    root = Pathname(get_base_path(book)).expand_path
+    return false unless Pathname(canonical_destination).expand_path == root
+
+    file = Pathname(previous_path).expand_path
+    return false unless file.parent == root
+    return false if File.directory?(previous_path) && !File.symlink?(previous_path)
+
+    true
+  rescue ArgumentError, SystemCallError => error
+    RemoteResult::Failed.new(error)
+  end
+
+  def multiple_incoming_media_files?(source_path)
+    count = 0
+    ebook_directory_files(source_path).each do |path|
+      next if File.symlink?(path)
+      next unless ebook_file?(path)
+
+      count += 1
+      return true if count > 1
+    end
+    false
+  rescue SystemCallError => error
+    RemoteResult::Failed.new(error)
+  end
+
+  def directory_source?(path)
+    File.directory?(path) && !File.symlink?(path)
+  rescue SystemCallError => error
+    RemoteResult::Failed.new(error)
+  end
+
+  def incoming_media_extension(book, source_path)
+    directory = directory_source?(source_path)
+    return directory if RemoteResult.failed?(directory)
+    return File.extname(source_path).presence unless directory
+
+    ebook_directory_files(source_path).each do |path|
+      next if File.symlink?(path)
+
+      extension = File.extname(path)
+      normalized = extension.delete_prefix(".").downcase
+      return extension if EBOOK_FILE_EXTENSIONS.include?(normalized)
+    end
+    nil
+  rescue SystemCallError => error
+    RemoteResult::Failed.new(error)
+  end
+
+  def choose_post_processing_replacement(book, canonical_destination, previous_path, layout, extension, language)
+    if layout == "file"
+      filename = PathTemplateService.build_filename(
+        book,
+        extension.presence || File.extname(previous_path),
+        language: language
+      )
+      candidate = File.join(canonical_destination, filename)
+      isolated = unused_replacement_destination(candidate, previous_path)
+      return [ isolated, isolated ]
+    end
+
+    flat_root = flat_output_root?(book, canonical_destination)
+    return flat_root if RemoteResult.failed?(flat_root)
+
+    destination = flat_root ? flat_replacement_folder(book, canonical_destination, language) : canonical_destination
+    isolated = unused_replacement_destination(destination, previous_path)
+    [ isolated, isolated ]
+  end
+
+  def flat_output_root?(book, canonical_destination)
+    return false unless PathTemplateService.flat_output?(book)
+
+    Pathname(canonical_destination).expand_path == Pathname(get_base_path(book)).expand_path
+  rescue ArgumentError, SystemCallError => error
+    RemoteResult::Failed.new(error)
+  end
+
+  def flat_replacement_folder(book, root, language)
+    named = PathTemplateService.build_filename(book, ".m4b", language: language)
+    stem = File.basename(named, ".m4b")
+    stem = "Unknown" if stem.blank?
+    File.join(root, stem)
+  end
+
+  def release_reused_destination_locks!
+    Array(@reused_destination_locks).each do |lock|
+      LibraryReplacement.release_destination_lock(lock)
+    end
+  ensure
+    @reused_destination_locks = nil
+  end
+
+  def record_published_library_file!(path)
+    recorded = LibraryReplacement.record_published_path!(@publication_download, path)
+    return if recorded == true
+
+    raise LibraryReplacement::UnreadablePlanError, "published library file could not be recorded"
+  end
+
+  def record_publication_proof!(path, proof)
+    recorded = LibraryReplacement.record_publication_proofs!(@publication_download, path => proof)
+    return if recorded == true
+
+    raise LibraryReplacement::UnreadablePlanError, "published library file could not be recorded"
+  end
+
+  def replacement_file_destination(directory)
+    return if @replacement_file_override_used || @replacement_file_path.blank?
+
+    file = Pathname(@replacement_file_path).expand_path
+    return unless file.parent == Pathname(directory).expand_path
+
+    @replacement_file_override_used = true
+    file.to_s
+  rescue ArgumentError => error
+    RemoteResult::Failed.new(error)
+  end
+
+  def unused_replacement_destination(destination, existing_path)
+    candidate = destination
+    counter = 1
+    while replacement_destination_conflicts?(candidate, existing_path)
+      counter += 1
+      raise Errno::ENAMETOOLONG, destination if counter > 100
+
+      candidate = duplicate_filename_candidate(destination, counter)
+    end
+    candidate
+  end
+
+  def replacement_destination_conflicts?(candidate, existing_path)
+    path_occupied?(candidate) ||
+      SafeLibraryDeletionService.overlapping_library_paths?(candidate, existing_path)
   end
 
   def duplicate_filename_candidate(path, counter)
@@ -1472,7 +2254,6 @@ class PostProcessingJob < ApplicationJob
     end
     candidates = deduplicate_path_candidates(candidates)
 
-    # Return the first candidate that actually exists on disk.
     candidates.each do |candidate|
       next if candidate[:path].blank?
 
@@ -1482,12 +2263,10 @@ class PostProcessingJob < ApplicationJob
       end
     end
 
-    # None found - log all candidates for debugging
     Rails.logger.warn(
       "[PostProcessingJob] No remapped path exists on disk; tried #{candidates.size} strategies"
     )
 
-    # Return the first non-nil candidate so import_files produces a clear "not found" error
     best_guess = candidates.find { |c| c[:path].present? }
     best_guess || { path: path, authorized_roots: [] }
   end
@@ -1510,7 +2289,7 @@ class PostProcessingJob < ApplicationJob
     Rails.logger.warn(
       "[PostProcessingJob] Could not refresh blank download path from client for download ##{download.id}: #{e.class}"
     )
-    nil
+    RemoteResult::Failed.new(e)
   end
 
   def build_path_candidates(path, download)
@@ -1528,6 +2307,24 @@ class PostProcessingJob < ApplicationJob
       candidates << {
         strategy: "global_prefix_remap",
         path: replace_path_prefix(normalized_path, remote_path, local_path),
+        authorized_roots: [ local_path ]
+      }
+    end
+
+    # 1b. Per-client download_path → local_path prefix replacement.
+    # Users often store the torrent client's host path on the client record and
+    # leave download_remote_path blank. Treat that value as a remap prefix so
+    # nested completed downloads stay visible on the container mount.
+    if client_download_path.present? &&
+        local_path.present? &&
+        remote_path.blank? &&
+        !path_prefix_match?(client_download_path, local_path) &&
+        !Dir.exist?(client_download_path) &&
+        !File.exist?(normalized_path) &&
+        path_prefix_match?(normalized_path, client_download_path)
+      candidates << {
+        strategy: "client_prefix_remap",
+        path: replace_path_prefix(normalized_path, client_download_path, local_path),
         authorized_roots: [ local_path ]
       }
     end
@@ -1562,7 +2359,6 @@ class PostProcessingJob < ApplicationJob
       end
     end
 
-    # 4. Client download_path + basename
     if client_download_path.present?
       candidates << {
         strategy: "client_download_path",
@@ -1668,13 +2464,12 @@ class PostProcessingJob < ApplicationJob
   end
 
   def sanitize_filename(name)
-    # Remove invalid filename characters, collapse whitespace
     name
-      .gsub(/[<>:"\/\\|?*]/, "")  # Remove invalid chars
-      .gsub(/[\x00-\x1f]/, "")    # Remove control characters
+      .gsub(/[<>:"\/\\|?*]/, "")
+      .gsub(/[\x00-\x1f]/, "")
       .strip
-      .gsub(/\s+/, " ")           # Collapse whitespace
-      .truncate(100, omission: "") # Limit length
+      .gsub(/\s+/, " ")
+      .truncate(100, omission: "")
   end
 
   def trigger_library_scan(book)

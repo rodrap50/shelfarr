@@ -15,8 +15,6 @@ module Admin
       sign_in_as(@admin)
     end
 
-    # === Authorization ===
-
     test "index requires admin" do
       sign_out
       sign_in_as(@user)
@@ -40,8 +38,6 @@ module Admin
       post refresh_admin_request_search_results_path(@request_record)
       assert_redirected_to root_path
     end
-
-    # === Index ===
 
     test "index shows search results" do
       get admin_request_search_results_path(@request_record)
@@ -81,6 +77,38 @@ module Admin
       assert_match(/seeds/, response.body)
     end
 
+    test "index explains a file size penalty alongside preference adjustments" do
+      @pending_result.update!(
+        confidence_score: 55,
+        score_breakdown: {
+          preference_adjustment: -6,
+          file_size_adjustment: -40,
+          file_size_status: "above_max",
+          auto_select_allowed: false
+        }
+      )
+      @selected_result.update!(
+        confidence_score: 96,
+        score_breakdown: {
+          preference_adjustment: 0,
+          file_size_adjustment: 0,
+          file_size_status: "within",
+          auto_select_allowed: true
+        }
+      )
+
+      get admin_request_search_results_path(@request_record)
+
+      assert_response :success
+      assert_match "Score: 55%", response.body
+      assert_match "Preference -6", response.body
+      assert_match "Size -40 (too large)", response.body
+      assert_match "Larger than the configured maximum file size", response.body
+      assert_match "Manual review", response.body
+      assert_no_match(/Size 0/, response.body)
+      assert_no_match(/too small/, response.body)
+    end
+
     test "index allows selecting rejected downloadable results" do
       @pending_result.update!(status: :rejected)
 
@@ -103,8 +131,6 @@ module Admin
         assert_select "button", text: "Retry Anyway"
       end
     end
-
-    # === Select ===
 
     test "select creates download and updates statuses" do
       assert_difference -> { Download.count }, 1 do
@@ -149,12 +175,9 @@ module Admin
     test "select marks other results as rejected" do
       post select_admin_request_search_result_path(@request_record, @pending_result)
 
-      # Reload all results
       @selected_result.reload
       @no_link_result.reload
 
-      # The previously selected result should be changed to rejected
-      # Note: selected_result was already :selected in fixture, so it becomes :rejected
       assert @selected_result.rejected?
     end
 
@@ -165,7 +188,7 @@ module Admin
       assert_match /cannot be downloaded/, flash[:alert]
 
       @no_link_result.reload
-      assert @no_link_result.pending? # Status unchanged
+      assert @no_link_result.pending?
     end
 
     test "select enqueues download job" do
@@ -173,8 +196,6 @@ module Admin
         post select_admin_request_search_result_path(@request_record, @pending_result)
       end
     end
-
-    # === Refresh ===
 
     test "refresh clears results and requeues search" do
       assert @request_record.search_results.any?

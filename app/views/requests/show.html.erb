@@ -172,11 +172,13 @@
           </div>
 
           <div data-search-results-target="content" class="space-y-2">
+            <% if @request.book.acquired? %>
+              <p class="text-sm text-gray-400">This title is already in the library. Selecting another result asks you to replace the existing file. The current file stays until the new one imports successfully.</p>
+            <% end %>
             <% @request.search_results.best_first.each do |result| %>
               <%= render "requests/search_result_row", result: result, request: @request %>
             <% end %>
 
-            <%# Pagination controls %>
             <div data-search-results-target="pagination" class="flex items-center justify-center gap-4 pt-2 text-xs">
               <button type="button"
                   data-action="click->search-results#prevPage"
@@ -279,20 +281,37 @@
         <div class="mt-6 pt-6 border-t border-gray-800">
           <h3 class="text-sm font-medium text-gray-500 mb-2">Manual Magnet Link</h3>
           <p class="text-sm text-gray-400 mb-3">Paste a magnet link to send it to the configured torrent client for this request. If a download is already active, it will be replaced.</p>
-          <%= form_with url: manual_magnet_request_path(@request), method: :post, local: true, class: "flex flex-col sm:flex-row gap-3" do |f| %>
+          <%= form_with url: manual_magnet_request_path(@request), method: :post, local: true, class: "flex flex-col gap-3" do |f| %>
+            <% if @request.book.acquired? %>
+              <label class="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+                <input type="checkbox" name="replace_library_file" value="1"
+                       class="mt-0.5 w-4 h-4 rounded border-gray-600 bg-gray-800 text-blue-600 focus:ring-blue-500">
+                <span>Replace the existing library file after this download imports. A failed download leaves the current file unchanged.</span>
+              </label>
+            <% end %>
+            <div class="flex flex-col sm:flex-row gap-3">
             <%= f.text_field :magnet_url,
                 name: :magnet_url,
                 placeholder: "magnet:?xt=urn:btih:...",
                 class: "flex-1 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 px-3 py-2 text-sm focus:border-blue-500 focus:ring-blue-500" %>
             <%= f.submit "Add Magnet",
                 class: "px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition text-sm" %>
+            </div>
           <% end %>
         </div>
 
         <div class="mt-6 pt-6 border-t border-gray-800">
           <h3 class="text-sm font-medium text-gray-500 mb-2">Manual NZB URL</h3>
           <p class="text-sm text-gray-400 mb-3">Paste an HTTP(S) NZB URL to send it to the highest-priority available Usenet client. The URL does not need to end in .nzb. If a download is already active, it will be replaced.</p>
-          <%= form_with url: manual_nzb_request_path(@request), method: :post, local: true, class: "flex flex-col sm:flex-row gap-3" do |f| %>
+          <%= form_with url: manual_nzb_request_path(@request), method: :post, local: true, class: "flex flex-col gap-3" do |f| %>
+            <% if @request.book.acquired? %>
+              <label class="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+                <input type="checkbox" name="replace_library_file" value="1"
+                       class="mt-0.5 w-4 h-4 rounded border-gray-600 bg-gray-800 text-blue-600 focus:ring-blue-500">
+                <span>Replace the existing library file after this download imports. A failed download leaves the current file unchanged.</span>
+              </label>
+            <% end %>
+            <div class="flex flex-col sm:flex-row gap-3">
             <%= f.url_field :nzb_url,
                 name: :nzb_url,
                 placeholder: "https://example.com/download",
@@ -301,6 +320,7 @@
                 class: "flex-1 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 px-3 py-2 text-sm focus:border-blue-500 focus:ring-blue-500" %>
             <%= f.submit "Add NZB URL",
                 class: "px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition text-sm" %>
+            </div>
           <% end %>
         </div>
       <% end %>
@@ -335,7 +355,9 @@
       <% end %>
     </div>
 
-    <% if @request.can_be_cancelled? || (Current.user.admin? && @request.can_retry?) %>
+    <% can_remove = Current.user.admin? || @request.can_be_cancelled? || @request.can_delete_completed_history? %>
+    <% removal_label = @request.completed? ? "Delete Request" : "Cancel Request" %>
+    <% if can_remove || (Current.user.admin? && @request.can_retry?) %>
       <div class="px-6 py-4 bg-gray-800/50 border-t border-gray-800 flex justify-end gap-3" data-controller="delete-modal">
         <% if Current.user.admin? && @request.can_retry? %>
           <%= button_to "Retry Request", retry_request_path(@request),
@@ -349,22 +371,31 @@
               class: "px-4 py-2 bg-green-600 hover:bg-green-500 text-white font-medium rounded-lg transition" %>
         <% end %>
 
-        <% if @request.can_be_cancelled? %>
+        <% if can_remove %>
           <button type="button"
                   class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg transition"
                   data-action="click->delete-modal#open">
-            Cancel Request
+            <%= removal_label %>
           </button>
 
           <dialog data-delete-modal-target="modal"
                   class="bg-gray-900 border border-gray-700 rounded-lg p-0 backdrop:bg-black/50 max-w-md w-full"
                   data-action="click->delete-modal#backdropClick">
             <div class="p-6">
-              <h3 class="text-lg font-semibold text-white mb-2">Cancel Request</h3>
-              <p class="text-gray-400 mb-4">Are you sure you want to cancel this request for "<%= @request.book.title %>"?</p>
+              <h3 class="text-lg font-semibold text-white mb-2"><%= removal_label %></h3>
+              <% if @request.completed? %>
+                <p class="text-gray-400 mb-4">Delete the completed request history for "<%= @request.book.title %>"? Library files will be kept.</p>
+                <% if @request.book.acquired? %>
+                  <p class="text-gray-400 mb-4">To request this book again, ask an admin to remove its entry from the <%= link_to "Library", library_path(@request.book), class: "text-blue-400 hover:text-blue-300" %>, including when its files were deleted manually.</p>
+                <% end %>
+              <% else %>
+                <p class="text-gray-400 mb-4">Are you sure you want to cancel this request for "<%= @request.book.title %>"?</p>
+              <% end %>
 
               <%= form_with url: request_path(@request), method: :delete, local: true, class: "space-y-4" do |f| %>
-                <% if @request.downloads.any? { |d| d.external_id.present? && d.download_client.present? } %>
+                <% if Current.user.admin? && !@request.completed? %>
+                  <p class="text-sm text-gray-400">The download will be stopped in the download client. Files outside the library are kept.</p>
+                <% elsif !@request.completed? && @request.downloads.any? { |d| d.external_id.present? && d.download_client.present? } %>
                   <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
                     <input type="checkbox" name="remove_torrent" value="1"
                            class="w-4 h-4 rounded border-gray-600 bg-gray-800 text-red-600 focus:ring-red-500">
@@ -380,7 +411,7 @@
                   </button>
                   <button type="submit"
                           class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg transition">
-                    Cancel Request
+                    <%= removal_label %>
                   </button>
                 </div>
               <% end %>

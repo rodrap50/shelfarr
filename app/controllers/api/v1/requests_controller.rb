@@ -97,8 +97,6 @@ class API::V1::RequestsController < API::V1::ApplicationController
     }
   end
 
-  # Select a downloadable acquisition candidate and start download (Quartermaster, etc.).
-  # Body: { "search_result_id": 123 }
   def grab
     if params[:search_result_id].blank?
       render json: { errors: [ "search_result_id is required" ] }, status: :unprocessable_entity
@@ -118,7 +116,7 @@ class API::V1::RequestsController < API::V1::ApplicationController
     case @request.blocklist_and_select_next!(reason: "Blocklisted via API")
     when :no_selected_result
       render json: { errors: [ "No selected result to blocklist" ] }, status: :unprocessable_entity
-    when :exhausted
+    when :exhausted, :manual_review
       render json: request_payload(@request.reload)
     else
       render json: request_payload_with_selected_result(@request.reload)

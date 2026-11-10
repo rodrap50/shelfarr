@@ -22,10 +22,10 @@ class AudiobookProbeService
   class << self
     attr_writer :probe
 
-    def valid?(path)
+    def valid?(path, format_whitelist: nil)
       return @probe.call(path) if @probe
 
-      probe_file(path)
+      probe_file(path, format_whitelist: format_whitelist)
     end
 
     def reset_probe!
@@ -34,7 +34,16 @@ class AudiobookProbeService
 
     private
 
-    def probe_file(path)
+    def probe_file(path, format_whitelist:)
+      source = path if path.respond_to?(:fileno)
+      return false if source && !source.stat.file?
+
+      position = source&.pos
+      # Pass the held file across exec. Descriptor-created staging files have
+      # no pathname, and reopening a name could inspect replacement bytes.
+      input_path = source ? "/dev/fd/3" : path.to_s
+      input_mapping = source ? { 3 => source.fileno } : {}
+      format_options = format_whitelist ? [ "-format_whitelist", format_whitelist.join(",") ] : []
       Tempfile.create([ "shelfarr-ffprobe-", ".json" ]) do |output|
         pid = Process.spawn(
           "ffprobe",
@@ -45,12 +54,14 @@ class AudiobookProbeService
           "-select_streams", "a:0",
           "-show_entries", "stream=codec_type,duration:format=duration",
           "-of", "json",
-          "-i", path.to_s,
+          *format_options,
+          "-i", input_path,
           in: File::NULL,
           out: output.path,
           err: File::NULL,
           pgroup: true,
-          **SPAWN_RESOURCE_LIMITS
+          **SPAWN_RESOURCE_LIMITS,
+          **input_mapping
         )
         status = wait_for_probe(pid)
         return false unless status&.success?
@@ -64,27 +75,29 @@ class AudiobookProbeService
         duration = audio_stream&.fetch("duration", nil).presence || data.dig("format", "duration")
         audio_stream.present? && duration.to_f.positive?
       end
-    rescue SystemCallError, ArgumentError, JSON::ParserError, TypeError
-      false
+    rescue SystemCallError, IOError, ArgumentError, JSON::ParserError, TypeError => error
+      RemoteResult::Failed.new(error)
+    ensure
+      source.seek(position, IO::SEEK_SET) if source && !source.closed? && position
     end
 
     def wait_for_probe(pid)
       Timeout.timeout(MAX_DURATION) { Process.wait2(pid).last }
-    rescue Timeout::Error
+    rescue Timeout::Error => error
       terminate_probe(pid)
-      nil
+      RemoteResult::Failed.new(error)
     end
 
     def terminate_probe(pid)
       Process.kill("TERM", -pid)
       Timeout.timeout(1.second) { Process.wait(pid) }
-    rescue Errno::ESRCH, Errno::ECHILD
-      nil
+    rescue Errno::ESRCH, Errno::ECHILD => error
+      RemoteResult::Failed.new(error)
     rescue Timeout::Error
       Process.kill("KILL", -pid)
       Process.wait(pid)
-    rescue Errno::ESRCH, Errno::ECHILD
-      nil
+    rescue Errno::ESRCH, Errno::ECHILD => error
+      RemoteResult::Failed.new(error)
     end
   end
 end

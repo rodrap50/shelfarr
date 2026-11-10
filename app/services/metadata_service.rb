@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-# Unified service for fetching book metadata from configured sources
-# Orchestrates Hardcover, Google Books, and OpenLibrary based on settings
 class MetadataService
   class Error < StandardError; end
 
@@ -49,8 +47,6 @@ class MetadataService
   end
 
   class << self
-    # Search for books across enabled metadata sources and aggregate duplicates
-    # into Shelfarr candidates.
     def search(query, limit: nil, content_kind: nil, aggregate_limit: nil)
       content_kind = ContentKinds.normalize(content_kind, default: nil)
       providers = enabled_metadata_providers(content_kind: content_kind)
@@ -133,7 +129,6 @@ class MetadataService
       ordered_provider_results(results_by_provider)
     end
 
-    # Get book details by unified work_id (format: "source:id")
     def book_details(work_id)
       source, id = parse_work_id(work_id)
 
@@ -153,30 +148,28 @@ class MetadataService
       end
     end
 
-    # Test all configured metadata sources
     def test_connections
       results = {}
 
       if HardcoverClient.configured?
-        results[:hardcover] = HardcoverClient.test_connection rescue false
+        results[:hardcover] = HardcoverClient.test_connection rescue RemoteResult::Failed.new($!)
       end
 
       if GoogleBooksClient.configured?
-        results[:google_books] = GoogleBooksClient.test_connection rescue false
+        results[:google_books] = GoogleBooksClient.test_connection rescue RemoteResult::Failed.new($!)
       end
 
       if OpenLibraryClient.configured?
-        results[:openlibrary] = OpenLibraryClient.test_connection rescue false
+        results[:openlibrary] = OpenLibraryClient.test_connection rescue RemoteResult::Failed.new($!)
       end
 
       if ComicVineClient.configured?
-        results[:comic_vine] = ComicVineClient.test_connection rescue false
+        results[:comic_vine] = ComicVineClient.test_connection rescue RemoteResult::Failed.new($!)
       end
 
       results
     end
 
-    # Determine primary metadata source
     def metadata_source
       SettingsService.get(:metadata_source, default: "auto")
     end
@@ -189,7 +182,6 @@ class MetadataService
       SettingsService.metadata_provider_priority
     end
 
-    # Check if any metadata source is available
     def available?
       enabled_metadata_providers.any?
     end

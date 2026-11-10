@@ -82,7 +82,7 @@ class UploadImportFileServiceTest < ActiveSupport::TestCase
       UploadImportFileService.discard_ingress!(path)
     end
 
-    assert_not removed
+    assert RemoteResult.failed?(removed)
     assert_equal "replacement ingress", File.binread(path)
     assert_equal "original ingress", File.binread(held_original)
   ensure
@@ -105,6 +105,33 @@ class UploadImportFileServiceTest < ActiveSupport::TestCase
     FileUtils.rm_rf(@source_root)
     FileUtils.rm_rf(@library_root)
     FileUtils.rm_rf(@other_library_root)
+  end
+
+  test "applies configured library import modes after publication" do
+    SettingsService.set(:library_import_file_mode, "0664")
+    SettingsService.set(:library_import_folder_mode, "0775")
+    root_mode = File.stat(@library_root).mode & 0o777
+    service = UploadImportFileService.new(upload: @upload, book: @book)
+    service.reserve!
+    service.publish!
+
+    destination = Pathname(@upload.reload.destination_path)
+    assert_equal 0o664, destination.stat.mode & 0o777
+    assert_equal 0o775, destination.parent.stat.mode & 0o777
+    assert_equal root_mode, File.stat(@library_root).mode & 0o777
+    assert File.exist?(@source)
+  end
+
+  test "linkat publication still receives the configured file mode" do
+    SettingsService.set(:library_import_file_mode, "0664")
+    service = UploadImportFileService.new(upload: @upload, book: @book)
+    service.reserve!
+
+    FilesystemSyscalls.stub(:rename_noreplace, ->(*) { raise Errno::EINVAL, "renameat2" }) do
+      assert_equal service.book_library_path, service.publish!
+    end
+
+    assert_equal 0o664, File.stat(@upload.reload.destination_path).mode & 0o777
   end
 
   test "reserves a unique snapshotted path and atomically publishes verified bytes" do
@@ -130,6 +157,26 @@ class UploadImportFileServiceTest < ActiveSupport::TestCase
     assert_equal "original ebook bytes", File.binread(destination)
     assert_equal 0o640, File.stat(destination).mode & 0o777
     assert File.exist?(@source), "the source remains until database completion"
+  end
+
+  test "publishes a new epub when the destination file does not exist and renameat2 returns EINVAL" do
+    service = UploadImportFileService.new(upload: @upload, book: @book)
+    service.reserve!
+    destination = Pathname(@upload.reload.destination_path)
+    assert_not destination.exist?
+    assert_not destination.parent.exist?
+
+    # NFSv4 rejects RENAME_NOREPLACE with EINVAL. The absent final name is
+    # still free, so publication must fall back to linkat instead of opening
+    # that missing file as a fatal ENOENT.
+    FilesystemSyscalls.stub(:rename_noreplace, ->(*) { raise Errno::EINVAL, "renameat2" }) do
+      assert_equal service.book_library_path, service.publish!
+    end
+
+    assert_equal "original ebook bytes", File.binread(destination)
+    assert_equal 0o640, File.stat(destination).mode & 0o777
+    assert destination.parent.directory?
+    assert File.exist?(@source)
   end
 
   test "a second active upload receives a distinct library reservation" do
@@ -162,6 +209,112 @@ class UploadImportFileServiceTest < ActiveSupport::TestCase
     service.reserve!
 
     assert_match(/Title \(2\)\z/, @upload.reload.library_path)
+  end
+
+  test "shares a completed companion-format folder on a shared library root and template" do
+    SettingsService.set(:audiobook_output_path, @library_root)
+    SettingsService.set(:ebook_path_template, "{series/}{seriesNum:00 - }{title}")
+    SettingsService.set(:audiobook_path_template, "{series/}{seriesNum:00 - }{title}")
+
+    shared_folder = File.join(File.realpath(@library_root), "Mistborn", "01 - The Final Empire")
+    FileUtils.mkdir_p(shared_folder)
+    File.binwrite(File.join(shared_folder, "Brandon Sanderson - The Final Empire.epub"), "ebook bytes")
+    Book.create!(
+      title: "The Final Empire",
+      author: "Brandon Sanderson",
+      series: "Mistborn",
+      series_position: "1",
+      book_type: :ebook,
+      file_path: shared_folder
+    )
+
+    audiobook = Book.new(
+      title: "The Final Empire",
+      author: "Brandon Sanderson",
+      series: "Mistborn",
+      series_position: "1",
+      book_type: :audiobook
+    )
+    source = File.join(@source_root, "The Final Empire.m4b")
+    File.binwrite(source, "audiobook bytes")
+    upload = Upload.create!(
+      user: users(:two),
+      original_filename: File.basename(source),
+      file_path: source,
+      file_size: File.size(source),
+      book_type: :audiobook,
+      status: :processing
+    )
+
+    service = UploadImportFileService.new(upload: upload, book: audiobook)
+    service.reserve!
+    service.publish!
+
+    assert_equal shared_folder, upload.reload.library_path
+    assert_equal File.join(shared_folder, "Brandon Sanderson - The Final Empire.m4b"),
+      upload.destination_path
+    assert_no_match(/ \(2\)/, upload.library_path)
+    assert_equal "ebook bytes",
+      File.binread(File.join(shared_folder, "Brandon Sanderson - The Final Empire.epub"))
+    assert_equal "audiobook bytes", File.binread(upload.destination_path)
+  end
+
+  test "failed companion publication can roll back beside a directory-backed ebook" do
+    SettingsService.set(:audiobook_output_path, @library_root)
+    @book.book_type = :audiobook
+    @upload.update!(book_type: :audiobook)
+    folder = File.join(File.realpath(@library_root), "Author", "Title")
+    FileUtils.mkdir_p(folder)
+    ebook = File.join(folder, "book.epub")
+    File.binwrite(ebook, "companion ebook")
+    Book.create!(title: @book.title, author: @book.author, book_type: :ebook, file_path: folder)
+    service = UploadImportFileService.new(upload: @upload, book: @book)
+    service.reserve!
+    service.publish!
+    destination = @upload.reload.destination_path
+
+    assert service.restore_and_clear!
+    assert_nil @upload.reload.destination_path
+    assert_not File.exist?(destination)
+    assert_equal "companion ebook", File.binread(ebook)
+    assert File.exist?(@source)
+  end
+
+  test "keeps a numbered folder when a different book already occupies the shared path" do
+    SettingsService.set(:audiobook_output_path, @library_root)
+    SettingsService.set(:ebook_path_template, "{title}")
+    SettingsService.set(:audiobook_path_template, "{title}")
+
+    occupied_folder = File.join(File.realpath(@library_root), "The Shining")
+    FileUtils.mkdir_p(occupied_folder)
+    File.binwrite(File.join(occupied_folder, "Stephen King - The Shining.epub"), "king ebook")
+    Book.create!(
+      title: "The Shining",
+      author: "Stephen King",
+      book_type: :ebook,
+      file_path: occupied_folder
+    )
+
+    audiobook = Book.new(
+      title: "The Shining",
+      author: "A Different Author",
+      book_type: :audiobook
+    )
+    source = File.join(@source_root, "The Shining.m4b")
+    File.binwrite(source, "unrelated audiobook")
+    upload = Upload.create!(
+      user: users(:two),
+      original_filename: File.basename(source),
+      file_path: source,
+      file_size: File.size(source),
+      book_type: :audiobook,
+      status: :processing
+    )
+
+    service = UploadImportFileService.new(upload: upload, book: audiobook)
+    service.reserve!
+
+    assert_equal "#{occupied_folder} (2)", upload.reload.library_path
   end
 
   test "a settings change cannot redirect a persisted reservation" do
@@ -263,7 +416,7 @@ class UploadImportFileServiceTest < ActiveSupport::TestCase
       UploadImportFileService.restore_and_clear!(@upload)
     end
 
-    assert_not restored
+    assert_not RemoteResult.succeeded?(restored)
     assert_equal "replacement library bytes", File.binread(destination)
     assert_equal "original ebook bytes", File.binread(held_original)
     assert_equal destination, @upload.reload.destination_path

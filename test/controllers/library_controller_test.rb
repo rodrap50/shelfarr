@@ -686,7 +686,7 @@ class LibraryControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "show displays download button when user has request" do
-    request = Request.create!(
+    Request.create!(
       book: @acquired_audiobook,
       user: @user,
       status: :completed
@@ -694,13 +694,13 @@ class LibraryControllerTest < ActionDispatch::IntegrationTest
 
     get library_path(@acquired_audiobook)
     assert_response :success
-    assert_select "a[href='#{download_request_path(request)}']", text: /Download/
+    assert_select "a[href='#{download_library_path(@acquired_audiobook)}']", text: /Download/
   end
 
-  test "show does not display download button when user has no request" do
+  test "show displays download button when user has no request" do
     get library_path(@acquired_audiobook)
     assert_response :success
-    assert_select "a[href*='download']", false
+    assert_select "a[href='#{download_library_path(@acquired_audiobook)}']", text: /Download/
   end
 
   test "show does not display add to library controls when user has no routing configured" do
@@ -906,7 +906,7 @@ class LibraryControllerTest < ActionDispatch::IntegrationTest
     assert_empty Request.where(book_id: @acquired_audiobook.id)
   end
 
-  test "destroy preserves library bytes and records while a request upload is pending" do
+  test "destroy removes a library item whose only upload is still pending" do
     sign_out
     sign_in_as(@admin)
     Dir.mktmpdir("shelfarr-library-blocked-upload") do |dir|
@@ -928,15 +928,14 @@ class LibraryControllerTest < ActionDispatch::IntegrationTest
         status: :pending
       )
 
-      assert_no_difference [ "Book.count", "Request.count", "Upload.count" ] do
-        delete library_path(book), params: { delete_files: "1" }
-      end
+      delete library_path(book), params: { delete_files: "1" }
 
-      assert_redirected_to library_path(book)
-      assert_match(/upload or direct acquisition in progress/i, flash[:alert])
-      assert_equal "keep library bytes", File.binread(file_path)
-      assert Request.exists?(request.id)
-      assert Upload.exists?(upload.id)
+      assert_redirected_to library_index_path
+      assert_match(/removed from the library/, flash[:notice].to_s)
+      assert_not Book.exists?(book.id)
+      assert_not Request.exists?(request.id)
+      assert_not Upload.exists?(upload.id)
+      assert_not File.exist?(file_path)
     end
   end
 
@@ -963,7 +962,7 @@ class LibraryControllerTest < ActionDispatch::IntegrationTest
     end
 
     assert_redirected_to library_path(book)
-    assert_match(/upload or direct acquisition in progress/i, flash[:alert])
+    assert_match(/direct download/i, flash[:alert])
     assert Request.exists?(request.id)
     assert Download.exists?(download.id)
   end
@@ -986,16 +985,34 @@ class LibraryControllerTest < ActionDispatch::IntegrationTest
         status: :completed,
         post_processing_job_id: "library-delete-post-processing-owner"
       )
+      queue_job = SolidQueue::Job.create!(
+        active_job_id: "library-delete-post-processing-owner",
+        class_name: "PostProcessingJob",
+        queue_name: "default",
+        arguments: { "job_class" => "PostProcessingJob", "arguments" => [] },
+        priority: 0,
+        scheduled_at: Time.current
+      )
 
       assert_no_difference [ "Book.count", "Request.count", "Download.count" ] do
         delete library_path(book), params: { delete_files: "1" }
       end
 
       assert_redirected_to library_path(book)
-      assert_match(/post-processing import awaiting recovery/i, flash[:alert])
+      assert_match(/post-processing/i, flash[:alert])
       assert_equal "recoverable post-processing bytes", File.binread(file_path)
       assert Request.exists?(request.id)
       assert Download.exists?(download.id)
+      assert_equal "library-delete-post-processing-owner", download.reload.post_processing_job_id
+    ensure
+      if queue_job
+        SolidQueue::ReadyExecution.where(job_id: queue_job.id).delete_all
+        SolidQueue::ScheduledExecution.where(job_id: queue_job.id).delete_all
+        SolidQueue::ClaimedExecution.where(job_id: queue_job.id).delete_all
+        SolidQueue::BlockedExecution.where(job_id: queue_job.id).delete_all
+        SolidQueue::FailedExecution.where(job_id: queue_job.id).delete_all
+        queue_job.delete
+      end
     end
   end
 
@@ -1039,7 +1056,7 @@ class LibraryControllerTest < ActionDispatch::IntegrationTest
       end
 
       assert_redirected_to library_path(book)
-      assert_match(/upload or direct acquisition in progress/i, flash[:alert])
+      assert_match(/Audible backup/i, flash[:alert])
       assert_equal "keep owned audio", File.binread(owned_file_path)
       assert_equal book, upload.reload.book
       assert_equal upload, media_import.reload.upload

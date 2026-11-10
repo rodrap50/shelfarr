@@ -487,6 +487,40 @@ class AudiobookshelfLibrarySyncServiceTest < ActiveSupport::TestCase
     LibraryPlatformClient.reset_connections!
   end
 
+  test "prunes cached Grimmory items after a successful empty inventory" do
+    SettingsService.set(:library_platform, "grimmory")
+    SettingsService.set(:grimmory_url, "http://localhost:5173")
+    SettingsService.set(:grimmory_username, "admin")
+    SettingsService.set(:grimmory_password, "secret")
+    SettingsService.set(:audiobookshelf_audiobook_library_id, "grim-lib")
+    SettingsService.set(:audiobookshelf_ebook_library_id, "")
+    LibraryPlatformClient.reset_connections!
+    existing = LibraryItem.create!(
+      library_platform: "grimmory",
+      library_id: "grim-lib",
+      audiobookshelf_id: "grim-removed",
+      title: "Removed Book",
+      synced_at: 1.day.ago
+    )
+
+    VCR.turned_off do
+      stub_request(:post, "http://localhost:5173/api/v1/auth/login")
+        .to_return(status: 200, headers: { "Content-Type" => "application/json" },
+          body: { accessToken: "grimmory-token" }.to_json)
+      stub_request(:get, "http://localhost:5173/api/v1/libraries/grim-lib/book")
+        .to_return(status: 200, headers: { "Content-Type" => "application/json" }, body: "[]")
+
+      result = AudiobookshelfLibrarySyncService.new.sync!
+
+      assert result.success?, result.errors.inspect
+      assert_equal 1, result.libraries_synced
+      assert_empty result.errors
+      assert_not LibraryItem.exists?(existing.id)
+    end
+  ensure
+    LibraryPlatformClient.reset_connections!
+  end
+
   test "syncs items from additional scan library ids alongside delivery libraries" do
     SettingsService.set(:audiobookshelf_audiobook_library_id, "lib-audio")
     SettingsService.set(:audiobookshelf_ebook_library_id, "")
@@ -555,8 +589,8 @@ class AudiobookshelfLibrarySyncServiceTest < ActiveSupport::TestCase
     end
   end
 
-  test "does not prune cached items when library sync fails with a transient API failure" do
-    LibraryItem.create!(
+  test "does not prune cached items when the library client returns a non-200" do
+    existing = LibraryItem.create!(
       library_platform: "audiobookshelf",
       library_id: "lib-audio",
       audiobookshelf_id: "ab-existing",
@@ -566,11 +600,8 @@ class AudiobookshelfLibrarySyncServiceTest < ActiveSupport::TestCase
     )
 
     VCR.turned_off do
-      # lib-audio fails (non-200)
       stub_request(:get, %r{localhost:13378/api/libraries/lib-audio/items})
-        .to_return(status: 500)
-
-      # lib-ebook succeeds
+        .to_return(status: 404)
       stub_request(:get, %r{localhost:13378/api/libraries/lib-ebook/items})
         .with(query: hash_including("limit" => "500", "page" => "0"))
         .to_return(
@@ -584,19 +615,113 @@ class AudiobookshelfLibrarySyncServiceTest < ActiveSupport::TestCase
 
       result = AudiobookshelfLibrarySyncService.new.sync!
 
-      # It should capture the failure for lib-audio in result.errors
+      assert_includes result.errors.first, "returned status 404"
+      assert_equal "Existing Title", existing.reload.title
+      assert LibraryItem.exists?(audiobookshelf_id: "ab-2")
+    end
+  end
+
+  test "prunes cached items when the library client returns an empty inventory" do
+    LibraryItem.create!(
+      library_platform: "audiobookshelf",
+      library_id: "lib-audio",
+      audiobookshelf_id: "ab-existing",
+      title: "Existing Title",
+      author: "Author",
+      synced_at: 1.day.ago
+    )
+
+    VCR.turned_off do
+      stub_request(:get, %r{localhost:13378/api/libraries/lib-audio/items})
+        .with(query: hash_including("limit" => "500", "page" => "0"))
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { "results" => [], "total" => 0 }.to_json
+        )
+      stub_request(:get, %r{localhost:13378/api/libraries/lib-ebook/items})
+        .with(query: hash_including("limit" => "500", "page" => "0"))
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: { "results" => [], "total" => 0 }.to_json
+        )
+
+      result = AudiobookshelfLibrarySyncService.new.sync!
+
+      assert result.success?
+      assert_not LibraryItem.exists?(audiobookshelf_id: "ab-existing")
+    end
+  end
+
+  test "does not prune cached BookOrbit items when the library client returns a non-200" do
+    SettingsService.set(:library_platform, "bookorbit")
+    SettingsService.set(:bookorbit_url, "http://localhost:3000")
+    SettingsService.set(:bookorbit_username, "admin")
+    SettingsService.set(:bookorbit_password, "secret")
+    SettingsService.set(:audiobookshelf_audiobook_library_id, "42")
+    SettingsService.set(:audiobookshelf_ebook_library_id, "")
+    LibraryPlatformClient.reset_connections!
+    existing = LibraryItem.create!(
+      library_platform: "bookorbit",
+      library_id: "42",
+      audiobookshelf_id: "101",
+      title: "Existing BookOrbit Item",
+      synced_at: 1.day.ago
+    )
+
+    VCR.turned_off do
+      stub_request(:post, "http://localhost:3000/api/v1/auth/login")
+        .to_return(status: 200, headers: { "Content-Type" => "application/json" }, body: { accessToken: "bookorbit-token" }.to_json)
+      stub_request(:post, "http://localhost:3000/api/v1/libraries/42/books")
+        .to_return(status: 404)
+
+      result = AudiobookshelfLibrarySyncService.new.sync!
+
+      assert_includes result.errors.first, "returned status 404"
+      assert_equal "Existing BookOrbit Item", existing.reload.title
+    end
+  ensure
+    LibraryPlatformClient.reset_connections!
+  end
+
+  test "does not prune cached items when library sync fails with a transient API failure" do
+    LibraryItem.create!(
+      library_platform: "audiobookshelf",
+      library_id: "lib-audio",
+      audiobookshelf_id: "ab-existing",
+      title: "Existing Title",
+      author: "Author",
+      synced_at: 1.day.ago
+    )
+
+    VCR.turned_off do
+      stub_request(:get, %r{localhost:13378/api/libraries/lib-audio/items})
+        .to_return(status: 500)
+
+      stub_request(:get, %r{localhost:13378/api/libraries/lib-ebook/items})
+        .with(query: hash_including("limit" => "500", "page" => "0"))
+        .to_return(
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: {
+            "results" => [ { "id" => "ab-2", "title" => "Good Omens", "author" => "Neil Gaiman" } ],
+            "total" => 1
+          }.to_json
+        )
+
+      result = AudiobookshelfLibrarySyncService.new.sync!
+
       assert_includes result.errors.first, "returned status 500"
 
       # The existing item in lib-audio should NOT be pruned because the sync failed!
       assert LibraryItem.exists?(audiobookshelf_id: "ab-existing")
 
-      # The item in lib-ebook should be successfully synced
       assert LibraryItem.exists?(audiobookshelf_id: "ab-2")
     end
   end
 
   test "prunes cached items for libraries no longer in the configured set" do
-    # Create library items for a library that is not configured (e.g. lib-old)
     LibraryItem.create!(
       library_platform: "audiobookshelf",
       library_id: "lib-old",
@@ -605,7 +730,6 @@ class AudiobookshelfLibrarySyncServiceTest < ActiveSupport::TestCase
       author: "Author",
       synced_at: 1.day.ago
     )
-    # Also create one for a configured library to ensure it's not deleted if it's synced
     LibraryItem.create!(
       library_platform: "audiobookshelf",
       library_id: "lib-audio",
@@ -640,16 +764,13 @@ class AudiobookshelfLibrarySyncServiceTest < ActiveSupport::TestCase
       result = AudiobookshelfLibrarySyncService.new.sync!
       assert result.success?
 
-      # ab-old should be pruned since lib-old is no longer configured
       assert_not LibraryItem.exists?(audiobookshelf_id: "ab-old")
 
-      # ab-existing should be kept
       assert LibraryItem.exists?(audiobookshelf_id: "ab-existing")
     end
   end
 
   test "does not prune cached items written after this run started" do
-    # Create library items for a library that is not configured, but synced_at is in the future (written after this run started)
     LibraryItem.create!(
       library_platform: "audiobookshelf",
       library_id: "lib-newly-added",
@@ -728,5 +849,40 @@ class AudiobookshelfLibrarySyncServiceTest < ActiveSupport::TestCase
     end
   ensure
     SettingsService.set(:audiobookshelf_audiobook_scan_library_ids, "")
+  end
+
+  test "does not prune cached items when the library client returns a raw empty list" do
+    existing = cached_library_item
+    LibraryPlatformClient.stub(:library_items, []) do
+      result = AudiobookshelfLibrarySyncService.new.sync!
+
+      assert_not result.success?
+      assert_includes result.errors, "lib-audio: empty inventory was not an explicit empty success"
+      assert_equal "Existing Title", existing.reload.title
+    end
+  end
+
+  test "does not prune cached items when an ok result holds an empty list" do
+    existing = cached_library_item
+    LibraryPlatformClient.stub(:library_items, RemoteResult::Ok.new([])) do
+      result = AudiobookshelfLibrarySyncService.new.sync!
+
+      assert_not result.success?
+      assert_includes result.errors, "lib-audio: empty inventory was not an explicit empty success"
+      assert_equal "Existing Title", existing.reload.title
+    end
+  end
+
+  private
+
+  def cached_library_item
+    LibraryItem.create!(
+      library_platform: "audiobookshelf",
+      library_id: "lib-audio",
+      audiobookshelf_id: "ab-existing",
+      title: "Existing Title",
+      author: "Author",
+      synced_at: 1.day.ago
+    )
   end
 end
