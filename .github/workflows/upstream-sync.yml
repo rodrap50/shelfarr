@@ -1,0 +1,101 @@
+name: Upstream sync
+
+# Weekly: merge Pedro-Revez-Silva/shelfarr main into this fork and open (or
+# update) a PR from the upstream-sync branch. Conflicts fail the run with the
+# file list in the job summary; resolve those by hand.
+#
+# Needs secret SYNC_TOKEN: a PAT for the fork owner with `repo` and `workflow`
+# scopes. GITHUB_TOKEN can't push upstream changes to .github/workflows, and
+# PRs it opens don't trigger CI.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/Pedro-Revez-Silva/shelfarr.git
+  SYNC_BRANCH: upstream-sync
+
+jobs:
+  sync:
+    if: github.repository == 'rodrap50/shelfarr'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch "$UPSTREAM" main
+
+          count=$(git rev-list --count --no-merges HEAD..FETCH_HEAD)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            echo "Fork is up to date with upstream." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git switch -c "$SYNC_BRANCH"
+          if ! git merge --no-edit -m "Merge upstream main into fork" FETCH_HEAD; then
+            {
+              echo "## Upstream merge has conflicts"
+              echo "$count upstream commits pending. Conflicting files:"
+              echo '```'
+              git diff --name-only --diff-filter=U
+              echo '```'
+              echo "Resolve locally: \`git fetch $UPSTREAM main && git merge FETCH_HEAD\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "migrations<<EOF"
+            git diff --name-only --diff-filter=A origin/main HEAD -- db/migrate
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push and open or update PR
+        if: steps.merge.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          COUNT: ${{ steps.merge.outputs.count }}
+          MIGRATIONS: ${{ steps.merge.outputs.migrations }}
+        run: |
+          # Branch is rebuilt from main each run, so force is safe.
+          git push --force origin "$SYNC_BRANCH"
+
+          body=$(cat <<EOF
+          Automated weekly merge of upstream \`main\` ($COUNT new commits).
+
+          New migrations (run \`rails db:migrate\` on deploy):
+          \`\`\`
+          ${MIGRATIONS:-none}
+          \`\`\`
+
+          Review CI before merging. Upstream changes to shared code can break fork-only tests.
+          EOF
+          )
+
+          if gh pr view "$SYNC_BRANCH" --json state -q .state 2>/dev/null | grep -q OPEN; then
+            gh pr edit "$SYNC_BRANCH" --title "Sync with upstream main ($COUNT commits)" --body "$body"
+          else
+            gh pr create --base main --head "$SYNC_BRANCH" \
+              --title "Sync with upstream main ($COUNT commits)" --body "$body"
+          fi
+          echo "PR updated with $COUNT upstream commits." >> "$GITHUB_STEP_SUMMARY"
